@@ -367,7 +367,7 @@ TOOLSETS = {
 
     "hermes-yuanbao": {
         "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、定时提醒",
-        "tools": [
+        "tools": _HERMES_CORE_TOOLS + [
             "get_group_info",
             "get_group_member_list",
             "get_member_info",
@@ -393,7 +393,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-weixin", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-weixin", "hermes-webhook", "hermes-yuanbao"]
     }
 }
 

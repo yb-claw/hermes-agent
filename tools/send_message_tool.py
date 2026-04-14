@@ -163,6 +163,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "yuanbao": Platform.YUANBAO,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -429,6 +430,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.YUANBAO:
+            result = await _send_yuanbao(chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1091,6 +1094,38 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
+
+
+async def _send_yuanbao(chat_id, message):
+    """Send via Yuanbao using the running gateway adapter's WebSocket connection.
+
+    Yuanbao uses a persistent WebSocket for all messaging, so we must route
+    through the running YuanbaoAdapter instance (injected into yuanbao_tools).
+
+    chat_id format:
+      - Group: "group:<group_code>"
+      - DM:    "direct:<account_id>" or just "<account_id>"
+    """
+    try:
+        from tools.yuanbao_tools import _adapter_ref
+    except ImportError:
+        return _error("Yuanbao tools module not available.")
+
+    adapter = _adapter_ref
+    if adapter is None:
+        return _error(
+            "Yuanbao adapter is not running. "
+            "Start the gateway with yuanbao platform enabled first."
+        )
+
+    try:
+        result = await adapter.send(chat_id, message)
+        if result.success:
+            return {"success": True, "platform": "yuanbao", "chat_id": chat_id}
+        else:
+            return _error(f"Yuanbao send failed: {result.error or 'unknown error'}")
+    except Exception as e:
+        return _error(f"Yuanbao send failed: {e}")
 
 
 # --- Registry ---
