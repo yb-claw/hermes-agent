@@ -1702,6 +1702,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
         }
 
     # ------------------------------------------------------------------
+    # Media validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_media_before_queue(
+        file_bytes: Optional[bytes], filename: str, max_size_mb: int = 50
+    ) -> Optional[str]:
+        """
+        媒体前置校验：在排入出站队列前检查文件有效性。
+
+        Returns:
+            错误描述（str）如果校验失败，否则 None。
+        """
+        if file_bytes is None or len(file_bytes) == 0:
+            return f"空文件: {filename}"
+        max_bytes = max_size_mb * 1024 * 1024
+        if len(file_bytes) > max_bytes:
+            size_mb = len(file_bytes) / 1024 / 1024
+            return f"文件过大: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
+        return None
+
+    # ------------------------------------------------------------------
     # Outbound queue helpers
     # ------------------------------------------------------------------
 
