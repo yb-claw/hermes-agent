@@ -1574,6 +1574,76 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return f"升级请求已收到，目标版本: {version}\n请通过服务器终端执行: hermes update {version}"
 
     # ------------------------------------------------------------------
+    # Agent 工具方法（可注册为 AI toolset）
+    # ------------------------------------------------------------------
+
+    async def tool_query_group_info(self, chat_id: str) -> dict:
+        """
+        AI 工具: 查询当前群信息。
+
+        无需参数（从 session context 提取 group_code）。
+        返回群名、群主、成员数等。
+        """
+        if not chat_id.startswith("group:"):
+            return {"error": "此命令仅在群聊中可用"}
+        group_code = chat_id[len("group:"):]
+        result = await self.query_group_info(group_code)
+        if result is None:
+            return {"error": "查询群信息失败"}
+        return result
+
+    async def tool_query_session_members(
+        self,
+        chat_id: str,
+        action: str = "list_all",
+        name: Optional[str] = None,
+    ) -> dict:
+        """
+        AI 工具: 查询群成员列表。
+
+        Args:
+            chat_id: 聊天 ID（从 session context 提取）
+            action: 'find'（按名称查找）| 'list_bots'（列出机器人）| 'list_all'（列出全部）
+            name: 当 action='find' 时的搜索关键词
+
+        Returns:
+            {"members": [...], "total": int, "mentionHint": str}
+        """
+        if not chat_id.startswith("group:"):
+            return {"error": "此命令仅在群聊中可用"}
+        group_code = chat_id[len("group:"):]
+        result = await self.get_group_member_list(group_code)
+        if result is None:
+            return {"error": "查询群成员失败"}
+
+        members = result.get("members", [])
+
+        if action == "find" and name:
+            query = name.lower()
+            members = [
+                m for m in members
+                if query in (m.get("nickname", "") or "").lower()
+                or query in (m.get("name_card", "") or "").lower()
+                or query in (m.get("user_id", "") or "").lower()
+            ]
+        elif action == "list_bots":
+            # 机器人通常 role=0 且 user_id 看起来像 bot ID
+            # 这里简单过滤，实际场景可能需要更精确的判断
+            members = [m for m in members if "bot" in (m.get("nickname", "") or "").lower()]
+
+        # 构造 mentionHint
+        mention_hint = ""
+        if members and len(members) <= 10:
+            names = [m.get("name_card") or m.get("nickname") or m.get("user_id", "") for m in members]
+            mention_hint = "可用 @名称 提及: " + ", ".join(names)
+
+        return {
+            "members": members[:50],  # 限制返回数量
+            "total": len(members),
+            "mentionHint": mention_hint,
+        }
+
+    # ------------------------------------------------------------------
     # Outbound queue helpers
     # ------------------------------------------------------------------
 
