@@ -76,7 +76,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write, is_truthy_value
+from utils import atomic_yaml_write
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -186,8 +186,6 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
             if "gateway_timeout_warning" in _agent_cfg and "HERMES_AGENT_TIMEOUT_WARNING" not in os.environ:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
-            if "gateway_notify_interval" in _agent_cfg and "HERMES_AGENT_NOTIFY_INTERVAL" not in os.environ:
-                os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg and "HERMES_RESTART_DRAIN_TIMEOUT" not in os.environ:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
         _display_cfg = _cfg.get("display", {})
@@ -207,15 +205,6 @@ if _config_path.exists():
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
     except Exception:
         pass  # Non-fatal; gateway can still run with .env values
-
-# Apply IPv4 preference if configured (before any HTTP clients are created).
-try:
-    from hermes_constants import apply_ipv4_preference
-    _network_cfg = (_cfg if '_cfg' in dir() else {}).get("network", {})
-    if isinstance(_network_cfg, dict) and _network_cfg.get("force_ipv4"):
-        apply_ipv4_preference(force=True)
-except Exception:
-    pass
 
 # Validate config structure early — log warnings so gateway operators see problems
 try:
@@ -363,14 +352,19 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
-    """Consume and return the full pending event for a session.
+def _dequeue_pending_text(adapter, session_key: str) -> str | None:
+    """Consume and return the text of a pending queued message.
 
-    Queued follow-ups must preserve their media metadata so they can re-enter
-    the normal image/STT/document preprocessing path instead of being reduced
-    to a placeholder string.
+    Preserves media context for captionless photo/document events by
+    building a placeholder so the message isn't silently dropped.
     """
-    return adapter.get_pending_message(session_key)
+    event = adapter.get_pending_message(session_key)
+    if not event:
+        return None
+    text = event.text
+    if not text and getattr(event, "media_urls", None):
+        text = _build_media_placeholder(event)
+    return text
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:
@@ -878,47 +872,13 @@ class GatewayRunner:
                 "api_mode": override.get("api_mode"),
             }
             if override_runtime.get("api_key"):
-                logger.debug(
-                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
-                    (resolved_session_key or "")[:30], model, override_model,
-                    override_runtime.get("provider"),
-                )
                 return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
-            logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                (resolved_session_key or "")[:30], model, override_model,
-            )
-        else:
-            logger.debug(
-                "No session model override: session=%s config_model=%s override_keys=%s",
-                (resolved_session_key or "")[:30], model,
-                list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
-            )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
-
-        # When the config has no model.default but a provider was resolved
-        # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
-        # fall back to the provider's first catalog model so the API call
-        # doesn't fail with "model must be a non-empty string".
-        if not model and runtime_kwargs.get("provider"):
-            try:
-                from hermes_cli.models import get_default_model_for_provider
-                model = get_default_model_for_provider(runtime_kwargs["provider"])
-                if model:
-                    logger.info(
-                        "No model configured — defaulting to %s for provider %s",
-                        model, runtime_kwargs["provider"],
-                    )
-            except Exception:
-                pass
-
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
@@ -960,12 +920,6 @@ class GatewayRunner:
             adapter.platform.value,
             adapter.fatal_error_code or "unknown",
             adapter.fatal_error_message or "unknown error",
-        )
-        self._update_platform_runtime_status(
-            adapter.platform.value,
-            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
-            error_code=adapter.fatal_error_code,
-            error_message=adapter.fatal_error_message,
         )
 
         existing = self.adapters.get(adapter.platform)
@@ -1041,25 +995,6 @@ class GatewayRunner:
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
                 active_agents=self._running_agent_count(),
-            )
-        except Exception:
-            pass
-
-    def _update_platform_runtime_status(
-        self,
-        platform: str,
-        *,
-        platform_state: Optional[str] = None,
-        error_code: Optional[str] = None,
-        error_message: Optional[str] = None,
-    ) -> None:
-        try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(
-                platform=platform,
-                platform_state=platform_state,
-                error_code=error_code,
-                error_message=error_message,
             )
         except Exception:
             pass
@@ -1496,10 +1431,8 @@ class GatewayRunner:
                        "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
                        "FEISHU_ALLOWED_USERS",
                        "WECOM_ALLOWED_USERS",
-                       "WECOM_CALLBACK_ALLOWED_USERS",
                        "WEIXIN_ALLOWED_USERS",
                        "BLUEBUBBLES_ALLOWED_USERS",
-                       "QQ_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
@@ -1511,10 +1444,8 @@ class GatewayRunner:
                        "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
                        "FEISHU_ALLOW_ALL_USERS",
                        "WECOM_ALLOW_ALL_USERS",
-                       "WECOM_CALLBACK_ALLOW_ALL_USERS",
                        "WEIXIN_ALLOW_ALL_USERS",
-                       "BLUEBUBBLES_ALLOW_ALL_USERS",
-                       "QQ_ALLOW_ALL_USERS")
+                       "BLUEBUBBLES_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
@@ -1534,31 +1465,7 @@ class GatewayRunner:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
-
-        # Suspend sessions that were active when the gateway last exited.
-        # This prevents stuck sessions from being blindly resumed on restart,
-        # which can create an unrecoverable loop (#7536).  Suspended sessions
-        # auto-reset on the next incoming message, giving the user a clean start.
-        #
-        # SKIP suspension after a clean (graceful) shutdown — the previous
-        # process already drained active agents, so sessions aren't stuck.
-        # This prevents unwanted auto-resets after `hermes update`,
-        # `hermes gateway restart`, or `/restart`.
-        _clean_marker = _hermes_home / ".clean_shutdown"
-        if _clean_marker.exists():
-            logger.info("Previous gateway exited cleanly — skipping session suspension")
-            try:
-                _clean_marker.unlink()
-            except Exception:
-                pass
-        else:
-            try:
-                suspended = self.session_store.suspend_recently_active()
-                if suspended:
-                    logger.info("Suspended %d in-flight session(s) from previous run", suspended)
-            except Exception as e:
-                logger.warning("Session suspension on startup failed: %s", e)
-
+        
         connected_count = 0
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
@@ -1583,34 +1490,16 @@ class GatewayRunner:
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
-            self._update_platform_runtime_status(
-                platform.value,
-                platform_state="connecting",
-                error_code=None,
-                error_message=None,
-            )
             try:
                 success = await adapter.connect()
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
-                    self._update_platform_runtime_status(
-                        platform.value,
-                        platform_state="connected",
-                        error_code=None,
-                        error_message=None,
-                    )
                     logger.info("✓ %s connected", platform.value)
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     if adapter.has_fatal_error:
-                        self._update_platform_runtime_status(
-                            platform.value,
-                            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
-                            error_code=adapter.fatal_error_code,
-                            error_message=adapter.fatal_error_message,
-                        )
                         target = (
                             startup_retryable_errors
                             if adapter.fatal_error_retryable
@@ -1627,12 +1516,6 @@ class GatewayRunner:
                                 "next_retry": time.monotonic() + 30,
                             }
                     else:
-                        self._update_platform_runtime_status(
-                            platform.value,
-                            platform_state="retrying",
-                            error_code=None,
-                            error_message="failed to connect",
-                        )
                         startup_retryable_errors.append(
                             f"{platform.value}: failed to connect"
                         )
@@ -1644,12 +1527,6 @@ class GatewayRunner:
                         }
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
-                self._update_platform_runtime_status(
-                    platform.value,
-                    platform_state="retrying",
-                    error_code=None,
-                    error_message=str(e),
-                )
                 startup_retryable_errors.append(f"{platform.value}: {e}")
                 # Unexpected exceptions are typically transient — queue for retry
                 self._failed_platforms[platform] = {
@@ -1718,9 +1595,6 @@ class GatewayRunner:
             )
         ):
             self._schedule_update_notification_watch()
-
-        # Notify the chat that initiated /restart that the gateway is back.
-        await self._send_restart_notification()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -1931,12 +1805,6 @@ class GatewayRunner:
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
-                        self._update_platform_runtime_status(
-                            platform.value,
-                            platform_state="connected",
-                            error_code=None,
-                            error_message=None,
-                        )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
@@ -1948,24 +1816,12 @@ class GatewayRunner:
                     else:
                         # Check if the failure is non-retryable
                         if adapter.has_fatal_error and not adapter.fatal_error_retryable:
-                            self._update_platform_runtime_status(
-                                platform.value,
-                                platform_state="fatal",
-                                error_code=adapter.fatal_error_code,
-                                error_message=adapter.fatal_error_message,
-                            )
                             logger.warning(
                                 "Reconnect %s: non-retryable error (%s), removing from retry queue",
                                 platform.value, adapter.fatal_error_message,
                             )
                             del self._failed_platforms[platform]
                         else:
-                            self._update_platform_runtime_status(
-                                platform.value,
-                                platform_state="retrying",
-                                error_code=adapter.fatal_error_code,
-                                error_message=adapter.fatal_error_message or "failed to reconnect",
-                            )
                             backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                             info["attempts"] = attempt
                             info["next_retry"] = time.monotonic() + backoff
@@ -1974,12 +1830,6 @@ class GatewayRunner:
                                 platform.value, backoff,
                             )
                 except Exception as e:
-                    self._update_platform_runtime_status(
-                        platform.value,
-                        platform_state="retrying",
-                        error_code=None,
-                        error_message=str(e),
-                    )
                     backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                     info["attempts"] = attempt
                     info["next_retry"] = time.monotonic() + backoff
@@ -2086,15 +1936,6 @@ class GatewayRunner:
             from gateway.status import remove_pid_file
             remove_pid_file()
 
-            # Write a clean-shutdown marker so the next startup knows this
-            # wasn't a crash.  suspend_recently_active() only needs to run
-            # after unexpected exits — graceful shutdowns already drain
-            # active agents, so there's no stuck-session risk.
-            try:
-                (_hermes_home / ".clean_shutdown").touch()
-            except Exception:
-                pass
-
             if self._restart_requested and self._restart_via_service:
                 self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
@@ -2196,16 +2037,6 @@ class GatewayRunner:
                 return None
             return FeishuAdapter(config)
 
-        elif platform == Platform.WECOM_CALLBACK:
-            from gateway.platforms.wecom_callback import (
-                WecomCallbackAdapter,
-                check_wecom_callback_requirements,
-            )
-            if not check_wecom_callback_requirements():
-                logger.warning("WeComCallback: aiohttp/httpx not installed")
-                return None
-            return WecomCallbackAdapter(config)
-
         elif platform == Platform.WECOM:
             from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
             if not check_wecom_requirements():
@@ -2257,15 +2088,15 @@ class GatewayRunner:
                 return None
             return BlueBubblesAdapter(config)
 
-        elif platform == Platform.QQBOT:
-            from gateway.platforms.qqbot import QQAdapter, check_qq_requirements
-            if not check_qq_requirements():
-                logger.warning("QQBot: aiohttp/httpx missing or QQ_APP_ID/QQ_CLIENT_SECRET not configured")
+        elif platform == Platform.YUANBAO:
+            from gateway.platforms.yuanbao import YuanbaoAdapter, WEBSOCKETS_AVAILABLE
+            if not WEBSOCKETS_AVAILABLE:
+                logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
                 return None
-            return QQAdapter(config)
+            return YuanbaoAdapter(config)
 
         return None
-
+    
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -2302,10 +2133,8 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
-            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
-            Platform.QQBOT: "QQ_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -2320,10 +2149,8 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
-            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
-            Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -2401,13 +2228,6 @@ class GatewayRunner:
         # are system-generated and must skip user authorization.
         if getattr(event, "internal", False):
             pass
-        elif source.user_id is None:
-            # Messages with no user identity (Telegram service messages,
-            # channel forwards, anonymous admin actions) cannot be
-            # authorized — drop silently instead of triggering the pairing
-            # flow with a None user_id.
-            logger.debug("Ignoring message with no user_id from %s", source.platform.value)
-            return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
@@ -2557,8 +2377,8 @@ class GatewayRunner:
                 self._pending_messages.pop(_quick_key, None)
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]
-                logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
-                return "⚡ Stopped. You can continue this session."
+                logger.info("HARD STOP for session %s — session lock released", _quick_key[:20])
+                return "⚡ Force-stopped. The session is unlocked — you can send a new message."
 
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
@@ -2768,9 +2588,6 @@ class GatewayRunner:
         if canonical == "update":
             return await self._handle_update_command(event)
 
-        if canonical == "debug":
-            return await self._handle_debug_command(event)
-
         if canonical == "title":
             return await self._handle_title_command(event)
 
@@ -2944,162 +2761,6 @@ class GatewayRunner:
                 del self._running_agents[_quick_key]
             self._running_agents_ts.pop(_quick_key, None)
 
-    async def _prepare_inbound_message_text(
-        self,
-        *,
-        event: MessageEvent,
-        source: SessionSource,
-        history: List[Dict[str, Any]],
-    ) -> Optional[str]:
-        """Prepare inbound event text for the agent.
-
-        Keep the normal inbound path and the queued follow-up path on the same
-        preprocessing pipeline so sender attribution, image enrichment, STT,
-        document notes, reply context, and @ references all behave the same.
-        """
-        history = history or []
-        message_text = event.text or ""
-
-        _is_shared_thread = (
-            source.chat_type != "dm"
-            and source.thread_id
-            and not getattr(self.config, "thread_sessions_per_user", False)
-        )
-        if _is_shared_thread and source.user_name:
-            message_text = f"[{source.user_name}] {message_text}"
-
-        if event.media_urls:
-            image_paths = []
-            audio_paths = []
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
-                    image_paths.append(path)
-                if mtype.startswith("audio/") or event.message_type in (MessageType.VOICE, MessageType.AUDIO):
-                    audio_paths.append(path)
-
-            if image_paths:
-                message_text = await self._enrich_message_with_vision(
-                    message_text,
-                    image_paths,
-                )
-
-            if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
-                )
-                _stt_fail_markers = (
-                    "No STT provider",
-                    "STT is disabled",
-                    "can't listen",
-                    "VOICE_TOOLS_OPENAI_KEY",
-                )
-                if any(marker in message_text for marker in _stt_fail_markers):
-                    _stt_adapter = self.adapters.get(source.platform)
-                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                    if _stt_adapter:
-                        try:
-                            _stt_msg = (
-                                "🎤 I received your voice message but can't transcribe it — "
-                                "no speech-to-text provider is configured.\n\n"
-                                "To enable voice: install faster-whisper "
-                                "(`pip install faster-whisper` in the Hermes venv) "
-                                "and set `stt.enabled: true` in config.yaml, "
-                                "then /restart the gateway."
-                            )
-                            if self._has_setup_skill():
-                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
-                            await _stt_adapter.send(
-                                source.chat_id,
-                                _stt_msg,
-                                metadata=_stt_meta,
-                            )
-                        except Exception:
-                            pass
-
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
-            import mimetypes as _mimetypes
-
-            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                if mtype in ("", "application/octet-stream"):
-                    import os as _os2
-
-                    _ext = _os2.path.splitext(path)[1].lower()
-                    if _ext in _TEXT_EXTENSIONS:
-                        mtype = "text/plain"
-                    else:
-                        guessed, _ = _mimetypes.guess_type(path)
-                        if guessed:
-                            mtype = guessed
-                if not mtype.startswith(("application/", "text/")):
-                    continue
-
-                import os as _os
-                import re as _re
-
-                basename = _os.path.basename(path)
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
-
-                if mtype.startswith("text/"):
-                    context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
-                    )
-                else:
-                    context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
-                        f"Ask the user what they'd like you to do with it.]"
-                    )
-                message_text = f"{context_note}\n\n{message_text}"
-
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            reply_snippet = event.reply_to_text[:500]
-            found_in_history = any(
-                reply_snippet[:200] in (msg.get("content") or "")
-                for msg in history
-                if msg.get("role") in ("assistant", "user", "tool")
-            )
-            if not found_in_history:
-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
-
-        if "@" in message_text:
-            try:
-                from agent.context_references import preprocess_context_references_async
-                from agent.model_metadata import get_model_context_length
-
-                _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
-                _msg_ctx_len = get_model_context_length(
-                    self._model,
-                    base_url=self._base_url or "",
-                )
-                _ctx_result = await preprocess_context_references_async(
-                    message_text,
-                    cwd=_msg_cwd,
-                    context_length=_msg_ctx_len,
-                    allowed_root=_msg_cwd,
-                )
-                if _ctx_result.blocked:
-                    _adapter = self.adapters.get(source.platform)
-                    if _adapter:
-                        await _adapter.send(
-                            source.chat_id,
-                            "\n".join(_ctx_result.warnings) or "Context injection refused.",
-                        )
-                    return None
-                if _ctx_result.expanded:
-                    message_text = _ctx_result.message
-            except Exception as exc:
-                logger.debug("@ context reference expansion failed: %s", exc)
-
-        return message_text
-
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -3151,9 +2812,7 @@ class GatewayRunner:
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
-            if reset_reason == "suspended":
-                context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
-            elif reset_reason == "daily":
+            if reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
@@ -3170,9 +2829,7 @@ class GatewayRunner:
                 )
                 platform_name = source.platform.value if source.platform else ""
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended sessions always notify (they were explicitly stopped
-                # or crashed mid-operation) — skip the policy check.
-                should_notify = reset_reason == "suspended" or (
+                should_notify = (
                     policy.notify
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
@@ -3180,9 +2837,7 @@ class GatewayRunner:
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
-                        elif reset_reason == "daily":
+                        if reset_reason == "daily":
                             reason_text = f"daily schedule at {policy.at_hour}:00"
                         else:
                             hours = policy.idle_minutes // 60
@@ -3338,26 +2993,21 @@ class GatewayRunner:
                 # Must run after runtime resolution so _hyg_base_url is set.
                 if _hyg_config_context_length is None and _hyg_base_url:
                     try:
-                        try:
-                            from hermes_cli.config import get_compatible_custom_providers as _gw_gcp
-                            _hyg_custom_providers = _gw_gcp(_hyg_data)
-                        except Exception:
-                            _hyg_custom_providers = _hyg_data.get("custom_providers")
-                            if not isinstance(_hyg_custom_providers, list):
-                                _hyg_custom_providers = []
-                        for _cp in _hyg_custom_providers:
-                            if not isinstance(_cp, dict):
-                                continue
-                            _cp_url = (_cp.get("base_url") or "").rstrip("/")
-                            if _cp_url and _cp_url == _hyg_base_url.rstrip("/"):
-                                _cp_models = _cp.get("models", {})
-                                if isinstance(_cp_models, dict):
-                                    _cp_model_cfg = _cp_models.get(_hyg_model, {})
-                                    if isinstance(_cp_model_cfg, dict):
-                                        _cp_ctx = _cp_model_cfg.get("context_length")
-                                        if _cp_ctx is not None:
-                                            _hyg_config_context_length = int(_cp_ctx)
-                                break
+                        _hyg_custom_providers = _hyg_data.get("custom_providers")
+                        if isinstance(_hyg_custom_providers, list):
+                            for _cp in _hyg_custom_providers:
+                                if not isinstance(_cp, dict):
+                                    continue
+                                _cp_url = (_cp.get("base_url") or "").rstrip("/")
+                                if _cp_url and _cp_url == _hyg_base_url.rstrip("/"):
+                                    _cp_models = _cp.get("models", {})
+                                    if isinstance(_cp_models, dict):
+                                        _cp_model_cfg = _cp_models.get(_hyg_model, {})
+                                        if isinstance(_cp_model_cfg, dict):
+                                            _cp_ctx = _cp_model_cfg.get("context_length")
+                                            if _cp_ctx is not None:
+                                                _hyg_config_context_length = int(_cp_ctx)
+                                    break
                     except (TypeError, ValueError):
                         pass
             except Exception:
@@ -3545,13 +3195,149 @@ class GatewayRunner:
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
+        message_text = event.text or ""
+
+        # -----------------------------------------------------------------
+        # Sender attribution for shared thread sessions.
+        #
+        # When multiple users share a single thread session (the default for
+        # threads), prefix each message with [sender name] so the agent can
+        # tell participants apart.  Skip for DMs (single-user by nature) and
+        # when per-user thread isolation is explicitly enabled.
+        # -----------------------------------------------------------------
+        _is_shared_thread = (
+            source.chat_type != "dm"
+            and source.thread_id
+            and not getattr(self.config, "thread_sessions_per_user", False)
         )
-        if message_text is None:
-            return
+        if _is_shared_thread and source.user_name:
+            message_text = f"[{source.user_name}] {message_text}"
+
+        if event.media_urls:
+            image_paths = []
+            for i, path in enumerate(event.media_urls):
+                # Check media_types if available; otherwise infer from message type
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_image = (
+                    mtype.startswith("image/")
+                    or event.message_type == MessageType.PHOTO
+                )
+                if is_image:
+                    image_paths.append(path)
+            if image_paths:
+                message_text = await self._enrich_message_with_vision(
+                    message_text, image_paths
+                )
+        
+        # -----------------------------------------------------------------
+        # Auto-transcribe voice/audio messages sent by the user
+        # -----------------------------------------------------------------
+        if event.media_urls:
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_audio = (
+                    mtype.startswith("audio/")
+                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
+                )
+                if is_audio:
+                    audio_paths.append(path)
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text, audio_paths
+                )
+                # If STT failed, send a direct message to the user so they
+                # know voice isn't configured — don't rely on the agent to
+                # relay the error clearly.
+                _stt_fail_markers = (
+                    "No STT provider",
+                    "STT is disabled",
+                    "can't listen",
+                    "VOICE_TOOLS_OPENAI_KEY",
+                )
+                if any(m in message_text for m in _stt_fail_markers):
+                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    if _stt_adapter:
+                        try:
+                            _stt_msg = (
+                                "🎤 I received your voice message but can't transcribe it — "
+                                "no speech-to-text provider is configured.\n\n"
+                                "To enable voice: install faster-whisper "
+                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "and set `stt.enabled: true` in config.yaml, "
+                                "then /restart the gateway."
+                            )
+                            # Point to setup skill if it's installed
+                            if self._has_setup_skill():
+                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                            await _stt_adapter.send(
+                                source.chat_id, _stt_msg,
+                                metadata=_stt_meta,
+                            )
+                        except Exception:
+                            pass
+
+        # -----------------------------------------------------------------
+        # Enrich document messages with context notes for the agent
+        # -----------------------------------------------------------------
+        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            import mimetypes as _mimetypes
+            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                # Fall back to extension-based detection when MIME type is unreliable.
+                if mtype in ("", "application/octet-stream"):
+                    import os as _os2
+                    _ext = _os2.path.splitext(path)[1].lower()
+                    if _ext in _TEXT_EXTENSIONS:
+                        mtype = "text/plain"
+                    else:
+                        guessed, _ = _mimetypes.guess_type(path)
+                        if guessed:
+                            mtype = guessed
+                if not mtype.startswith(("application/", "text/")):
+                    continue
+                # Extract display filename by stripping the doc_{uuid12}_ prefix
+                import os as _os
+                basename = _os.path.basename(path)
+                # Format: doc_<12hex>_<original_filename>
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                # Sanitize to prevent prompt injection via filenames
+                import re as _re
+                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+
+                if mtype.startswith("text/"):
+                    context_note = (
+                        f"[The user sent a text document: '{display_name}'. "
+                        f"Its content has been included below. "
+                        f"The file is also saved at: {path}]"
+                    )
+                else:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"The file is saved at: {path}. "
+                        f"Ask the user what they'd like you to do with it.]"
+                    )
+                message_text = f"{context_note}\n\n{message_text}"
+
+        # -----------------------------------------------------------------
+        # Inject reply context when user replies to a message not in history.
+        # Telegram (and other platforms) let users reply to specific messages,
+        # but if the quoted message is from a previous session, cron delivery,
+        # or background task, the agent has no context about what's being
+        # referenced. Prepend the quoted text so the agent understands. (#1594)
+        # -----------------------------------------------------------------
+        if getattr(event, 'reply_to_text', None) and event.reply_to_message_id:
+            reply_snippet = event.reply_to_text[:500]
+            found_in_history = any(
+                reply_snippet[:200] in (msg.get("content") or "")
+                for msg in history
+                if msg.get("role") in ("assistant", "user", "tool")
+            )
+            if not found_in_history:
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         try:
             # Emit agent:start hook
@@ -3562,6 +3348,30 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
+
+            # Expand @ context references (@file:, @folder:, @diff, etc.)
+            if "@" in message_text:
+                try:
+                    from agent.context_references import preprocess_context_references_async
+                    from agent.model_metadata import get_model_context_length
+                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                    _msg_ctx_len = get_model_context_length(
+                        self._model, base_url=self._base_url or "")
+                    _ctx_result = await preprocess_context_references_async(
+                        message_text, cwd=_msg_cwd,
+                        context_length=_msg_ctx_len, allowed_root=_msg_cwd)
+                    if _ctx_result.blocked:
+                        _adapter = self.adapters.get(source.platform)
+                        if _adapter:
+                            await _adapter.send(
+                                source.chat_id,
+                                "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            )
+                        return
+                    if _ctx_result.expanded:
+                        message_text = _ctx_result.message
+                except Exception as exc:
+                    logger.debug("@ context reference expansion failed: %s", exc)
 
             # Run the agent
             agent_result = await self._run_agent(
@@ -3626,18 +3436,8 @@ class GatewayRunner:
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
 
-            # Prepend reasoning/thinking if display is enabled (per-platform)
-            try:
-                from gateway.display_config import resolve_display_setting as _rds
-                _show_reasoning_effective = _rds(
-                    _load_gateway_config(),
-                    _platform_config_key(source.platform),
-                    "show_reasoning",
-                    getattr(self, "_show_reasoning", False),
-                )
-            except Exception:
-                _show_reasoning_effective = getattr(self, "_show_reasoning", False)
-            if _show_reasoning_effective and response:
+            # Prepend reasoning/thinking if display is enabled
+            if getattr(self, "_show_reasoning", False) and response:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -4042,16 +3842,9 @@ class GatewayRunner:
         except Exception:
             pass
 
-        # Append a random tip to the reset message
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = f"\n✦ Tip: {get_random_tip()}"
-        except Exception:
-            _tip_line = ""
-
         if session_info:
-            return f"{header}\n\n{session_info}{_tip_line}"
-        return f"{header}{_tip_line}"
+            return f"{header}\n\n{session_info}"
+        return header
     
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""
@@ -4127,27 +3920,25 @@ class GatewayRunner:
         handles /stop before this method is reached.  This handler fires
         only through normal command dispatch (no running agent) or as a
         fallback.  Force-clean the session lock in all cases for safety.
-
-        The session is preserved so the user can continue the conversation.
         """
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-
+        
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
-            logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
-            return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
+            logger.info("HARD STOP (pending) for session %s — sentinel cleared", session_key[:20])
+            return "⚡ Force-stopped. The agent was still starting — session unlocked."
         if agent:
             agent.interrupt("Stop requested")
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
-            return "⚡ Stopped. You can continue this session."
+            return "⚡ Force-stopped. The session is unlocked — you can send a new message."
         else:
             return "No active task to stop."
 
@@ -4159,36 +3950,11 @@ class GatewayRunner:
                 return f"⏳ Draining {count} active agent(s) before restart..."
             return "⏳ Gateway restart already in progress..."
 
-        # Save the requester's routing info so the new gateway process can
-        # notify them once it comes back online.
-        try:
-            import json as _json
-            notify_data = {
-                "platform": event.source.platform.value if event.source.platform else None,
-                "chat_id": event.source.chat_id,
-            }
-            if event.source.thread_id:
-                notify_data["thread_id"] = event.source.thread_id
-            (_hermes_home / ".restart_notify.json").write_text(
-                _json.dumps(notify_data)
-            )
-        except Exception as e:
-            logger.debug("Failed to write restart notify file: %s", e)
-
         active_agents = self._running_agent_count()
-        # When running under a service manager (systemd/launchd), use the
-        # service restart path: exit with code 75 so the service manager
-        # restarts us.  The detached subprocess approach (setsid + bash)
-        # doesn't work under systemd because KillMode=mixed kills all
-        # processes in the cgroup, including the detached helper.
-        _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
-        if _under_service:
-            self.request_restart(detached=False, via_service=True)
-        else:
-            self.request_restart(detached=True, via_service=False)
+        self.request_restart(detached=True, via_service=False)
         if active_agents:
             return f"⏳ Draining {active_agents} active agent(s) before restart..."
-        return "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+        return "♻ Restarting gateway..."
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
@@ -4305,11 +4071,7 @@ class GatewayRunner:
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
-                try:
-                    from hermes_cli.config import get_compatible_custom_providers
-                    custom_provs = get_compatible_custom_providers(cfg)
-                except Exception:
-                    custom_provs = cfg.get("custom_providers")
+                custom_provs = cfg.get("custom_providers")
         except Exception:
             pass
 
@@ -4405,11 +4167,6 @@ class GatewayRunner:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
-
-                        # Evict cached agent so the next turn creates a fresh
-                        # agent from the override rather than relying on the
-                        # stale cache signature to trigger a rebuild.
-                        _self._evict_cached_agent(_session_key)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -4523,10 +4280,6 @@ class GatewayRunner:
             "base_url": result.base_url,
             "api_mode": result.api_mode,
         }
-
-        # Evict cached agent so the next turn creates a fresh agent from the
-        # override rather than relying on cache signature mismatch detection.
-        self._evict_cached_agent(session_key)
 
         # Persist to config if --global
         if persist_global:
@@ -4940,8 +4693,6 @@ class GatewayRunner:
 
         if success:
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
-            if hasattr(adapter, "_voice_sources"):
-                adapter._voice_sources[guild_id] = event.source.to_dict()
             self._voice_mode[event.source.chat_id] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=False)
@@ -5002,23 +4753,14 @@ class GatewayRunner:
         if not text_ch_id:
             return
 
-        # Build source — reuse the linked text channel's metadata when available
-        # so voice input shares the same session as the bound text conversation.
-        source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
-        if source_data:
-            source = SessionSource.from_dict(source_data)
-            source.user_id = str(user_id)
-            source.user_name = str(user_id)
-        else:
-            source = SessionSource(
-                platform=Platform.DISCORD,
-                chat_id=str(text_ch_id),
-                user_id=str(user_id),
-                user_name=str(user_id),
-                chat_type="channel",
-            )
-
         # Check authorization before processing voice input
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=str(text_ch_id),
+            user_id=str(user_id),
+            user_name=str(user_id),
+            chat_type="channel",
+        )
         if not self._is_user_authorized(source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
@@ -5675,20 +5417,16 @@ class GatewayRunner:
                 "_Usage:_ `/reasoning <none|minimal|low|medium|high|xhigh|show|hide>`"
             )
 
-        # Display toggle (per-platform)
-        platform_key = _platform_config_key(event.source.platform)
+        # Display toggle
         if args in ("show", "on"):
             self._show_reasoning = True
-            _save_config_key(f"display.platforms.{platform_key}.show_reasoning", True)
-            return (
-                "🧠 ✓ Reasoning display: **ON**\n"
-                f"Model thinking will be shown before each response on **{platform_key}**."
-            )
+            _save_config_key("display.show_reasoning", True)
+            return "🧠 ✓ Reasoning display: **ON**\nModel thinking will be shown before each response."
 
         if args in ("hide", "off"):
             self._show_reasoning = False
-            _save_config_key(f"display.platforms.{platform_key}.show_reasoning", False)
-            return f"🧠 ✓ Reasoning display: **OFF** for **{platform_key}**"
+            _save_config_key("display.show_reasoning", False)
+            return "🧠 ✓ Reasoning display: **OFF**"
 
         # Effort level change
         effort = args.strip()
@@ -5791,14 +5529,11 @@ class GatewayRunner:
 
         Gated by ``display.tool_progress_command`` in config.yaml (default off).
         When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
-        ``display.platforms.<platform>.tool_progress`` so each channel can
-        have its own verbosity level independently.
+        verbose → off, same as the CLI.
         """
         import yaml
 
         config_path = _hermes_home / "config.yaml"
-        platform_key = _platform_config_key(event.source.platform)
 
         # --- check config gate ------------------------------------------------
         try:
@@ -5817,7 +5552,7 @@ class GatewayRunner:
                 "display:\n  tool_progress_command: true\n```"
             )
 
-        # --- cycle mode (per-platform) ----------------------------------------
+        # --- cycle mode -------------------------------------------------------
         cycle = ["off", "new", "all", "verbose"]
         descriptions = {
             "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
@@ -5826,49 +5561,38 @@ class GatewayRunner:
             "verbose": "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments.",
         }
 
-        # Read current effective mode for this platform via the resolver
-        from gateway.display_config import resolve_display_setting
-        current = resolve_display_setting(user_config, platform_key, "tool_progress", "all")
+        raw_progress = user_config.get("display", {}).get("tool_progress", "all")
+        # YAML 1.1 parses bare "off" as boolean False — normalise back
+        if raw_progress is False:
+            current = "off"
+        elif raw_progress is True:
+            current = "all"
+        else:
+            current = str(raw_progress).lower()
         if current not in cycle:
             current = "all"
         idx = (cycle.index(current) + 1) % len(cycle)
         new_mode = cycle[idx]
 
-        # Save to display.platforms.<platform>.tool_progress
+        # Save to config.yaml
         try:
             if "display" not in user_config or not isinstance(user_config.get("display"), dict):
                 user_config["display"] = {}
-            display = user_config["display"]
-            if "platforms" not in display or not isinstance(display.get("platforms"), dict):
-                display["platforms"] = {}
-            if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
-                display["platforms"][platform_key] = {}
-            display["platforms"][platform_key]["tool_progress"] = new_mode
+            user_config["display"]["tool_progress"] = new_mode
             atomic_yaml_write(config_path, user_config)
-            return (
-                f"{descriptions[new_mode]}\n"
-                f"_(saved for **{platform_key}** — takes effect on next message)_"
-            )
+            return f"{descriptions[new_mode]}\n_(saved to config — takes effect on next message)_"
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{descriptions[new_mode]}\n_(could not save to config: {e})_"
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
-        """Handle /compress command -- manually compress conversation context.
-
-        Accepts an optional focus topic: ``/compress <focus>`` guides the
-        summariser to preserve information related to *focus* while being
-        more aggressive about discarding everything else.
-        """
+        """Handle /compress command -- manually compress conversation context."""
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
             return "Not enough conversation to compress (need at least 4 messages)."
-
-        # Extract optional focus topic from command args
-        focus_topic = (event.get_command_args() or "").strip() or None
 
         try:
             from run_agent import AIAgent
@@ -5911,7 +5635,7 @@ class GatewayRunner:
             loop = asyncio.get_event_loop()
             compressed, _ = await loop.run_in_executor(
                 None,
-                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic)
+                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens)
             )
 
             # _compress_context already calls end_session() on the old session
@@ -5935,10 +5659,7 @@ class GatewayRunner:
                 approx_tokens,
                 new_tokens,
             )
-            lines = [f"🗜️ {summary['headline']}"]
-            if focus_topic:
-                lines.append(f"Focus: \"{focus_topic}\"")
-            lines.append(summary["token_line"])
+            lines = [f"🗜️ {summary['headline']}", summary["token_line"]]
             if summary["note"]:
                 lines.append(summary["note"])
             return "\n".join(lines)
@@ -6307,7 +6028,7 @@ class GatewayRunner:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
         loop = asyncio.get_event_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _load_mcp_config, _servers, _lock
 
             # Capture old server names before shutdown
             with _lock:
@@ -6480,63 +6201,8 @@ class GatewayRunner:
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
-        Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
+        Platform.FEISHU, Platform.WECOM, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.LOCAL,
     })
-
-    async def _handle_debug_command(self, event: MessageEvent) -> str:
-        """Handle /debug — upload debug report + logs and return paste URLs."""
-        import asyncio
-        from hermes_cli.debug import (
-            _capture_dump, collect_debug_report, _read_full_log,
-            upload_to_pastebin,
-        )
-
-        loop = asyncio.get_running_loop()
-
-        # Run blocking I/O (dump capture, log reads, uploads) in a thread.
-        def _collect_and_upload():
-            dump_text = _capture_dump()
-            report = collect_debug_report(log_lines=200, dump_text=dump_text)
-            agent_log = _read_full_log("agent")
-            gateway_log = _read_full_log("gateway")
-
-            if agent_log:
-                agent_log = dump_text + "\n\n--- full agent.log ---\n" + agent_log
-            if gateway_log:
-                gateway_log = dump_text + "\n\n--- full gateway.log ---\n" + gateway_log
-
-            urls = {}
-            failures = []
-
-            try:
-                urls["Report"] = upload_to_pastebin(report)
-            except Exception as exc:
-                return f"✗ Failed to upload debug report: {exc}"
-
-            if agent_log:
-                try:
-                    urls["agent.log"] = upload_to_pastebin(agent_log)
-                except Exception:
-                    failures.append("agent.log")
-
-            if gateway_log:
-                try:
-                    urls["gateway.log"] = upload_to_pastebin(gateway_log)
-                except Exception:
-                    failures.append("gateway.log")
-
-            lines = ["**Debug report uploaded:**", ""]
-            label_width = max(len(k) for k in urls)
-            for label, url in urls.items():
-                lines.append(f"`{label:<{label_width}}`  {url}")
-
-            if failures:
-                lines.append(f"\n_(failed to upload: {', '.join(failures)})_")
-
-            lines.append("\nShare these links with the Hermes team for support.")
-            return "\n".join(lines)
-
-        return await loop.run_in_executor(None, _collect_and_upload)
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command — update Hermes Agent to the latest version.
@@ -6780,12 +6446,8 @@ class GatewayRunner:
             if buffer.strip() and (loop.time() - last_stream_time) >= stream_interval:
                 await _flush_buffer()
 
-            # Check for prompts — only forward if we haven't already sent
-            # one that's still awaiting a response.  Without this guard the
-            # watcher would re-read the same .update_prompt.json every poll
-            # cycle and spam the user with duplicate prompt messages.
-            if (prompt_path.exists() and session_key
-                    and not self._update_prompt_pending.get(session_key)):
+            # Check for prompts
+            if prompt_path.exists() and session_key:
                 try:
                     prompt_data = json.loads(prompt_path.read_text())
                     prompt_text = prompt_data.get("prompt", "")
@@ -6817,11 +6479,6 @@ class GatewayRunner:
                                 f"or type your answer directly."
                             )
                         self._update_prompt_pending[session_key] = True
-                        # Remove the prompt file so it isn't re-read on the
-                        # next poll cycle.  The update process only needs
-                        # .update_response to continue — it doesn't re-check
-                        # .update_prompt.json while waiting.
-                        prompt_path.unlink(missing_ok=True)
                         logger.info("Forwarded update prompt to %s: %s", session_key, prompt_text[:80])
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
@@ -6932,48 +6589,6 @@ class GatewayRunner:
 
         return True
 
-    async def _send_restart_notification(self) -> None:
-        """Notify the chat that initiated /restart that the gateway is back."""
-        import json as _json
-
-        notify_path = _hermes_home / ".restart_notify.json"
-        if not notify_path.exists():
-            return
-
-        try:
-            data = _json.loads(notify_path.read_text())
-            platform_str = data.get("platform")
-            chat_id = data.get("chat_id")
-            thread_id = data.get("thread_id")
-
-            if not platform_str or not chat_id:
-                return
-
-            platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
-            if not adapter:
-                logger.debug(
-                    "Restart notification skipped: %s adapter not connected",
-                    platform_str,
-                )
-                return
-
-            metadata = {"thread_id": thread_id} if thread_id else None
-            await adapter.send(
-                chat_id,
-                "♻ Gateway restarted successfully. Your session continues.",
-                metadata=metadata,
-            )
-            logger.info(
-                "Sent restart notification to %s:%s",
-                platform_str,
-                chat_id,
-            )
-        except Exception as e:
-            logger.warning("Restart notification failed: %s", e)
-        finally:
-            notify_path.unlink(missing_ok=True)
-
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -6989,9 +6604,6 @@ class GatewayRunner:
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
-            user_id=str(context.source.user_id) if context.source.user_id else "",
-            user_name=str(context.source.user_name) if context.source.user_name else "",
-            session_key=context.session_key,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -7204,8 +6816,6 @@ class GatewayRunner:
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
-        user_id = watcher.get("user_id", "")
-        user_name = watcher.get("user_name", "")
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
@@ -7237,9 +6847,7 @@ class GatewayRunner:
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/poll/log
-                from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                if agent_notify:
                     from tools.ansi_strip import strip_ansi
                     _out = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
                     synth_text = (
@@ -7263,8 +6871,6 @@ class GatewayRunner:
                                 platform=_platform_enum,
                                 chat_id=chat_id,
                                 thread_id=thread_id or None,
-                                user_id=user_id or None,
-                                user_name=user_name or None,
                             )
                             synth_event = MessageEvent(
                                 text=synth_text,
@@ -7435,27 +7041,31 @@ class GatewayRunner:
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
-        display_config = user_config.get("display", {})
-        if not isinstance(display_config, dict):
-            display_config = {}
-
-        # Per-platform display settings — resolve via display_config module
-        # which checks display.platforms.<platform>.<key> first, then
-        # display.<key> global, then built-in platform defaults.
-        from gateway.display_config import resolve_display_setting
-
         # Apply tool preview length config (0 = no limit)
         try:
             from agent.display import set_tool_preview_max_len
-            _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
+            _tpl = user_config.get("display", {}).get("tool_preview_length", 0)
             set_tool_preview_max_len(int(_tpl) if _tpl else 0)
         except Exception:
             pass
 
-        # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
+        # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
+        # Falls back to env vars for backward compatibility.
+        # YAML 1.1 parses bare `off` as boolean False — normalise before
+        # the `or` chain so it doesn't silently fall through to "all".
+        #
+        # Per-platform overrides (display.tool_progress_overrides) take
+        # priority over the global setting — e.g. Signal users can set
+        # tool_progress to "off" while keeping Telegram on "all".
+        _display_cfg = user_config.get("display", {})
+        _overrides = _display_cfg.get("tool_progress_overrides", {})
+        _raw_tp = _overrides.get(platform_key)
+        if _raw_tp is None:
+            _raw_tp = _display_cfg.get("tool_progress")
+        if _raw_tp is False:
+            _raw_tp = "off"
         progress_mode = (
-            _resolved_tp
+            _raw_tp
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
@@ -7463,16 +7073,6 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
-        # Natural assistant status messages are intentionally independent from
-        # tool progress and token streaming. Users can keep tool_progress quiet
-        # in chat platforms while opting into concise mid-turn updates.
-        interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
-            and is_truthy_value(
-                display_config.get("interim_assistant_messages"),
-                default=True,
-            )
-        )
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
@@ -7505,11 +7105,9 @@ class GatewayRunner:
                     _pl = get_tool_preview_max_len()
                     import json as _json
                     args_str = _json.dumps(args, ensure_ascii=False, default=str)
-                    # When tool_preview_length is 0 (default), don't truncate
-                    # in verbose mode — the user explicitly asked for full
-                    # detail.  Platform message-length limits handle the rest.
-                    if _pl > 0 and len(args_str) > _pl:
-                        args_str = args_str[:_pl - 3] + "..."
+                    _cap = _pl if _pl > 0 else 200
+                    if len(args_str) > _cap:
+                        args_str = args_str[:_cap - 3] + "..."
                     msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
                 elif preview:
                     msg = f"{emoji} {tool_name}: \"{preview}\""
@@ -7744,8 +7342,8 @@ class GatewayRunner:
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # session_key is now set via contextvars in _set_session_env()
-            # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
+            # Pass session_key to process registry via env var so background
+            # processes can be mapped back to this gateway session
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
             # Read from env var or use default (same as CLI)
@@ -7775,10 +7373,6 @@ class GatewayRunner:
                     session_key=session_key,
                     user_config=user_config,
                 )
-                logger.debug(
-                    "run_agent resolved: model=%s provider=%s session=%s",
-                    model, runtime_kwargs.get("provider"), (session_key or "")[:30],
-                )
             except Exception as exc:
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
@@ -7791,7 +7385,7 @@ class GatewayRunner:
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            # Set up stream consumer for token streaming or interim commentary.
+            # Set up streaming consumer if enabled
             _stream_consumer = None
             _stream_delta_cb = None
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
@@ -7799,44 +7393,15 @@ class GatewayRunner:
                 from gateway.config import StreamingConfig
                 _scfg = StreamingConfig()
 
-            # Per-platform streaming gate: display.platforms.<plat>.streaming
-            # can disable streaming for specific platforms even when the global
-            # streaming config is enabled.
-            _plat_streaming = resolve_display_setting(
-                user_config, platform_key, "streaming"
-            )
-            # None = no per-platform override → follow global config
-            _streaming_enabled = (
-                _scfg.enabled and _scfg.transport != "off"
-                if _plat_streaming is None
-                else bool(_plat_streaming)
-            )
-            _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
-            _want_interim_consumer = _want_interim_messages
-            if _want_stream_deltas or _want_interim_consumer:
+            if _scfg.enabled and _scfg.transport != "off":
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
+                            cursor=_scfg.cursor,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -7844,32 +7409,10 @@ class GatewayRunner:
                             config=_consumer_cfg,
                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
                         )
-                        if _want_stream_deltas:
-                            _stream_delta_cb = _stream_consumer.on_delta
+                        _stream_delta_cb = _stream_consumer.on_delta
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
-
-            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                if _stream_consumer is not None:
-                    if already_streamed:
-                        _stream_consumer.on_segment_break()
-                    else:
-                        _stream_consumer.on_commentary(text)
-                    return
-                if already_streamed or not _status_adapter or not str(text or "").strip():
-                    return
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
-                            text,
-                            metadata=_status_thread_metadata,
-                        ),
-                        _loop_for_step,
-                    )
-                except Exception as _e:
-                    logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
@@ -7928,7 +7471,6 @@ class GatewayRunner:
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
-            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
@@ -8232,7 +7774,6 @@ class GatewayRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "session_id": effective_session_id,
-                "response_previewed": result.get("response_previewed", False),
             }
         
         # Start progress message sender if enabled
@@ -8267,66 +7808,35 @@ class GatewayRunner:
         
         tracking_task = asyncio.create_task(track_agent())
         
-        # Monitor for interrupts from the adapter (new messages arriving).
-        # This is the PRIMARY interrupt path for regular text messages —
-        # Level 1 (base.py) catches them before _handle_message() is reached,
-        # so the Level 2 running_agent.interrupt() path never fires.
-        # The inactivity poll loop below has a BACKUP check in case this
-        # task dies (no error handling = silent death = lost interrupts).
-        _interrupt_detected = asyncio.Event()  # shared with backup check
-
+        # Monitor for interrupts from the adapter (new messages arriving)
         async def monitor_for_interrupt():
-            if not session_key:
+            adapter = self.adapters.get(source.platform)
+            if not adapter or not session_key:
                 return
-
+            
             while True:
                 await asyncio.sleep(0.2)  # Check every 200ms
-                try:
-                    # Re-resolve adapter each iteration so reconnects don't
-                    # leave us holding a stale reference.
-                    _adapter = self.adapters.get(source.platform)
-                    if not _adapter:
-                        continue
-                    # Check if adapter has a pending interrupt for this session.
-                    # Must use session_key (build_session_key output) — NOT
-                    # source.chat_id — because the adapter stores interrupt events
-                    # under the full session key.
-                    if hasattr(_adapter, 'has_pending_interrupt') and _adapter.has_pending_interrupt(session_key):
-                        agent = agent_holder[0]
-                        if agent:
-                            # Peek at the pending message text WITHOUT consuming it.
-                            # The message must remain in _pending_messages so the
-                            # post-run dequeue at _dequeue_pending_event() can
-                            # retrieve the full MessageEvent (with media metadata).
-                            # If we pop here, a race exists: the agent may finish
-                            # before checking _interrupt_requested, and the message
-                            # is lost — neither the interrupt path nor the dequeue
-                            # path finds it.
-                            _peek_event = _adapter._pending_messages.get(session_key)
-                            pending_text = _peek_event.text if _peek_event else None
-                            logger.debug("Interrupt detected from adapter, signaling agent...")
-                            agent.interrupt(pending_text)
-                            _interrupt_detected.set()
-                            break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as _mon_err:
-                    logger.debug("monitor_for_interrupt error (will retry): %s", _mon_err)
+                # Check if adapter has a pending interrupt for this session.
+                # Must use session_key (build_session_key output) — NOT
+                # source.chat_id — because the adapter stores interrupt events
+                # under the full session key.
+                if hasattr(adapter, 'has_pending_interrupt') and adapter.has_pending_interrupt(session_key):
+                    agent = agent_holder[0]
+                    if agent:
+                        pending_event = adapter.get_pending_message(session_key)
+                        pending_text = pending_event.text if pending_event else None
+                        logger.debug("Interrupt detected from adapter, signaling agent...")
+                        agent.interrupt(pending_text)
+                        break
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
         # Periodic "still working" notifications for long-running tasks.
-        # Fires every N seconds so the user knows the agent hasn't died.
-        # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 600s (10 min).
-        # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = float(os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 600))
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        # Fires every 10 minutes so the user knows the agent hasn't died.
+        _NOTIFY_INTERVAL = 600  # 10 minutes
         _notify_start = time.time()
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
-                return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
@@ -8382,34 +7892,8 @@ class GatewayRunner:
             _POLL_INTERVAL = 5.0
 
             if _agent_timeout is None:
-                # Unlimited — still poll periodically for backup interrupt
-                # detection in case monitor_for_interrupt() silently died.
-                response = None
-                while True:
-                    done, _ = await asyncio.wait(
-                        {_executor_task}, timeout=_POLL_INTERVAL
-                    )
-                    if done:
-                        response = _executor_task.result()
-                        break
-                    # Backup interrupt check: if the monitor task died or
-                    # missed the interrupt, catch it here.
-                    if not _interrupt_detected.is_set() and session_key:
-                        _backup_adapter = self.adapters.get(source.platform)
-                        _backup_agent = agent_holder[0]
-                        if (_backup_adapter and _backup_agent
-                                and hasattr(_backup_adapter, 'has_pending_interrupt')
-                                and _backup_adapter.has_pending_interrupt(session_key)):
-                            _bp_event = _backup_adapter._pending_messages.get(session_key)
-                            _bp_text = _bp_event.text if _bp_event else None
-                            logger.info(
-                                "Backup interrupt detected for session %s "
-                                "(monitor task state: %s)",
-                                session_key[:20],
-                                "done" if interrupt_monitor.done() else "running",
-                            )
-                            _backup_agent.interrupt(_bp_text)
-                            _interrupt_detected.set()
+                # Unlimited — just await the result.
+                response = await _executor_task
             else:
                 # Poll loop: check the agent's built-in activity tracker
                 # (updated by _touch_activity() on every tool call, API
@@ -8453,23 +7937,6 @@ class GatewayRunner:
                     if _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
                         break
-                    # Backup interrupt check (same as unlimited path).
-                    if not _interrupt_detected.is_set() and session_key:
-                        _backup_adapter = self.adapters.get(source.platform)
-                        _backup_agent = agent_holder[0]
-                        if (_backup_adapter and _backup_agent
-                                and hasattr(_backup_adapter, 'has_pending_interrupt')
-                                and _backup_adapter.has_pending_interrupt(session_key)):
-                            _bp_event = _backup_adapter._pending_messages.get(session_key)
-                            _bp_text = _bp_event.text if _bp_event else None
-                            logger.info(
-                                "Backup interrupt detected for session %s "
-                                "(monitor task state: %s)",
-                                session_key[:20],
-                                "done" if interrupt_monitor.done() else "running",
-                            )
-                            _backup_agent.interrupt(_bp_text)
-                            _interrupt_detected.set()
 
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
@@ -8558,16 +8025,17 @@ class GatewayRunner:
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
-            pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
-                    pending = result.get("interrupt_message")
-                elif pending_event:
-                    pending = pending_event.text or _build_media_placeholder(pending_event)
-                    logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
-
+                if result.get("interrupted"):
+                    pending = _dequeue_pending_text(adapter, session_key)
+                    if not pending and result.get("interrupt_message"):
+                        pending = result.get("interrupt_message")
+                else:
+                    pending = _dequeue_pending_text(adapter, session_key)
+                    if pending:
+                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+            
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the
@@ -8585,29 +8053,27 @@ class GatewayRunner:
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
-                            pending_event = None
                             pending = None
                     except Exception:
                         pass
 
-            if self._draining and (pending_event or pending):
+            if self._draining and pending:
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
                     session_key[:20] if session_key else "?",
                     self._status_action_label(),
                 )
-                pending_event = None
                 pending = None
 
-            if pending_event or pending:
+            if pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
-
+                
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
                 # even makes its first API call (this was causing an infinite loop).
                 if adapter and hasattr(adapter, '_active_sessions') and session_key and session_key in adapter._active_sessions:
                     adapter._active_sessions[session_key].clear()
-
+                
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)
                 if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
@@ -8616,10 +8082,9 @@ class GatewayRunner:
                         "queueing message instead of recursing.",
                         _interrupt_depth, session_key,
                     )
+                    # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
-                    if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
-                    elif adapter and hasattr(adapter, 'queue_message'):
+                    if adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
@@ -8629,66 +8094,28 @@ class GatewayRunner:
                     # response before processing the queued follow-up.
                     # Skip if streaming already delivered it.
                     _sc = stream_consumer_holder[0]
-                    if _sc and stream_task:
-                        try:
-                            await asyncio.wait_for(stream_task, timeout=5.0)
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            stream_task.cancel()
-                            try:
-                                await stream_task
-                            except asyncio.CancelledError:
-                                pass
-                        except Exception as e:
-                            logger.debug("Stream consumer wait before queued message failed: %s", e)
-                    _response_previewed = bool(result.get("response_previewed"))
-                    _already_streamed = bool(
-                        _sc
-                        and (
-                            getattr(_sc, "final_response_sent", False)
-                            or (
-                                _response_previewed
-                                and getattr(_sc, "already_sent", False)
-                            )
-                        )
-                    )
+                    _already_streamed = _sc and getattr(_sc, "already_sent", False)
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
-                            )
+                            await adapter.send(source.chat_id, first_response,
+                                               metadata=getattr(event, "metadata", None))
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
+                # Process the pending message with updated history
                 updated_history = result.get("messages", history)
-                next_source = source
-                next_message = pending
-                next_message_id = None
-                if pending_event is not None:
-                    next_source = getattr(pending_event, "source", None) or source
-                    next_message = await self._prepare_inbound_message_text(
-                        event=pending_event,
-                        source=next_source,
-                        history=updated_history,
-                    )
-                    if next_message is None:
-                        return result
-                    next_message_id = getattr(pending_event, "message_id", None)
-
                 return await self._run_agent(
-                    message=next_message,
+                    message=pending,
                     context_prompt=context_prompt,
                     history=updated_history,
-                    source=next_source,
+                    source=source,
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -8731,15 +8158,8 @@ class GatewayRunner:
         # message is new content the user hasn't seen, and it must reach
         # them even if streaming had sent earlier partial output.
         _sc = stream_consumer_holder[0]
-        if _sc and isinstance(response, dict) and not response.get("failed"):
-            _response_previewed = bool(response.get("response_previewed"))
-            if (
-                getattr(_sc, "final_response_sent", False)
-                or (
-                    _response_previewed
-                    and getattr(_sc, "already_sent", False)
-                )
-            ):
+        if _sc and _sc.already_sent and isinstance(response, dict):
+            if not response.get("failed"):
                 response["already_sent"] = True
         
         return response
@@ -8888,11 +8308,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
-    # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
-    # and gateway.log (INFO+, gateway-component records only).
+    # Centralized logging — agent.log (INFO+) and errors.log (WARNING+).
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging
-    setup_logging(hermes_home=_hermes_home, mode="gateway")
+    log_dir = setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Gateway-specific rotating log — captures all gateway-level messages
+    # (session management, platform adapters, slash commands, etc.).
+    from agent.redact import RedactingFormatter
+    from hermes_logging import _add_rotating_handler
+    _add_rotating_handler(
+        logging.getLogger(),
+        log_dir / 'gateway.log',
+        level=logging.DEBUG,  # TEMP: debug mode
+        max_bytes=5 * 1024 * 1024,
+        backup_count=3,
+        formatter=RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'),
+    )
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
@@ -8900,8 +8332,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # verbosity=1    (-v):         INFO and above
     # verbosity=2+   (-vv/-vvv):   DEBUG
     if verbosity is not None:
-        from agent.redact import RedactingFormatter
-
         _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
         _stderr_handler = logging.StreamHandler()
         _stderr_handler.setLevel(_stderr_level)
@@ -8921,19 +8351,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         runner.request_restart(detached=False, via_service=True)
     
     loop = asyncio.get_event_loop()
-    if threading.current_thread() is threading.main_thread():
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, shutdown_signal_handler)
-            except NotImplementedError:
-                pass
-        if hasattr(signal, "SIGUSR1"):
-            try:
-                loop.add_signal_handler(signal.SIGUSR1, restart_signal_handler)
-            except NotImplementedError:
-                pass
-    else:
-        logger.info("Skipping signal handlers (not running in main thread).")
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown_signal_handler)
+        except NotImplementedError:
+            pass
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            loop.add_signal_handler(signal.SIGUSR1, restart_signal_handler)
+        except NotImplementedError:
+            pass
     
     # Start the gateway
     success = await runner.start()
