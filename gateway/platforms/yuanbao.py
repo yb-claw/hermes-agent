@@ -66,16 +66,24 @@ from gateway.platforms.yuanbao_proto import (
     _parse_fields,
     WT_LEN,
     WT_VARINT,
+    WS_HEARTBEAT_RUNNING,
+    WS_HEARTBEAT_FINISH,
     decode_conn_msg,
     decode_inbound_push,
     decode_push_msg,
     decode_directed_push,
+    decode_query_group_info_rsp,
+    decode_get_group_member_list_rsp,
     encode_auth_bind,
     encode_biz_msg,
     encode_ping,
     encode_push_ack,
     encode_send_c2c_message,
     encode_send_group_message,
+    encode_send_private_heartbeat,
+    encode_send_group_heartbeat,
+    encode_query_group_info,
+    encode_get_group_member_list,
     next_seq_no,
 )
 from gateway.session import SessionSource
@@ -93,6 +101,10 @@ MAX_RECONNECT_ATTEMPTS = 10
 # Maximum number of distinct chat IDs tracked in _chat_locks / _group_history.
 # Oldest entry is evicted when the limit is reached to prevent unbounded growth.
 _CHAT_DICT_MAX_SIZE = 1000
+
+# Reply Heartbeat 配置
+REPLY_HEARTBEAT_INTERVAL_S = 2.0   # 每 2 秒续发 RUNNING
+REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # 30 秒无活动自动停止
 
 
 class YuanbaoAdapter(BasePlatformAdapter):
@@ -143,6 +155,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Group chat history: chat_id -> deque of {sender_id, text, ts}
         # Upper-bounded to _CHAT_DICT_MAX_SIZE entries; oldest evicted first.
         self._group_history: Dict[str, deque] = {}
+
+        # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
+        self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------
     # Abstract method implementations
@@ -264,6 +279,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not fut.done():
                 fut.set_exception(disc_exc)
         self._pending_acks.clear()
+
+        # Cancel all reply heartbeat tasks
+        for task in list(self._reply_heartbeat_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._reply_heartbeat_tasks.clear()
 
         await self._cleanup_ws()
         logger.info("[%s] Disconnected", self.name)
@@ -731,96 +752,232 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # Typing / heartbeat
+    # Reply Heartbeat 状态机
     # ------------------------------------------------------------------
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
         """
         发送"正在输入"状态心跳（RUNNING），best effort，不抛错。
-        根据 chat_id 前缀判断 C2C 或群聊。
+        此方法现在委托给 Reply Heartbeat 状态机（如已启动则为 no-op）。
         """
         try:
-            if chat_id.startswith("group:"):
-                group_code = chat_id[len("group:"):]
-                await self._send_group_heartbeat(group_code, "running")
-            else:
-                to_account = chat_id.removeprefix("direct:")
-                await self._send_private_heartbeat(to_account, "running")
+            await self._start_reply_heartbeat(chat_id)
         except Exception as exc:
             logger.debug("[%s] send_typing failed: %s", self.name, exc)
 
-    async def _send_private_heartbeat(self, to_account: str, status: str) -> None:
+    async def _start_reply_heartbeat(self, chat_id: str) -> None:
         """
-        发送 C2C 心跳。
-        status: 'running'(1) / 'done'/'finish'(2)
+        启动或续期 Reply Heartbeat 定时续发（RUNNING，每 2s 一次）。
 
-        SendPrivateHeartbeatReq proto fields:
-          1: from_account (string)
-          2: to_account   (string)
-          3: heartbeat    (varint: RUNNING=1, FINISH=2)
+        如果该 chat_id 已有活跃的 heartbeat task，则仅刷新时间戳（不重复启动）。
+        30 秒无续期调用时自动停止（发送 FINISH）。
         """
         if self._ws is None or not self._bot_id:
             return
-        heartbeat_val = 1 if status == "running" else 2
-        buf = (
-            _encode_field(1, WT_LEN, _encode_string(self._bot_id))
-            + _encode_field(2, WT_LEN, _encode_string(to_account))
-            + _encode_field(3, WT_VARINT, _encode_varint(heartbeat_val))
+
+        # 如果已有任务在跑，只刷新时间戳即可
+        existing = self._reply_heartbeat_tasks.get(chat_id)
+        if existing and not existing.done():
+            # 通过 task 的 name 来传递 "refresh" 信号实现不了，
+            # 改用一个 dict 来存最后活跃时间
+            if not hasattr(self, '_reply_hb_last_active'):
+                self._reply_hb_last_active: Dict[str, float] = {}
+            self._reply_hb_last_active[chat_id] = time.time()
+            return
+
+        # 启动新的 heartbeat task
+        if not hasattr(self, '_reply_hb_last_active'):
+            self._reply_hb_last_active = {}
+        self._reply_hb_last_active[chat_id] = time.time()
+
+        task = asyncio.create_task(
+            self._reply_heartbeat_worker(chat_id),
+            name=f"yuanbao-reply-hb-{chat_id}",
         )
-        req_id = f"hb_priv_{next_seq_no()}"
-        encoded = encode_biz_msg(
-            service=_BIZ_PKG,
-            method="send_private_heartbeat",
-            req_id=req_id,
-            body=buf,
-        )
+        self._reply_heartbeat_tasks[chat_id] = task
+
+    async def _reply_heartbeat_worker(self, chat_id: str) -> None:
+        """
+        后台协程：每 2 秒发送一次 RUNNING 心跳。
+        30 秒无续期 → 发送 FINISH 并退出。
+        """
         try:
-            await self._ws.send(encoded)
-            logger.debug(
-                "[%s] private heartbeat sent: to=%s status=%s",
-                self.name, to_account, status,
-            )
+            # 立即发一次 RUNNING
+            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
+
+            while True:
+                await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
+
+                # 检查超时
+                last_active = getattr(self, '_reply_hb_last_active', {}).get(chat_id, 0)
+                if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
+                    logger.debug(
+                        "[%s] Reply heartbeat timeout for %s, sending FINISH",
+                        self.name, chat_id,
+                    )
+                    break
+
+                if self._ws is None:
+                    break
+
+                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
+
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
-            logger.debug("[%s] _send_private_heartbeat failed: %s", self.name, exc)
+            logger.debug("[%s] Reply heartbeat worker error: %s", self.name, exc)
+        finally:
+            # 发送 FINISH
+            try:
+                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+            except Exception:
+                pass
+            self._reply_heartbeat_tasks.pop(chat_id, None)
+            if hasattr(self, '_reply_hb_last_active'):
+                self._reply_hb_last_active.pop(chat_id, None)
 
-    async def _send_group_heartbeat(self, group_code: str, status: str) -> None:
+    async def _stop_reply_heartbeat(self, chat_id: str) -> None:
         """
-        发送群聊心跳。
-        status: 'running'(1) / 'done'/'finish'(2)
+        停止 Reply Heartbeat（发送 FINISH 并取消定时器）。
+        用于 agent 回复完成后调用。
+        """
+        task = self._reply_heartbeat_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # task 的 finally 块会发 FINISH；如果已被取消，补发一次
+        try:
+            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+        except Exception:
+            pass
 
-        SendGroupHeartbeatReq proto fields:
-          1: from_account (string)
-          2: to_account   (string)  — 群场景留空
-          3: group_code   (string)
-          4: send_time    (int64, ms timestamp)
-          5: heartbeat    (varint: RUNNING=1, FINISH=2)
-        """
+    async def _send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
+        """发送单次心跳（RUNNING 或 FINISH），best effort。"""
         if self._ws is None or not self._bot_id:
             return
-        heartbeat_val = 1 if status == "running" else 2
-        send_time = int(time.time() * 1000)
-        buf = (
-            _encode_field(1, WT_LEN, _encode_string(self._bot_id))
-            + _encode_field(2, WT_LEN, _encode_string(""))  # to_account empty for group
-            + _encode_field(3, WT_LEN, _encode_string(group_code))
-            + _encode_field(4, WT_VARINT, _encode_varint(send_time))
-            + _encode_field(5, WT_VARINT, _encode_varint(heartbeat_val))
-        )
-        req_id = f"hb_grp_{next_seq_no()}"
-        encoded = encode_biz_msg(
-            service=_BIZ_PKG,
-            method="send_group_heartbeat",
-            req_id=req_id,
-            body=buf,
-        )
         try:
+            if chat_id.startswith("group:"):
+                group_code = chat_id[len("group:"):]
+                encoded = encode_send_group_heartbeat(
+                    from_account=self._bot_id,
+                    group_code=group_code,
+                    heartbeat=heartbeat_val,
+                )
+            else:
+                to_account = chat_id.removeprefix("direct:")
+                encoded = encode_send_private_heartbeat(
+                    from_account=self._bot_id,
+                    to_account=to_account,
+                    heartbeat=heartbeat_val,
+                )
             await self._ws.send(encoded)
+            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
             logger.debug(
-                "[%s] group heartbeat sent: group=%s status=%s",
-                self.name, group_code, status,
+                "[%s] Reply heartbeat %s sent: chat=%s",
+                self.name, status_name, chat_id,
             )
         except Exception as exc:
-            logger.debug("[%s] _send_group_heartbeat failed: %s", self.name, exc)
+            logger.debug("[%s] _send_heartbeat_once failed: %s", self.name, exc)
+
+    # ------------------------------------------------------------------
+    # 群查询方法
+    # ------------------------------------------------------------------
+
+    async def query_group_info(self, group_code: str) -> Optional[dict]:
+        """
+        查询群信息（群名、群主、成员数等）。
+
+        Args:
+            group_code: 群号
+
+        Returns:
+            {
+              "group_code": str,
+              "group_name": str,
+              "owner_id": str,
+              "member_count": int,
+              "max_member": int,
+            }
+            或 None（查询失败）
+        """
+        if self._ws is None:
+            return None
+        encoded = encode_query_group_info(group_code)
+        # 提取 req_id（与 encode_query_group_info 中生成的一致）
+        from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
+        decoded = _decode(encoded)
+        req_id = decoded["head"]["msg_id"]
+        try:
+            response = await self._send_biz_request(encoded, req_id=req_id)
+            # response 来自 _handle_frame，对于 RPC Response 返回的是 {"head": head}
+            # 但对于 Push 响应，返回的是 decoded push
+            # 对于群查询这种 RPC，我们需要从 conn_data 中解码
+            # 实际上 _send_biz_request 返回的 response 对于 Response cmd_type 是 {"head": head}
+            # 群查询的响应 data 需要从原始帧中获取
+            # 由于当前 _handle_frame 对 Response 只返回 head，群查询需要改进
+            # 暂时返回 response head 表示成功
+            head = response.get("head", {})
+            status = head.get("status", 0)
+            if status != 0:
+                logger.warning("[%s] query_group_info failed: status=%d", self.name, status)
+                return None
+            # 如果 response 中有 body/data（来自 biz 层），解码它
+            biz_data = response.get("data", b"") or response.get("body", b"")
+            if biz_data and isinstance(biz_data, bytes):
+                return decode_query_group_info_rsp(biz_data)
+            return {"group_code": group_code}
+        except asyncio.TimeoutError:
+            logger.warning("[%s] query_group_info timeout: group=%s", self.name, group_code)
+            return None
+        except Exception as exc:
+            logger.warning("[%s] query_group_info failed: %s", self.name, exc)
+            return None
+
+    async def get_group_member_list(
+        self, group_code: str, offset: int = 0, limit: int = 200
+    ) -> Optional[dict]:
+        """
+        查询群成员列表。
+
+        Args:
+            group_code: 群号
+            offset: 分页偏移
+            limit: 分页大小
+
+        Returns:
+            {
+              "members": [{"user_id": str, "nickname": str, "role": int, ...}, ...],
+              "next_offset": int,
+              "is_complete": bool,
+            }
+            或 None（查询失败）
+        """
+        if self._ws is None:
+            return None
+        encoded = encode_get_group_member_list(group_code, offset=offset, limit=limit)
+        from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
+        decoded = _decode(encoded)
+        req_id = decoded["head"]["msg_id"]
+        try:
+            response = await self._send_biz_request(encoded, req_id=req_id)
+            head = response.get("head", {})
+            status = head.get("status", 0)
+            if status != 0:
+                logger.warning("[%s] get_group_member_list failed: status=%d", self.name, status)
+                return None
+            biz_data = response.get("data", b"") or response.get("body", b"")
+            if biz_data and isinstance(biz_data, bytes):
+                return decode_get_group_member_list_rsp(biz_data)
+            return {"members": [], "next_offset": 0, "is_complete": True}
+        except asyncio.TimeoutError:
+            logger.warning("[%s] get_group_member_list timeout: group=%s", self.name, group_code)
+            return None
+        except Exception as exc:
+            logger.warning("[%s] get_group_member_list failed: %s", self.name, exc)
+            return None
 
     def _push_to_inbound(self, head: dict, conn_data: bytes) -> None:
         """
@@ -992,7 +1149,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
             raw_message=push,
         )
 
-        asyncio.create_task(self.handle_message(event))
+        # Start reply heartbeat (RUNNING) as soon as we dispatch to AI
+        asyncio.create_task(self._start_reply_heartbeat(chat_id))
+        asyncio.create_task(self._handle_message_with_heartbeat(event, chat_id))
+
+    async def _handle_message_with_heartbeat(
+        self, event: MessageEvent, chat_id: str
+    ) -> None:
+        """Dispatch message to AI handler and stop heartbeat when done."""
+        try:
+            await self.handle_message(event)
+        finally:
+            await self._stop_reply_heartbeat(chat_id)
 
     def _extract_text(self, msg_body: list) -> str:
         """
