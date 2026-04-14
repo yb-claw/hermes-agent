@@ -24,8 +24,6 @@ model:
   #   "minimax"      - MiniMax global (requires: MINIMAX_API_KEY)
   #   "minimax-cn"   - MiniMax China (requires: MINIMAX_CN_API_KEY)
   #   "huggingface"  - Hugging Face Inference (requires: HF_TOKEN)
-  #   "xiaomi"       - Xiaomi MiMo (requires: XIAOMI_API_KEY)
-  #   "arcee"        - Arcee AI Trinity models (requires: ARCEEAI_API_KEY)
   #   "kilocode"     - KiloCode gateway (requires: KILOCODE_API_KEY)
   #   "ai-gateway"   - Vercel AI Gateway (requires: AI_GATEWAY_API_KEY)
   #
@@ -310,8 +308,15 @@ compression:
   # compression of older turns.
   protect_last_n: 20
 
-  # To pin a specific model/provider for compression summaries, use the
-  # auxiliary section below (auxiliary.compression.provider / model).
+  # Model to use for generating summaries (fast/cheap recommended)
+  # This model compresses the middle turns into a concise summary.
+  # IMPORTANT: it receives the full middle section of the conversation, so it
+  # MUST support a context length at least as large as your main model's.
+  summary_model: "google/gemini-3-flash-preview"
+  
+  # Provider for the summary model (default: "auto")
+  # Options: "auto", "openrouter", "nous", "main"
+  # summary_provider: "auto"
 
 # =============================================================================
 # Auxiliary Models (Advanced — Experimental)
@@ -523,7 +528,7 @@ agent:
 #   - A preset like "hermes-cli" or "hermes-telegram" (curated tool set)
 #   - A list of individual toolsets to compose your own (see list below)
 #
-# Supported platform keys: cli, telegram, discord, whatsapp, slack, qqbot
+# Supported platform keys: cli, telegram, discord, whatsapp, slack
 #
 # Examples:
 #
@@ -552,7 +557,6 @@ agent:
 #   slack:         hermes-slack          (same as telegram)
 #   signal:        hermes-signal         (same as telegram)
 #   homeassistant: hermes-homeassistant  (same as telegram)
-#   qqbot:            hermes-qqbot            (same as telegram)
 #
 platform_toolsets:
   cli: [hermes-cli]
@@ -562,7 +566,7 @@ platform_toolsets:
   slack: [hermes-slack]
   signal: [hermes-signal]
   homeassistant: [hermes-homeassistant]
-  qqbot: [hermes-qqbot]
+  yuanbao: [hermes-telegram]  # Yuanbao uses the same toolset as other messaging platforms
 
 # =============================================================================
 # Gateway Platform Settings
@@ -782,11 +786,6 @@ display:
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 
-  # Gateway-only natural mid-turn assistant updates.
-  # When true, completed assistant status messages are sent as separate chat
-  # messages. This is independent of tool_progress and gateway streaming.
-  interim_assistant_messages: true
-
   # What Enter does when Hermes is already busy in the CLI.
   #   interrupt: Interrupt the current run and redirect Hermes (default)
   #   queue:     Queue your message for the next turn
@@ -795,7 +794,7 @@ display:
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use
-  # terminal(background=true, notify_on_complete=true) from Telegram/Discord/etc.
+  # terminal(background=true, check_interval=...) from Telegram/Discord/etc.
   #   off:     No watcher messages at all
   #   result:  Only the final completion message
   #   error:   Only the final message when exit code != 0
@@ -891,3 +890,31 @@ display:
 #   # Names and usernames are NOT affected (user-chosen, publicly visible).
 #   # Routing/delivery still uses the original values internally.
 #   redact_pii: false
+
+# =============================================================================
+# Yuanbao (元宝 IM Bot) Platform Configuration
+# =============================================================================
+# Connect to Tencent Yuanbao IM Bot via WebSocket long-connection.
+# Required: YUANBAO_APP_KEY and YUANBAO_APP_SECRET in .env
+#           (or configure under platforms.yuanbao below)
+#
+# Environment variables (recommended — avoids storing secrets in this file):
+#   YUANBAO_APP_KEY         - App Key for sign-token API authentication
+#   YUANBAO_APP_SECRET      - App Secret for HMAC signing
+#   YUANBAO_BOT_ID          - Bot account ID (optional, returned by sign-token)
+#   YUANBAO_WS_GATEWAY_URL  - WebSocket gateway URL (e.g. wss://your-ws-gateway)
+#   YUANBAO_SIGN_TOKEN_URL  - Sign-token HTTP API URL
+#   YUANBAO_HOME_CHANNEL    - Default home channel chat ID
+#
+# platforms:
+#   yuanbao:
+#     enabled: true
+#     yuanbao_app_key: "your-app-key"           # App Key，用于签票接口鉴权
+#     yuanbao_app_secret: "your-app-secret"     # App Secret，用于 HMAC 签名
+#     yuanbao_bot_id: "your-bot-id"             # Bot 账号 ID（可选，sign-token 接口会返回）
+#     yuanbao_ws_gateway_url: "wss://your-ws-gateway"  # WS 网关地址
+#     yuanbao_sign_token_url: "https://your-sign-token-url"  # 签票接口地址（HTTP）
+#     # home_channel:
+#     #   platform: yuanbao
+#     #   chat_id: "your-home-chat-id"
+#     #   name: "Home"

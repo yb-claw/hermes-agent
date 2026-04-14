@@ -1,0 +1,1530 @@
+"""
+Yuanbao platform adapter.
+
+Connects to the Yuanbao WebSocket gateway, handles authentication (AUTH_BIND),
+heartbeat, and reconnection.  Message receive (T05) and send (T06) logic
+will be added in follow-up tasks.
+
+Configuration in config.yaml (or via env vars):
+    platforms:
+      yuanbao:
+        yuanbao_app_key: "..."        # or YUANBAO_APP_KEY
+        yuanbao_app_secret: "..."     # or YUANBAO_APP_SECRET
+        yuanbao_bot_id: "..."         # or YUANBAO_BOT_ID  (optional, returned by sign-token)
+        yuanbao_ws_gateway_url: "wss://..." # or YUANBAO_WS_GATEWAY_URL
+        yuanbao_sign_token_url: "https://..." # or YUANBAO_SIGN_TOKEN_URL
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from collections import deque
+from typing import Any, Dict, Optional
+
+try:
+    import websockets
+    import websockets.exceptions
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+    websockets = None  # type: ignore[assignment]
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.yuanbao_media import (
+    download_url as media_download_url,
+    get_cos_credentials,
+    upload_to_cos,
+    build_image_msg_body,
+    build_file_msg_body,
+    guess_mime_type,
+    is_image,
+    md5_hex,
+)
+from gateway.platforms.yuanbao_markdown import chunk_markdown_text
+from gateway.platforms.yuanbao_proto import (
+    CMD_TYPE,
+    _BIZ_PKG,
+    _encode_field,
+    _encode_string,
+    _encode_message,
+    _encode_varint,
+    _fields_to_dict,
+    _get_string,
+    _get_varint,
+    _parse_fields,
+    WT_LEN,
+    WT_VARINT,
+    decode_conn_msg,
+    decode_inbound_push,
+    decode_push_msg,
+    decode_directed_push,
+    encode_auth_bind,
+    encode_biz_msg,
+    encode_ping,
+    encode_push_ack,
+    encode_send_c2c_message,
+    encode_send_group_message,
+    next_seq_no,
+)
+from gateway.platforms.yuanbao_api import get_sign_token, force_refresh_sign_token
+from gateway.session import SessionSource
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_WS_GATEWAY_URL = "wss://yuanbao.tencent.com/ws"
+DEFAULT_SIGN_TOKEN_URL = "https://yuanbao.tencent.com/api/sign-token"
+
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+CONNECT_TIMEOUT_SECONDS = 15.0
+AUTH_TIMEOUT_SECONDS = 10.0
+MAX_RECONNECT_ATTEMPTS = 10
+
+# Maximum number of distinct chat IDs tracked in _chat_locks / _group_history.
+# Oldest entry is evicted when the limit is reached to prevent unbounded growth.
+_CHAT_DICT_MAX_SIZE = 1000
+
+
+class YuanbaoAdapter(BasePlatformAdapter):
+    """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
+
+    PLATFORM = Platform.YUANBAO
+    MAX_TEXT_CHUNK: int = 3000  # 元宝单条消息字符上限
+
+    def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
+        super().__init__(config, Platform.YUANBAO)
+
+        # Credentials / endpoints from config or environment
+        self._app_key: str = (
+            config.yuanbao_app_key or os.getenv("YUANBAO_APP_KEY", "")
+        ).strip()
+        self._app_secret: str = (
+            config.yuanbao_app_secret or os.getenv("YUANBAO_APP_SECRET", "")
+        ).strip()
+        self._bot_id: Optional[str] = (
+            config.yuanbao_bot_id or os.getenv("YUANBAO_BOT_ID", "") or None
+        )
+        self._ws_gateway_url: str = (
+            config.yuanbao_ws_gateway_url
+            or os.getenv("YUANBAO_WS_GATEWAY_URL", DEFAULT_WS_GATEWAY_URL)
+        ).strip()
+        self._sign_token_url: str = (
+            config.yuanbao_sign_token_url
+            or os.getenv("YUANBAO_SIGN_TOKEN_URL", DEFAULT_SIGN_TOKEN_URL)
+        ).strip()
+
+        # Runtime state
+        self._ws = None                          # websockets connection
+        self._connect_id: Optional[str] = None  # received from BIND_ACK
+        self._pending_acks: Dict[str, asyncio.Future] = {}  # req_id (str) -> Future
+        self._chat_locks: Dict[str, asyncio.Lock] = {}  # per-chat-id 锁（懒初始化，上限 _CHAT_DICT_MAX_SIZE）
+        self._send_lock: asyncio.Lock = asyncio.Lock()  # guards concurrent WS sends
+
+        # Background tasks
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._recv_task: Optional[asyncio.Task] = None
+
+        # Reconnection state
+        self._reconnect_attempts: int = 0
+
+        # Internal sequence counter (separate from proto-level next_seq_no)
+        self._seq: int = 0
+
+        # Group chat history: chat_id -> deque of {sender_id, text, ts}
+        # Upper-bounded to _CHAT_DICT_MAX_SIZE entries; oldest evicted first.
+        self._group_history: Dict[str, deque] = {}
+
+    # ------------------------------------------------------------------
+    # Abstract method implementations
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> bool:
+        """
+        Connect to Yuanbao WS gateway and authenticate.
+
+        Flow:
+          1. Get sign token via HTTP API
+          2. Open WebSocket connection (websockets library, no built-in ping)
+          3. Send AUTH_BIND, wait for BIND_ACK, extract connectId
+          4. Start heartbeat task and receive task
+        """
+        if not WEBSOCKETS_AVAILABLE:
+            msg = "Yuanbao startup failed: 'websockets' package not installed"
+            self._set_fatal_error("yuanbao_missing_dependency", msg, retryable=True)
+            logger.warning("[%s] %s. Run: pip install websockets", self.name, msg)
+            return False
+
+        if not self._app_key or not self._app_secret:
+            msg = (
+                "Yuanbao startup failed: "
+                "YUANBAO_APP_KEY and YUANBAO_APP_SECRET are required"
+            )
+            self._set_fatal_error("yuanbao_missing_credentials", msg, retryable=False)
+            logger.error("[%s] %s", self.name, msg)
+            return False
+
+        # Idempotency guard
+        if self._ws is not None:
+            try:
+                # websockets >= 10 uses .open; fallback attribute check
+                is_open = getattr(self._ws, "open", None)
+                if is_open is True or (callable(is_open) and is_open()):
+                    logger.debug("[%s] Already connected, skipping connect()", self.name)
+                    return True
+            except Exception:
+                pass
+
+        try:
+            # Step 1: Get sign token
+            logger.info("[%s] Fetching sign token from %s", self.name, self._sign_token_url)
+            token_data = await get_sign_token(
+                self._app_key, self._app_secret, self._sign_token_url
+            )
+
+            # Update bot_id if returned by sign-token API
+            if token_data.get("bot_id"):
+                self._bot_id = str(token_data["bot_id"])
+
+            # Step 2: Open WebSocket connection (disable built-in ping/pong)
+            logger.info("[%s] Connecting to %s", self.name, self._ws_gateway_url)
+            self._ws = await asyncio.wait_for(
+                websockets.connect(  # type: ignore[attr-defined]
+                    self._ws_gateway_url,
+                    ping_interval=None,   # we manage heartbeat ourselves
+                    ping_timeout=None,
+                    close_timeout=5,
+                ),
+                timeout=CONNECT_TIMEOUT_SECONDS,
+            )
+
+            # Step 3: Authenticate (AUTH_BIND + wait for BIND_ACK)
+            authed = await self._authenticate(token_data)
+            if not authed:
+                await self._cleanup_ws()
+                return False
+
+            # Step 4: Start background tasks
+            self._reconnect_attempts = 0
+            self._mark_connected()
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
+            )
+            self._recv_task = asyncio.create_task(
+                self._receive_loop(), name=f"yuanbao-recv-{self._connect_id}"
+            )
+            logger.info(
+                "[%s] Connected. connectId=%s botId=%s",
+                self.name, self._connect_id, self._bot_id,
+            )
+            return True
+
+        except asyncio.TimeoutError:
+            logger.error("[%s] Connection timed out", self.name)
+            await self._cleanup_ws()
+            return False
+        except Exception as exc:
+            logger.error("[%s] connect() failed: %s", self.name, exc, exc_info=True)
+            await self._cleanup_ws()
+            return False
+
+    async def disconnect(self) -> None:
+        """Cancel background tasks and close the WebSocket connection."""
+        self._running = False
+        self._mark_disconnected()
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
+        if self._recv_task:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+            self._recv_task = None
+
+        # Fail any pending ACK futures
+        disc_exc = RuntimeError("YuanbaoAdapter disconnected")
+        for fut in self._pending_acks.values():
+            if not fut.done():
+                fut.set_exception(disc_exc)
+        self._pending_acks.clear()
+
+        await self._cleanup_ws()
+        logger.info("[%s] Disconnected", self.name)
+
+    def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        """获取或创建指定 chat_id 的锁（懒初始化，上限 _CHAT_DICT_MAX_SIZE）。"""
+        if chat_id not in self._chat_locks:
+            if len(self._chat_locks) >= _CHAT_DICT_MAX_SIZE:
+                # Evict the oldest entry (insertion-order guaranteed in Python 3.7+)
+                self._chat_locks.pop(next(iter(self._chat_locks)))
+            self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送文本消息，支持自动分片、per-chat-id 顺序保障。
+
+        chat_id 格式：
+          - C2C:  "direct:{account_id}" 或直接 "{account_id}"（无前缀）
+          - 群聊: "group:{group_code}"
+
+        增强逻辑：
+          1. 获取或创建该 chat_id 的锁，保证同 chat_id 消息串行发送
+          2. 调用 chunk_markdown_text() 将 content 分片（超过 MAX_TEXT_CHUNK 自动切割）
+          3. 逐片调用 _send_text_chunk() 发送（含重试），任一片失败立即停止
+        """
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        lock = self._get_chat_lock(chat_id)
+        async with lock:
+            chunks = chunk_markdown_text(content, self.MAX_TEXT_CHUNK)
+            for i, chunk in enumerate(chunks):
+                r_to = reply_to if i == 0 else None  # 只有第一片带 reply_to
+                result = await self._send_text_chunk(chat_id, chunk, r_to)
+                if not result.success:
+                    return result
+        return SendResult(success=True)
+
+    async def _send_text_chunk(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        retry: int = 3,
+    ) -> SendResult:
+        """
+        发送单个文本片段，带重试（指数退避：1s, 2s, 4s）。
+
+        - 最多重试 retry 次
+        - 每次失败后等待 2^attempt 秒（0→1s, 1→2s, 2→4s）
+        - 返回最终结果
+        """
+        last_error: str = "Unknown error"
+        for attempt in range(retry):
+            try:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    raw = await self._send_group_message(group_code, text, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    raw = await self._send_c2c_message(to_account, text)
+
+                if raw.get("success"):
+                    return SendResult(success=True, message_id=raw.get("msg_key"))
+
+                last_error = raw.get("error", "Unknown error")
+                logger.warning(
+                    "[%s] _send_text_chunk attempt %d/%d failed: %s",
+                    self.name, attempt + 1, retry, last_error,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "[%s] _send_text_chunk attempt %d/%d exception: %s",
+                    self.name, attempt + 1, retry, last_error,
+                )
+
+            if attempt < retry - 1:
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+
+        logger.error(
+            "[%s] _send_text_chunk max retries (%d) exceeded. Last error: %s",
+            self.name, retry, last_error,
+        )
+        return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
+
+    async def _send_c2c_message(self, to_account: str, text: str) -> dict:
+        """发送 C2C 文本消息，返回 {success: bool, msg_key: str}。"""
+        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+        req_id = f"c2c_{next_seq_no()}"
+        encoded = encode_send_c2c_message(
+            to_account=to_account,
+            msg_body=msg_body,
+            from_account=self._bot_id or "",
+            msg_id=req_id,
+        )
+        try:
+            response = await self._send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Request timeout after 10.0s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def _send_group_message(
+        self,
+        group_code: str,
+        text: str,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """发送群聊文本消息。"""
+        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+        req_id = f"grp_{next_seq_no()}"
+        encoded = encode_send_group_message(
+            group_code=group_code,
+            msg_body=msg_body,
+            from_account=self._bot_id or "",
+            msg_id=req_id,
+            ref_msg_id=reply_to or "",
+        )
+        try:
+            response = await self._send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Request timeout after 10.0s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def _send_biz_request(
+        self,
+        encoded_conn_msg: bytes,
+        req_id: str,
+        timeout: float = 10.0,
+    ) -> dict:
+        """
+        发送业务层请求并等待响应。
+
+        1. 注册 Future 到 self._pending_acks[req_id]
+        2. 发送 encoded_conn_msg（bytes）到 WS
+        3. asyncio.wait_for(future, timeout)
+        4. 超时/异常时清理 pending_acks
+        """
+        if self._ws is None:
+            raise RuntimeError("Not connected")
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending_acks[req_id] = future
+        try:
+            await self._ws.send(encoded_conn_msg)
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("[%s] _send_biz_request timeout: req_id=%s", self.name, req_id)
+            raise
+        except Exception:
+            raise
+        finally:
+            self._pending_acks.pop(req_id, None)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """Return basic chat metadata derived from the chat_id prefix.
+
+        chat_id conventions:
+          "group:<group_code>"  → group chat
+          "direct:<account>"   → C2C / direct message (default)
+
+        TODO (T06): fetch real chat name/member-count from Yuanbao API.
+        """
+        if chat_id.startswith("group:"):
+            return {"name": chat_id, "type": "group"}
+        return {"name": chat_id, "type": "dm"}
+
+    # ------------------------------------------------------------------
+    # Internal methods
+    # ------------------------------------------------------------------
+
+    async def _authenticate(self, token_data: dict) -> bool:
+        """
+        Send AUTH_BIND and read frames until BIND_ACK is received.
+
+        Because _receive_loop is a placeholder (T05), we read frames directly
+        here until we get the BIND_ACK response, then hand off to the loop.
+
+        Returns True on success, False on failure/timeout.
+        """
+        if self._ws is None:
+            return False
+
+        token = token_data.get("token", "")
+        uid = self._bot_id or token_data.get("bot_id", "")
+        source = token_data.get("source") or "bot"  # use API-returned source; default to 'bot' (not 'web') to receive inbound pushes
+        route_env = token_data.get("route_env", "") or ""
+
+        msg_id = str(uuid.uuid4())
+
+        # Build and send AUTH_BIND
+        auth_bytes = encode_auth_bind(
+            biz_id="ybBot",
+            uid=uid,
+            source=source,
+            token=token,
+            msg_id=msg_id,
+            route_env=route_env,
+        )
+        await self._ws.send(auth_bytes)
+        logger.debug("[%s] AUTH_BIND sent (msg_id=%s uid=%s)", self.name, msg_id, uid)
+
+        # Read frames synchronously until BIND_ACK (cmd_type=Response, cmd=auth-bind)
+        try:
+            _loop = asyncio.get_running_loop()
+            deadline = _loop.time() + AUTH_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - _loop.time()
+                if remaining <= 0:
+                    logger.error("[%s] AUTH_BIND timeout waiting for BIND_ACK", self.name)
+                    return False
+
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+                if not isinstance(raw, (bytes, bytearray)):
+                    continue
+
+                try:
+                    msg = decode_conn_msg(bytes(raw))
+                except Exception as dec_exc:
+                    logger.debug("[%s] Failed to decode frame during auth: %s", self.name, dec_exc)
+                    continue
+
+                head = msg.get("head", {})
+                cmd_type = head.get("cmd_type", -1)
+                cmd = head.get("cmd", "")
+
+                # BIND_ACK: Response to auth-bind
+                if cmd_type == CMD_TYPE["Response"] and cmd == "auth-bind":
+                    status = head.get("status", 0)
+                    if status != 0:
+                        logger.error(
+                            "[%s] BIND_ACK error: status=%d", self.name, status
+                        )
+                        return False
+
+                    # Extract connectId from BIND_ACK payload
+                    connect_id = self._extract_connect_id(msg)
+                    self._connect_id = connect_id
+                    logger.info("[%s] BIND_ACK received. connectId=%s", self.name, connect_id)
+                    return True
+
+                # Ignore other frames (e.g. Ping responses) during auth
+                logger.debug(
+                    "[%s] Ignoring frame during auth: cmd_type=%d cmd=%s",
+                    self.name, cmd_type, cmd,
+                )
+
+        except asyncio.TimeoutError:
+            logger.error("[%s] Timeout waiting for BIND_ACK", self.name)
+            return False
+        except Exception as exc:
+            logger.error("[%s] Error during authentication: %s", self.name, exc, exc_info=True)
+            return False
+
+    def _extract_connect_id(self, decoded_msg: dict) -> Optional[str]:
+        """
+        Extract connectId from decoded BIND_ACK message.
+
+        The BIND_ACK data payload is an AuthBindRsp protobuf message.
+        AuthBindRsp fields (from conn.json):
+          field 1: code      (int32)
+          field 2: message   (string)
+          field 3: connectId (string)  <-- this is what we need
+        """
+        data: bytes = decoded_msg.get("data", b"")
+        if not data:
+            return None
+        try:
+            fdict = _fields_to_dict(_parse_fields(data))
+            code = _get_varint(fdict, 1)
+            if code != 0:
+                message = _get_string(fdict, 2)
+                logger.error(
+                    "[%s] AuthBindRsp error: code=%d message=%r",
+                    self.name, code, message,
+                )
+                return None
+            # connectId is field 3 (not field 1)
+            connect_id = _get_string(fdict, 3)
+            return connect_id if connect_id else None
+        except Exception as exc:
+            logger.warning("[%s] Failed to extract connectId: %s", self.name, exc)
+            return None
+
+    async def _heartbeat_loop(self) -> None:
+        """Send HEARTBEAT (ping) every 30 seconds while connected."""
+        try:
+            while self._running:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                if self._ws is None:
+                    continue
+                try:
+                    msg_id = str(uuid.uuid4())
+                    ping_bytes = encode_ping(msg_id)
+                    await self._ws.send(ping_bytes)
+                    logger.debug("[%s] PING sent (msg_id=%s)", self.name, msg_id)
+                except Exception as exc:
+                    logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
+        except asyncio.CancelledError:
+            pass  # Normal shutdown
+
+    async def _receive_loop(self) -> None:
+        """
+        接收循环：
+        1. 读取 WS 帧（raw bytes）
+        2. 调用 decode_conn_msg() 解码
+        3. 根据 cmd_type 分发：
+           - Response + "ping"      : HEARTBEAT_ACK，只记录 log
+           - Response (其他)       : RPC 响应，resolve pending_acks
+           - Push (cmd_type=2)     : 服务器推送，判断是入站消息还是 RPC 响应
+           - 其他                  : 忽略或 log
+        4. 每条 need_ack=True 的 Push 都回 PushAck
+        5. WS 断开时（ConnectionClosed）觧发 _reconnect_with_backoff()
+        """
+        try:
+            async for raw in self._ws:  # type: ignore[union-attr]
+                if not isinstance(raw, (bytes, bytearray)):
+                    continue
+                await self._handle_frame(bytes(raw))
+        except asyncio.CancelledError:
+            pass
+        except websockets.exceptions.ConnectionClosed:  # type: ignore[union-attr]
+            logger.warning("[%s] WebSocket connection closed", self.name)
+            if self._running:
+                asyncio.create_task(self._reconnect_with_backoff())
+        except Exception as exc:
+            logger.warning("[%s] receive_loop exited: %s", self.name, exc)
+            if self._running:
+                logger.info("[%s] Attempting reconnect after receive_loop error", self.name)
+                asyncio.create_task(self._reconnect_with_backoff())
+
+    async def _handle_frame(self, raw: bytes) -> None:
+        """处理单个 WebSocket 帧。"""
+        try:
+            msg = decode_conn_msg(raw)
+        except Exception as exc:
+            logger.debug("[%s] Failed to decode frame: %s", self.name, exc)
+            return
+
+        head = msg.get("head", {})
+        cmd_type = head.get("cmd_type", -1)
+        cmd = head.get("cmd", "")
+        msg_id = head.get("msg_id", "")
+        need_ack = head.get("need_ack", False)
+        data: bytes = msg.get("data", b"")
+
+        # HEARTBEAT_ACK: Response to our ping
+        if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
+            logger.debug("[%s] HEARTBEAT_ACK received", self.name)
+            return
+
+        # Response to an outbound RPC call (e.g. send-message response)
+        if cmd_type == CMD_TYPE["Response"]:
+            if msg_id and msg_id in self._pending_acks:
+                fut = self._pending_acks.pop(msg_id)
+                if not fut.done():
+                    # RPC responses use a different proto schema than inbound pushes;
+                    # return the head dict so callers can read msg_id/status fields.
+                    fut.set_result({"head": head})
+            else:
+                logger.debug(
+                    "[%s] Unmatched Response: cmd=%s msg_id=%s",
+                    self.name, cmd, msg_id,
+                )
+            return
+
+        # Server-initiated Push
+        if cmd_type == CMD_TYPE["Push"]:
+            logger.info("[%s] Push received: cmd=%s msg_id=%s data_len=%d", self.name, cmd, msg_id, len(data))
+            # Send PushAck if required
+            if need_ack and self._ws is not None:
+                try:
+                    ack_bytes = encode_push_ack(head)
+                    await self._ws.send(ack_bytes)
+                except Exception as ack_exc:
+                    logger.debug("[%s] Failed to send PushAck: %s", self.name, ack_exc)
+
+            # Some push frames echo an outbound msg_id as confirmation
+            if msg_id and msg_id in self._pending_acks:
+                fut = self._pending_acks.pop(msg_id)
+                if not fut.done():
+                    try:
+                        decoded = decode_inbound_push(data) if data else {"head": head}
+                        fut.set_result(decoded)
+                    except Exception as exc:
+                        fut.set_exception(exc)
+                return
+
+            # Genuine inbound message — dispatch to AI
+            if data:
+                self._push_to_inbound(head, data)
+            return
+
+        logger.debug(
+            "[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s",
+            self.name, cmd_type, cmd, msg_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Group chat helpers
+    # ------------------------------------------------------------------
+
+    def _is_at_bot(self, msg_body: list) -> bool:
+        """
+        检测消息是否 @Bot。
+
+        AT 元素格式：TIMCustomElem，msg_content.data 是 JSON 字符串：
+            {"elem_type": 1002, "text": "@xxx", "user_id": "<botId>"}
+        elem_type == 1002 且 user_id == self._bot_id 时视为 @Bot。
+        """
+        if not self._bot_id:
+            return False
+        for elem in msg_body:
+            if elem.get("msg_type") != "TIMCustomElem":
+                continue
+            data_str = elem.get("msg_content", {}).get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if custom.get("elem_type") == 1002 and custom.get("user_id") == self._bot_id:
+                return True
+        return False
+
+    def _build_group_context(self, chat_id: str, current_sender: str, current_msg: str) -> str:
+        """
+        将该 chat_id 的群聊历史 + 当前消息拼成完整 context（Markdown 格式）。
+
+        格式：
+            **[历史消息]**
+            用户A: 消息1
+            用户B: 消息2
+            ...
+            **[当前消息]**
+            用户C: 当前消息内容
+        """
+        history = self._group_history.get(chat_id)
+        lines: list[str] = []
+        if history:
+            lines.append("**[历史消息]**")
+            for entry in history:
+                lines.append(f"{entry['sender_id']}: {entry['text']}")
+            lines.append("")
+        lines.append("**[当前消息]**")
+        lines.append(f"{current_sender}: {current_msg}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Typing / heartbeat
+    # ------------------------------------------------------------------
+
+    async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
+        """
+        发送"正在输入"状态心跳（RUNNING），best effort，不抛错。
+        根据 chat_id 前缀判断 C2C 或群聊。
+        """
+        try:
+            if chat_id.startswith("group:"):
+                group_code = chat_id[len("group:"):]
+                await self._send_group_heartbeat(group_code, "running")
+            else:
+                to_account = chat_id.removeprefix("direct:")
+                await self._send_private_heartbeat(to_account, "running")
+        except Exception as exc:
+            logger.debug("[%s] send_typing failed: %s", self.name, exc)
+
+    async def _send_private_heartbeat(self, to_account: str, status: str) -> None:
+        """
+        发送 C2C 心跳。
+        status: 'running'(1) / 'done'/'finish'(2)
+
+        SendPrivateHeartbeatReq proto fields:
+          1: from_account (string)
+          2: to_account   (string)
+          3: heartbeat    (varint: RUNNING=1, FINISH=2)
+        """
+        if self._ws is None or not self._bot_id:
+            return
+        heartbeat_val = 1 if status == "running" else 2
+        buf = (
+            _encode_field(1, WT_LEN, _encode_string(self._bot_id))
+            + _encode_field(2, WT_LEN, _encode_string(to_account))
+            + _encode_field(3, WT_VARINT, _encode_varint(heartbeat_val))
+        )
+        req_id = f"hb_priv_{next_seq_no()}"
+        encoded = encode_biz_msg(
+            service=_BIZ_PKG,
+            method="send_private_heartbeat",
+            req_id=req_id,
+            body=buf,
+        )
+        try:
+            await self._ws.send(encoded)
+            logger.debug(
+                "[%s] private heartbeat sent: to=%s status=%s",
+                self.name, to_account, status,
+            )
+        except Exception as exc:
+            logger.debug("[%s] _send_private_heartbeat failed: %s", self.name, exc)
+
+    async def _send_group_heartbeat(self, group_code: str, status: str) -> None:
+        """
+        发送群聊心跳。
+        status: 'running'(1) / 'done'/'finish'(2)
+
+        SendGroupHeartbeatReq proto fields:
+          1: from_account (string)
+          2: to_account   (string)  — 群场景留空
+          3: group_code   (string)
+          4: send_time    (int64, ms timestamp)
+          5: heartbeat    (varint: RUNNING=1, FINISH=2)
+        """
+        if self._ws is None or not self._bot_id:
+            return
+        heartbeat_val = 1 if status == "running" else 2
+        send_time = int(time.time() * 1000)
+        buf = (
+            _encode_field(1, WT_LEN, _encode_string(self._bot_id))
+            + _encode_field(2, WT_LEN, _encode_string(""))  # to_account empty for group
+            + _encode_field(3, WT_LEN, _encode_string(group_code))
+            + _encode_field(4, WT_VARINT, _encode_varint(send_time))
+            + _encode_field(5, WT_VARINT, _encode_varint(heartbeat_val))
+        )
+        req_id = f"hb_grp_{next_seq_no()}"
+        encoded = encode_biz_msg(
+            service=_BIZ_PKG,
+            method="send_group_heartbeat",
+            req_id=req_id,
+            body=buf,
+        )
+        try:
+            await self._ws.send(encoded)
+            logger.debug(
+                "[%s] group heartbeat sent: group=%s status=%s",
+                self.name, group_code, status,
+            )
+        except Exception as exc:
+            logger.debug("[%s] _send_group_heartbeat failed: %s", self.name, exc)
+
+    def _push_to_inbound(self, head: dict, conn_data: bytes) -> None:
+        """
+        将推送帧转换为 MessageEvent 并分发给 AI 处理。
+
+        解码优先级（对齐 TS gateway.ts 的 wsPushToInboundMessage）:
+          1. connData protobuf: decode_inbound_push(conn_data) 直接解码
+          2. PushMsg 外层解包: decode_push_msg(conn_data) 拿 rawData,
+             再 decode_inbound_push(rawData)
+          3. rawData JSON 回退: raw_data 当 JSON 解析
+          4. DirectedPush.content: decode_directed_push(conn_data) 拿 content JSON
+          5. conn_data JSON 兜底（含 callback_command 过滤，最后才尝试）
+        """
+        push = None
+        raw_data = None  # PushMsg.data
+
+        # Step 1: connData protobuf 解码（优先，完整 ConnMsg.data）
+        # P0: 仅当 push 非 None 且非空 dict 才停止尝试
+        if conn_data:
+            try:
+                push = decode_inbound_push(conn_data)
+                if not push:  # None 或空 dict {} 都视为失败，继续后续步骤
+                    push = None
+            except Exception:
+                push = None
+
+        # Step 2: PushMsg 外层解包 + rawData protobuf
+        if not push:
+            push_msg = decode_push_msg(conn_data)
+            if push_msg is not None:
+                raw_data = push_msg.get("data") or b""
+                logger.debug(
+                    "[%s] PushMsg decoded: cmd=%r module=%r raw_data_len=%d",
+                    self.name, push_msg.get("cmd"), push_msg.get("module"), len(raw_data),
+                )
+                if raw_data:
+                    try:
+                        push = decode_inbound_push(raw_data)
+                        if not push:
+                            push = None
+                    except Exception:
+                        push = None
+
+        # Step 3: rawData JSON 回退
+        if not push and raw_data:
+            try:
+                raw_json = json.loads(raw_data.decode("utf-8"))
+                logger.info("[%s] rawData JSON push: fields=%s len=%d",
+                    self.name, list(raw_json.keys()), len(json.dumps(raw_json)))
+                push = _parse_json_push(raw_json)
+            except Exception:
+                pass
+
+        # Step 4: DirectedPush.content（content 是 JSON 字符串）
+        if not push:
+            directed = decode_directed_push(conn_data)
+            if directed and directed.get("content"):
+                content_str = directed["content"]
+                logger.info("[%s] DirectedPush: type=%d content_len=%d",
+                    self.name, directed.get("type", 0), len(content_str))
+                try:
+                    content_json = json.loads(content_str)
+                    push = _parse_json_push(content_json)
+                    if push and not push.get("msg_body"):
+                        msg_body = _parse_push_content_to_msg_body(content_str)
+                        if msg_body:
+                            push["msg_body"] = msg_body
+                except Exception as _content_exc:
+                    # P2: 记录 JSON 解析失败，方便诊断
+                    logger.warning(
+                        "[%s] DirectedPush content JSON parse failed: %s",
+                        self.name, _content_exc,
+                    )
+                    if content_str.strip():
+                        push = {
+                            "from_account": "",
+                            "msg_body": [{"msg_type": "TIMTextElem",
+                                          "msg_content": {"text": content_str}}],
+                        }
+                        logger.debug(
+                            "[%s] DirectedPush fallback to plain text: %s",
+                            self.name, content_str[:200],
+                        )
+
+        # Step 5: conn_data itself is JSON (callback_command style push) — 最后兜底
+        # Yuanbao delivers inbound user messages directly as JSON in ConnMsg.data, e.g.:
+        #   {"callback_command":"C2C.CallbackAfterSendMsg", "from_account":..., "msg_body":[...]}
+        # NOTE: Despite the name "AfterSendMsg", this is the format for INBOUND user messages
+        # (not a bot send-echo). The TS original code (gateway.ts decodeFromContent) assigns
+        # C2C.CallbackAfterSendMsg as the callback_command for user messages received via
+        # DirectedPush.content — this is exactly what Yuanbao server sends as the push payload.
+        # Do NOT filter these out.
+        if not push and conn_data:
+            try:
+                conn_json = json.loads(conn_data.decode("utf-8"))
+                if not isinstance(conn_json, dict):
+                    pass
+                else:
+                    logger.info("[%s] conn_data JSON push: fields=%s len=%d",
+                        self.name, list(conn_json.keys()), len(json.dumps(conn_json)))
+                    push = _parse_json_push(conn_json)
+            except Exception:
+                pass
+
+        if not push:
+            logger.info("[%s] Push decoded but no valid message. conn_data hex(first64)=%s",
+                self.name, conn_data.hex()[:128] if conn_data else "(empty)")
+            return
+
+        logger.info("[%s] Push decoded: from=%s group=%s msg_body_len=%d", self.name, push.get("from_account",""), push.get("group_code",""), len(push.get("msg_body",[])))
+        from_account: str = push.get("from_account", "")
+        group_code: str = push.get("group_code", "")
+        group_name: str = push.get("group_name", "")
+        sender_nickname: str = push.get("sender_nickname", "")
+        msg_body: list = push.get("msg_body", [])
+        msg_id_field: str = push.get("msg_id", "")
+
+        # Determine chat type and build chat_id
+        if group_code:
+            chat_id = f"group:{group_code}"
+            chat_type = "group"
+            chat_name = group_name or group_code
+        else:
+            chat_id = f"direct:{from_account}"
+            chat_type = "dm"
+            chat_name = sender_nickname or from_account
+
+        # ---- Group chat: history recording + @Bot filter ----
+        if chat_type == "group":
+            text_for_history = self._extract_text(msg_body)
+            # Record every group message into history
+            if chat_id not in self._group_history:
+                if len(self._group_history) >= _CHAT_DICT_MAX_SIZE:
+                    self._group_history.pop(next(iter(self._group_history)))
+                self._group_history[chat_id] = deque(maxlen=50)
+            self._group_history[chat_id].append({
+                "sender_id": from_account,
+                "text": text_for_history,
+                "ts": int(time.time() * 1000),
+            })
+
+            # Only trigger AI when @Bot
+            if not self._is_at_bot(msg_body):
+                logger.info(
+                    "[%s] Group message recorded (no @bot): chat=%s from=%s",
+                    self.name, chat_id, from_account,
+                )
+                return
+
+            # Build context-enriched content
+            text = self._build_group_context(chat_id, from_account, text_for_history)
+        else:
+            text = self._extract_text(msg_body)
+
+        source = SessionSource(
+            platform=self.PLATFORM,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            chat_name=chat_name,
+            user_id=from_account or None,
+            user_name=sender_nickname or None,
+        )
+
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=msg_id_field or None,
+            raw_message=push,
+        )
+
+        asyncio.create_task(self.handle_message(event))
+
+    def _extract_text(self, msg_body: list) -> str:
+        """
+        从 MsgBody 提取纯文本内容。
+        - TIMTextElem      → 提取 text 字段
+        - TIMImageElem     → "[图片]"
+        - TIMFileElem      → "[文件: {filename}]"
+        - TIMSoundElem     → "[语音]"
+        - TIMVideoFileElem → "[视频]"
+        - TIMCustomElem    → 尝试提取 data 字段，否则 "[自定义消息]"
+        - 多个 elem 用空格拼接
+        """
+        parts: list[str] = []
+        for elem in msg_body:
+            elem_type: str = elem.get("msg_type", "")
+            content: dict = elem.get("msg_content", {})
+
+            if elem_type == "TIMTextElem":
+                text = content.get("text", "")
+                if text:
+                    parts.append(text)
+            elif elem_type == "TIMImageElem":
+                parts.append("[图片]")
+            elif elem_type == "TIMFileElem":
+                filename = content.get("fileName", content.get("filename", ""))
+                parts.append(f"[文件: {filename}]" if filename else "[文件]")
+            elif elem_type == "TIMSoundElem":
+                parts.append("[语音]")
+            elif elem_type == "TIMVideoFileElem":
+                parts.append("[视频]")
+            elif elem_type == "TIMCustomElem":
+                data_val = content.get("data", "")
+                parts.append(data_val if data_val else "[自定义消息]")
+            elif elem_type:
+                # Unknown element type — include type as placeholder
+                parts.append(f"[{elem_type}]")
+
+        return " ".join(parts) if parts else ""
+
+    # ------------------------------------------------------------------
+    # Media send methods
+    # ------------------------------------------------------------------
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送图片消息。
+
+        流程：
+          1. 下载图片 URL 内容（httpx）
+          2. 调用 genUploadInfo 获取 COS 临时凭证
+          3. PUT 上传到 COS
+          4. 构造 TIMImageElem 消息体，通过 WS 发送
+
+        若 image_url 已是 COS 公网 URL（cos.*myqcloud.com 或 file.myqcloud.com），
+        则跳过重复上传，直接用其构造消息体。
+        """
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        try:
+            # 1. 下载图片
+            logger.info("[%s] send_image: downloading %s", self.name, image_url)
+            file_bytes, content_type = await media_download_url(image_url, max_size_mb=50)
+
+            if not content_type or content_type == "application/octet-stream":
+                # 从 URL 推断 MIME
+                path_part = image_url.split("?")[0]
+                content_type = guess_mime_type(path_part) or "image/jpeg"
+
+            filename = os.path.basename(image_url.split("?")[0]) or "image.jpg"
+            file_uuid = md5_hex(file_bytes)
+
+            # 2. 获取 COS 上传凭证
+            token_data = await self._get_cached_token()
+            token: str = token_data.get("token", "")
+            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
+
+            credentials = await get_cos_credentials(
+                app_key=self._app_key,
+                sign_token_url=self._sign_token_url,
+                token=token,
+                filename=filename,
+                bot_id=bot_id,
+            )
+
+            # 3. 上传到 COS
+            upload_result = await upload_to_cos(
+                file_bytes=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                credentials=credentials,
+                bucket=credentials["bucketName"],
+                region=credentials["region"],
+            )
+
+            # 4. 构造 TIMImageElem 消息体
+            msg_body = build_image_msg_body(
+                url=upload_result["url"],
+                uuid=file_uuid,
+                filename=filename,
+                size=upload_result["size"],
+                width=upload_result.get("width", 0),
+                height=upload_result.get("height", 0),
+                mime_type=content_type,
+            )
+
+            # 5. 若有 caption，追加文字消息体
+            if caption:
+                msg_body.append(
+                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
+                )
+
+            # 6. 发送
+            async with self._send_lock:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    result = await self._send_c2c_msg_body(to_account, msg_body)
+
+            if result.get("success"):
+                return SendResult(success=True, message_id=result.get("msg_key"))
+            return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+        except Exception as exc:
+            logger.error("[%s] send_image() failed: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_file(
+        self,
+        chat_id: str,
+        file_url: str,
+        filename: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送文件消息。
+
+        流程：
+          1. 下载文件 URL 内容（httpx）
+          2. 调用 genUploadInfo 获取 COS 临时凭证
+          3. PUT 上传到 COS
+          4. 构造 TIMFileElem 消息体，通过 WS 发送
+        """
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        try:
+            # 1. 下载文件
+            logger.info("[%s] send_file: downloading %s", self.name, file_url)
+            file_bytes, content_type = await media_download_url(file_url, max_size_mb=50)
+
+            # 推断文件名
+            if not filename:
+                path_part = file_url.split("?")[0]
+                filename = os.path.basename(path_part) or "file"
+
+            if not content_type or content_type == "application/octet-stream":
+                content_type = guess_mime_type(filename) or "application/octet-stream"
+
+            file_uuid = md5_hex(file_bytes)
+
+            # 2. 获取 COS 上传凭证
+            token_data = await self._get_cached_token()
+            token: str = token_data.get("token", "")
+            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
+
+            credentials = await get_cos_credentials(
+                app_key=self._app_key,
+                sign_token_url=self._sign_token_url,
+                token=token,
+                filename=filename,
+                bot_id=bot_id,
+            )
+
+            # 3. 上传到 COS
+            upload_result = await upload_to_cos(
+                file_bytes=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                credentials=credentials,
+                bucket=credentials["bucketName"],
+                region=credentials["region"],
+            )
+
+            # 4. 构造 TIMFileElem 消息体
+            msg_body = build_file_msg_body(
+                url=upload_result["url"],
+                filename=filename,
+                uuid=file_uuid,
+                size=upload_result["size"],
+            )
+
+            # 5. 发送
+            async with self._send_lock:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    result = await self._send_c2c_msg_body(to_account, msg_body)
+
+            if result.get("success"):
+                return SendResult(success=True, message_id=result.get("msg_key"))
+            return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+        except Exception as exc:
+            logger.error("[%s] send_file() failed: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_sticker(
+        self,
+        chat_id: str,
+        sticker_name: Optional[str] = None,
+        face_index: Optional[int] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送表情包/贴纸（TIMFaceElem）。
+
+        解析优先级：
+          1. sticker_name 不为空 → 在 STICKER_MAP 中模糊查找，找不到返回错误
+          2. face_index 不为空   → 直接用该 index 构造 TIMFaceElem（无 data）
+          3. 两者均为空          → 随机发送一个内置贴纸
+
+        chat_id 格式与 send() 相同：
+          - C2C:  "direct:{account_id}" 或 "{account_id}"
+          - 群聊: "group:{group_code}"
+        """
+        from gateway.platforms.yuanbao_sticker import (
+            get_sticker_by_name,
+            get_random_sticker,
+            build_face_msg_body,
+            build_sticker_msg_body,
+        )
+
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        try:
+            if sticker_name is not None:
+                sticker = get_sticker_by_name(sticker_name)
+                if sticker is None:
+                    return SendResult(
+                        success=False,
+                        error=f"Sticker not found: {sticker_name!r}",
+                    )
+                msg_body = build_sticker_msg_body(sticker)
+            elif face_index is not None:
+                msg_body = build_face_msg_body(face_index=face_index)
+            else:
+                sticker = get_random_sticker()
+                msg_body = build_sticker_msg_body(sticker)
+
+            async with self._send_lock:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    result = await self._send_c2c_msg_body(to_account, msg_body)
+
+            if result.get("success"):
+                return SendResult(success=True, message_id=result.get("msg_key"))
+            return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+        except Exception as exc:
+            logger.error("[%s] send_sticker() failed: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
+        """发送任意 MsgBody 的 C2C 消息。"""
+        req_id = f"c2c_{next_seq_no()}"
+        encoded = encode_send_c2c_message(
+            to_account=to_account,
+            msg_body=msg_body,
+            from_account=self._bot_id or "",
+            msg_id=req_id,
+        )
+        try:
+            response = await self._send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timeout after 10.0s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def _send_group_msg_body(
+        self,
+        group_code: str,
+        msg_body: list,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """发送任意 MsgBody 的群聊消息。"""
+        req_id = f"grp_{next_seq_no()}"
+        encoded = encode_send_group_message(
+            group_code=group_code,
+            msg_body=msg_body,
+            from_account=self._bot_id or "",
+            msg_id=req_id,
+            ref_msg_id=reply_to or "",
+        )
+        try:
+            response = await self._send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timeout after 10.0s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def _get_cached_token(self) -> dict:
+        """
+        获取当前有效的签票 token（走 yuanbao_api 模块缓存）。
+        """
+        from gateway.platforms.yuanbao_api import get_sign_token as _get_sign_token
+        return await _get_sign_token(
+            self._app_key, self._app_secret, self._sign_token_url
+        )
+
+    async def _reconnect_with_backoff(self) -> bool:
+        """
+        Reconnect with exponential backoff.
+
+        Waits 1s, 2s, 4s, … up to 60s between attempts.
+        On each attempt, force-refreshes the sign token (old token may be expired).
+        Returns True on successful reconnect, False after max attempts.
+        """
+        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            self._reconnect_attempts = attempt + 1
+            wait = min(2 ** attempt, 60)
+            logger.info(
+                "[%s] Reconnect attempt %d/%d in %ds",
+                self.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait,
+            )
+            await asyncio.sleep(wait)
+
+            # Clean up existing connection before re-trying
+            await self._cleanup_ws()
+
+            try:
+                # Force-refresh token to avoid using a stale one
+                token_data = await force_refresh_sign_token(
+                    self._app_key, self._app_secret, self._sign_token_url
+                )
+                if token_data.get("bot_id"):
+                    self._bot_id = str(token_data["bot_id"])
+
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(  # type: ignore[attr-defined]
+                        self._ws_gateway_url,
+                        ping_interval=None,
+                        ping_timeout=None,
+                        close_timeout=5,
+                    ),
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                )
+
+                authed = await self._authenticate(token_data)
+                if not authed:
+                    logger.warning("[%s] Re-auth failed on attempt %d", self.name, attempt + 1)
+                    await self._cleanup_ws()
+                    continue
+
+                # Restart background tasks
+                self._reconnect_attempts = 0
+                self._mark_connected()
+
+                if self._heartbeat_task and not self._heartbeat_task.done():
+                    self._heartbeat_task.cancel()
+                self._heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(),
+                    name=f"yuanbao-heartbeat-{self._connect_id}",
+                )
+
+                if self._recv_task and not self._recv_task.done():
+                    self._recv_task.cancel()
+                self._recv_task = asyncio.create_task(
+                    self._receive_loop(),
+                    name=f"yuanbao-recv-{self._connect_id}",
+                )
+
+                logger.info(
+                    "[%s] Reconnected on attempt %d. connectId=%s",
+                    self.name, attempt + 1, self._connect_id,
+                )
+                return True
+
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Reconnect attempt %d timed out", self.name, attempt + 1)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Reconnect attempt %d failed: %s", self.name, attempt + 1, exc
+                )
+
+        logger.error(
+            "[%s] Giving up after %d reconnect attempts", self.name, MAX_RECONNECT_ATTEMPTS
+        )
+        self._mark_disconnected()
+        return False
+
+    async def _cleanup_ws(self) -> None:
+        """Close and clear the WebSocket connection."""
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    def get_status(self) -> dict:
+        """Return a snapshot of the current connection status."""
+        ws = self._ws
+        connected = False
+        if ws is not None:
+            # websockets >= 10 exposes .open as a bool property
+            open_attr = getattr(ws, "open", None)
+            if open_attr is True:
+                connected = True
+            elif callable(open_attr):
+                try:
+                    connected = bool(open_attr())
+                except Exception:
+                    connected = False
+
+        return {
+            "connected": connected,
+            "bot_id": self._bot_id,
+            "connect_id": self._connect_id,
+            "reconnect_attempts": self._reconnect_attempts,
+            "ws_gateway_url": self._ws_gateway_url,
+        }
+
+    def _next_seq(self) -> int:
+        """Return a monotonically increasing local sequence number."""
+        self._seq += 1
+        return self._seq
+
+
+# ============================================================
+# 模块级辅助函数（JSON 推送解析，对齐 TS 的 decodeFromContent）
+# ============================================================
+
+def _parse_json_push(raw_json: dict) -> dict | None:
+    """
+    将 JSON 格式的推送（来自 rawData 或 DirectedPush.content）转换为
+    与 decode_inbound_push 相同结构的 dict。
+
+    支持标准回调格式（callback_command + from_account + msg_body）
+    以及旧格式字段（GroupId, MsgSeq, MsgKey, MsgBody 等）。
+    """
+    if not raw_json:
+        return None
+
+    # Tencent IM callback format uses PascalCase (From_Account, To_Account, MsgBody).
+    # Internal format uses snake_case (from_account, to_account, msg_body).
+    # Support both.
+    from_account = (
+        raw_json.get("from_account", "")
+        or raw_json.get("From_Account", "")
+    )
+    group_code = (
+        raw_json.get("group_code", "")
+        or raw_json.get("GroupId", "")
+        or raw_json.get("group_id", "")
+    )
+    msg_body_raw = (
+        raw_json.get("msg_body", [])
+        or raw_json.get("MsgBody", [])
+    )
+    msg_body = _convert_json_msg_body(msg_body_raw)
+
+    # Allow a push with from_account even if msg_body is empty (e.g. callback notifications)
+    if not from_account and not msg_body:
+        return None
+
+    return {
+        "callback_command": raw_json.get("callback_command", ""),
+        "from_account": from_account,
+        "to_account": raw_json.get("to_account", "") or raw_json.get("To_Account", ""),
+        "sender_nickname": raw_json.get("sender_nickname", "") or raw_json.get("nick_name", ""),
+        "group_code": group_code,
+        "group_name": raw_json.get("group_name", ""),
+        "msg_seq": raw_json.get("msg_seq", 0) or raw_json.get("MsgSeq", 0),
+        "msg_id": raw_json.get("msg_id", "") or raw_json.get("msg_key", "") or raw_json.get("MsgKey", ""),
+        "msg_body": msg_body,
+        "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
+    }
+
+
+def _parse_push_content_to_msg_body(content: str) -> list | None:
+    """
+    将 DirectedPush.content（字符串）解析为 msg_body 列表。
+    对齐 TS 的 parsePushContentToMsgBody。
+
+    - 若是 JSON 且有 msg_body 数组 → 直接返回
+    - 若是 JSON 且有 text 字段 → 包装为 TIMTextElem
+    - 纯文本 → 包装为 TIMTextElem
+    """
+    if not content or not content.strip():
+        return None
+    try:
+        parsed = json.loads(content)
+        if parsed.get("msg_body") and isinstance(parsed["msg_body"], list):
+            return _convert_json_msg_body(parsed["msg_body"])
+        if parsed.get("text"):
+            return [{"msg_type": "TIMTextElem", "msg_content": {"text": parsed["text"]}}]
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    # 纯文本
+    return [{"msg_type": "TIMTextElem", "msg_content": {"text": content}}]
+
+
+def _convert_json_msg_body(raw_body: list) -> list:
+    """
+    将原始 JSON msg_body 数组标准化为 [{"msg_type": str, "msg_content": dict}] 格式。
+    兼容大驼峰（MsgType/MsgContent）和小蛇形（msg_type/msg_content）两种命名。
+    """
+    result = []
+    for item in raw_body or []:
+        if not isinstance(item, dict):
+            continue
+        msg_type = item.get("msg_type") or item.get("MsgType", "")
+        msg_content = item.get("msg_content") or item.get("MsgContent", {})
+        if isinstance(msg_content, str):
+            try:
+                msg_content = json.loads(msg_content)
+            except Exception:
+                msg_content = {"text": msg_content}
+        result.append({"msg_type": msg_type, "msg_content": msg_content or {}})
+    return result

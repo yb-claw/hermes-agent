@@ -9,11 +9,11 @@ Each adapter handles:
 """
 
 from .base import BasePlatformAdapter, MessageEvent, SendResult
-from .qqbot import QQAdapter
+from .yuanbao import YuanbaoAdapter
 
 __all__ = [
     "BasePlatformAdapter",
     "MessageEvent",
     "SendResult",
-    "QQAdapter",
+    "YuanbaoAdapter",
 ]
