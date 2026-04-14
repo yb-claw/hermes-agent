@@ -257,6 +257,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "sms": Platform.SMS,
         "bluebubbles": Platform.BLUEBUBBLES,
         "qqbot": Platform.QQBOT,
+        "yuanbao": Platform.YUANBAO,
     }
     platform = platform_map.get(platform_name.lower())
     if not platform:
