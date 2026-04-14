@@ -121,6 +121,16 @@ REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # 30 秒无活动自动停止
 OUTBOUND_MIN_CHARS = 200           # 最小缓冲门槛（字符数）才触发 flush
 OUTBOUND_FLUSH_DELAY_S = 0.5      # flush 延迟（秒），收集更多文本后再发
 
+# Reply-to 引用配置
+REPLY_REF_TTL_S = 300.0            # 引用去重 TTL（5 分钟）
+_REPLY_REF_MAX_ENTRIES = 500       # 引用去重字典最大容量
+
+# 占位符消息过滤（当无实际媒体内容时跳过这些纯占位符）
+_SKIPPABLE_PLACEHOLDERS = frozenset({
+    "[image]", "[图片]", "[file]", "[文件]",
+    "[video]", "[视频]", "[voice]", "[语音]",
+})
+
 
 class _OutboundQueue:
     """
@@ -280,6 +290,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
         self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
 
+        # Reply-to dedup: inbound_msg_id -> expire_ts
+        # Only the first outbound message carries refMsgId for a given inbound msg.
+        self._reply_ref_used: Dict[str, float] = {}
+
+        # replyToMode config: 'off' | 'first' | 'all' (default: 'first')
+        self._reply_to_mode: str = (
+            getattr(config, 'yuanbao_reply_to_mode', None)
+            or os.getenv("YUANBAO_REPLY_TO_MODE", "first")
+        ).strip().lower()
+
     # ------------------------------------------------------------------
     # Abstract method implementations
     # ------------------------------------------------------------------
@@ -418,6 +438,52 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 self._chat_locks.pop(next(iter(self._chat_locks)))
             self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
+
+    def _should_attach_reply_ref(self, inbound_msg_id: str) -> bool:
+        """
+        判断是否应该为本次出站消息附加 refMsgId。
+
+        规则：
+        - replyToMode='off' → 永不附加
+        - replyToMode='all' → 始终附加
+        - replyToMode='first'（默认）→ 同一入站消息只有首次回复附加
+
+        带 TTL 清理，防止内存泄漏。
+        """
+        if self._reply_to_mode == "off":
+            return False
+        if self._reply_to_mode == "all":
+            return True
+        if not inbound_msg_id:
+            return False
+
+        now = time.time()
+
+        # 清理过期条目
+        if len(self._reply_ref_used) > _REPLY_REF_MAX_ENTRIES:
+            expired = [k for k, ts in self._reply_ref_used.items() if now - ts > REPLY_REF_TTL_S]
+            for k in expired:
+                self._reply_ref_used.pop(k, None)
+
+        # 检查是否已使用
+        if inbound_msg_id in self._reply_ref_used:
+            return False
+
+        self._reply_ref_used[inbound_msg_id] = now
+        return True
+
+    @staticmethod
+    def _is_self_reference(from_account: str, bot_id: Optional[str]) -> bool:
+        """检测是否是 bot 自己的消息（自引用）。"""
+        if not from_account or not bot_id:
+            return False
+        return from_account == bot_id
+
+    @staticmethod
+    def _is_skippable_placeholder(text: str) -> bool:
+        """检测是否为纯占位符消息（无实际内容时应跳过）。"""
+        stripped = text.strip()
+        return stripped in _SKIPPABLE_PLACEHOLDERS
 
     async def send(
         self,
@@ -1250,6 +1316,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         msg_body: list = push.get("msg_body", [])
         msg_id_field: str = push.get("msg_id", "")
 
+        # ---- Self-reference filter ----
+        if self._is_self_reference(from_account, self._bot_id):
+            logger.debug("[%s] Ignoring self-sent message from %s", self.name, from_account)
+            return
+
         # Determine chat type and build chat_id
         if group_code:
             chat_id = f"group:{group_code}"
@@ -1286,6 +1357,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
             text = self._build_group_context(chat_id, from_account, text_for_history)
         else:
             text = self._extract_text(msg_body)
+
+        # ---- Placeholder filter ----
+        if self._is_skippable_placeholder(text):
+            logger.debug("[%s] Skipping placeholder message: %r", self.name, text)
+            return
 
         source = SessionSource(
             platform=self.PLATFORM,
