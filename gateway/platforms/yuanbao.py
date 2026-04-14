@@ -96,7 +96,18 @@ DEFAULT_SIGN_TOKEN_URL = "https://yuanbao.tencent.com/api/sign-token"
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
 AUTH_TIMEOUT_SECONDS = 10.0
-MAX_RECONNECT_ATTEMPTS = 10
+MAX_RECONNECT_ATTEMPTS = 100
+DEFAULT_SEND_TIMEOUT = 30.0  # WS biz request timeout (was 10s)
+
+# Close codes that indicate permanent errors — do NOT reconnect.
+NO_RECONNECT_CLOSE_CODES = {4012, 4013, 4014, 4018, 4019, 4021}
+
+# Heartbeat timeout threshold — N consecutive missed pongs trigger reconnect.
+HEARTBEAT_TIMEOUT_THRESHOLD = 2
+
+# Auth error code classification
+AUTH_FAILED_CODES = {4001, 4002, 4003}      # permanent auth failure, re-sign token
+AUTH_RETRYABLE_CODES = {4010, 4011, 4099}   # transient, can retry with same token
 
 # Maximum number of distinct chat IDs tracked in _chat_locks / _group_history.
 # Oldest entry is evicted when the limit is reached to prevent unbounded growth.
@@ -148,6 +159,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Reconnection state
         self._reconnect_attempts: int = 0
+        self._consecutive_hb_timeouts: int = 0  # heartbeat timeout counter
 
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
@@ -393,7 +405,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             response = await self._send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
         except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after 10.0s"}
+            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -417,7 +429,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             response = await self._send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
         except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after 10.0s"}
+            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -425,7 +437,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self,
         encoded_conn_msg: bytes,
         req_id: str,
-        timeout: float = 10.0,
+        timeout: float = DEFAULT_SEND_TIMEOUT,
     ) -> dict:
         """
         发送业务层请求并等待响应。
@@ -587,7 +599,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return None
 
     async def _heartbeat_loop(self) -> None:
-        """Send HEARTBEAT (ping) every 30 seconds while connected."""
+        """
+        Send HEARTBEAT (ping) every 30 seconds while connected.
+        Tracks consecutive missed pongs; triggers reconnect after HEARTBEAT_TIMEOUT_THRESHOLD.
+        """
         try:
             while self._running:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -596,8 +611,29 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 try:
                     msg_id = str(uuid.uuid4())
                     ping_bytes = encode_ping(msg_id)
+                    # Register a future for this ping to track pong response
+                    loop = asyncio.get_running_loop()
+                    pong_future: asyncio.Future = loop.create_future()
+                    self._pending_acks[msg_id] = pong_future
                     await self._ws.send(ping_bytes)
                     logger.debug("[%s] PING sent (msg_id=%s)", self.name, msg_id)
+                    try:
+                        await asyncio.wait_for(pong_future, timeout=10.0)
+                        self._consecutive_hb_timeouts = 0
+                    except asyncio.TimeoutError:
+                        self._pending_acks.pop(msg_id, None)
+                        self._consecutive_hb_timeouts += 1
+                        logger.warning(
+                            "[%s] PONG timeout (%d/%d)",
+                            self.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD,
+                        )
+                        if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
+                            logger.warning("[%s] Heartbeat threshold exceeded, triggering reconnect", self.name)
+                            if self._running:
+                                asyncio.create_task(self._reconnect_with_backoff())
+                            return
+                    finally:
+                        self._pending_acks.pop(msg_id, None)
                 except Exception as exc:
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
         except asyncio.CancelledError:
@@ -623,9 +659,19 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 await self._handle_frame(bytes(raw))
         except asyncio.CancelledError:
             pass
-        except websockets.exceptions.ConnectionClosed:  # type: ignore[union-attr]
-            logger.warning("[%s] WebSocket connection closed", self.name)
-            if self._running:
+        except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
+            close_code = getattr(close_exc, 'code', None)
+            logger.warning(
+                "[%s] WebSocket connection closed: code=%s reason=%s",
+                self.name, close_code, getattr(close_exc, 'reason', ''),
+            )
+            if close_code and close_code in NO_RECONNECT_CLOSE_CODES:
+                logger.error(
+                    "[%s] Close code %d is non-recoverable, NOT reconnecting",
+                    self.name, close_code,
+                )
+                self._mark_disconnected()
+            elif self._running:
                 asyncio.create_task(self._reconnect_with_backoff())
         except Exception as exc:
             logger.warning("[%s] receive_loop exited: %s", self.name, exc)
@@ -1456,7 +1502,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             response = await self._send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
         except asyncio.TimeoutError:
-            return {"success": False, "error": "Request timeout after 10.0s"}
+            return {"success": False, "error": "Request timeout after 30.0s"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -1479,7 +1525,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             response = await self._send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
         except asyncio.TimeoutError:
-            return {"success": False, "error": "Request timeout after 10.0s"}
+            return {"success": False, "error": "Request timeout after 30.0s"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
