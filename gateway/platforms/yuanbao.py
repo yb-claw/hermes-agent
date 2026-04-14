@@ -18,13 +18,20 @@ Configuration in config.yaml (or via env vars):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
+
+import httpx
 
 try:
     import websockets
@@ -46,7 +53,6 @@ from gateway.platforms.yuanbao_media import (
     is_image,
     md5_hex,
 )
-from gateway.platforms.yuanbao_markdown import chunk_markdown_text
 from gateway.platforms.yuanbao_proto import (
     CMD_TYPE,
     _BIZ_PKG,
@@ -72,7 +78,6 @@ from gateway.platforms.yuanbao_proto import (
     encode_send_group_message,
     next_seq_no,
 )
-from gateway.platforms.yuanbao_api import get_sign_token, force_refresh_sign_token
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
@@ -1309,10 +1314,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _get_cached_token(self) -> dict:
         """
-        获取当前有效的签票 token（走 yuanbao_api 模块缓存）。
+        获取当前有效的签票 token（走模块级缓存）。
         """
-        from gateway.platforms.yuanbao_api import get_sign_token as _get_sign_token
-        return await _get_sign_token(
+        return await get_sign_token(
             self._app_key, self._app_secret, self._sign_token_url
         )
 
@@ -1528,3 +1532,438 @@ def _convert_json_msg_body(raw_body: list) -> list:
                 msg_content = {"text": msg_content}
         result.append({"msg_type": msg_type, "msg_content": msg_content or {}})
     return result
+
+
+# ============================================================
+# Markdown 分块工具函数（原 yuanbao_markdown.py）
+# ============================================================
+
+def has_unclosed_fence(text: str) -> bool:
+    """
+    检测文本中是否有未闭合的代码块围栏。
+
+    逐行扫描，遇到以 ``` 开头的行时切换 in/out 状态。
+    奇数次切换说明存在未闭合的围栏。
+
+    Args:
+        text: 待检测的 Markdown 文本
+
+    Returns:
+        若文本以未闭合围栏结尾则返回 True，否则返回 False
+    """
+    in_fence = False
+    for line in text.split('\n'):
+        if line.startswith('```'):
+            in_fence = not in_fence
+    return in_fence
+
+
+def ends_with_table_row(text: str) -> bool:
+    """
+    检测文本是否以表格行结尾（最后一个非空行以 | 开头且以 | 结尾）。
+
+    Args:
+        text: 待检测的文本
+
+    Returns:
+        若最后一个非空行是表格行则返回 True
+    """
+    trimmed = text.rstrip()
+    if not trimmed:
+        return False
+    last_line = trimmed.split('\n')[-1].strip()
+    return last_line.startswith('|') and last_line.endswith('|')
+
+
+def split_at_paragraph_boundary(text: str, max_chars: int) -> tuple[str, str]:
+    """
+    在不超过 max_chars 的前提下，找到最近的段落边界切割点，返回 (前段, 后段)。
+
+    切割优先级：
+    1. 空行（段落边界）
+    2. 句号/问号/感叹号（中英文）后的换行
+    3. 最后一个换行
+    4. 强制在 max_chars 处切割
+
+    Args:
+        text: 待切割文本
+        max_chars: 最大字符数上限
+
+    Returns:
+        (head, tail) 元组，head 是切割前段，tail 是切割后段，满足 head + tail == text
+    """
+    if len(text) <= max_chars:
+        return text, ''
+
+    window = text[:max_chars]
+
+    # 1. 优先找最后一个空行（\n\n）作为段落边界
+    pos = window.rfind('\n\n')
+    if pos > 0:
+        return text[:pos + 2], text[pos + 2:]
+
+    # 2. 其次找最后一个句子结束符后的换行
+    sentence_end_re = re.compile(r'[。！？.!?]\n')
+    best_pos = -1
+    for m in sentence_end_re.finditer(window):
+        best_pos = m.end()
+    if best_pos > 0:
+        return text[:best_pos], text[best_pos:]
+
+    # 3. 退而求其次：找最后一个换行
+    pos = window.rfind('\n')
+    if pos > 0:
+        return text[:pos + 1], text[pos + 1:]
+
+    # 4. 实在没有合法切割点，强制在 max_chars 处切割
+    return text[:max_chars], text[max_chars:]
+
+
+def _is_fence_atom(text: str) -> bool:
+    """判断原子块是否是代码块（以 ``` 开头）。"""
+    return text.lstrip().startswith('```')
+
+
+def _is_table_atom(text: str) -> bool:
+    """判断原子块是否是表格（第一行以 | 开头）。"""
+    first_line = text.split('\n')[0].strip()
+    return first_line.startswith('|') and first_line.endswith('|')
+
+
+def _split_into_atoms(text: str) -> list[str]:
+    """
+    将文本拆分为"原子块"列表，每个原子块是不可分割的逻辑单元：
+
+    - 代码块（fence）：从 ``` 开到对应 ``` 关闭的整段（含首尾 fence 行）
+    - 表格：连续的 |...| 行组成的整段
+    - 普通段落：以空行分隔的普通文本段
+
+    空行作为分隔符，不加入任何原子块。
+
+    Args:
+        text: 待拆分的 Markdown 文本
+
+    Returns:
+        原子块字符串列表（均非空）
+    """
+    lines = text.split('\n')
+    atoms: list[str] = []
+
+    current_lines: list[str] = []
+    in_fence = False
+
+    def _is_table_line(line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith('|') and stripped.endswith('|')
+
+    def _flush_current() -> None:
+        if current_lines:
+            atom = '\n'.join(current_lines)
+            if atom.strip():
+                atoms.append(atom)
+            current_lines.clear()
+
+    for line in lines:
+        if in_fence:
+            current_lines.append(line)
+            if line.startswith('```') and len(current_lines) > 1:
+                in_fence = False
+                _flush_current()
+        elif line.startswith('```'):
+            _flush_current()
+            in_fence = True
+            current_lines.append(line)
+        elif _is_table_line(line):
+            if current_lines and not _is_table_line(current_lines[-1]):
+                _flush_current()
+            current_lines.append(line)
+        elif line.strip() == '':
+            _flush_current()
+        else:
+            if current_lines and _is_table_line(current_lines[-1]):
+                _flush_current()
+            current_lines.append(line)
+
+    _flush_current()
+
+    return atoms
+
+
+def chunk_markdown_text(text: str, max_chars: int = 3000) -> list[str]:
+    """
+    将 Markdown 文本按 max_chars 切割为多个片段。
+
+    保证：
+    - 每个片段 <= max_chars 字符（除非单段本身超过限制，如超大代码块/表格）
+    - 代码块（```...```）不在中间被切断
+    - 表格行不在中间被切断（表格作为原子块整体输出）
+    - 在段落边界切割（空行、句号后等）
+
+    Args:
+        text: 待切割的 Markdown 文本
+        max_chars: 每片段最大字符数，默认 3000
+
+    Returns:
+        切割后的文本片段列表（非空）
+    """
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [text]
+
+    # Phase 1: 提取原子块
+    atoms = _split_into_atoms(text)
+
+    # Phase 2: 贪心合并
+    chunks: list[str] = []
+    indivisible_set: set[int] = set()
+    current_parts: list[str] = []
+    current_len = 0
+
+    def _flush_parts() -> None:
+        if current_parts:
+            chunks.append('\n\n'.join(current_parts))
+
+    for atom in atoms:
+        atom_len = len(atom)
+        sep_len = 2 * len(current_parts)
+        projected_len = current_len + sep_len + atom_len
+
+        if projected_len > max_chars and current_parts:
+            _flush_parts()
+            current_parts = []
+            current_len = 0
+
+        if (not current_parts
+                and atom_len > max_chars
+                and (_is_fence_atom(atom) or _is_table_atom(atom))):
+            indivisible_set.add(len(chunks))
+            chunks.append(atom)
+            continue
+
+        current_parts.append(atom)
+        current_len += atom_len
+
+    _flush_parts()
+
+    # Phase 3: 后处理 — 对仍超长的 chunk 做段落边界切割
+    result: list[str] = []
+    for idx, chunk in enumerate(chunks):
+        if len(chunk) <= max_chars:
+            result.append(chunk)
+            continue
+
+        if idx in indivisible_set:
+            result.append(chunk)
+            continue
+
+        if has_unclosed_fence(chunk):
+            result.append(chunk)
+            continue
+
+        remaining = chunk
+        while len(remaining) > max_chars:
+            head, remaining = split_at_paragraph_boundary(remaining, max_chars)
+            if not head:
+                head, remaining = remaining[:max_chars], remaining[max_chars:]
+            if head:
+                result.append(head)
+        if remaining:
+            result.append(remaining)
+
+    return [c for c in result if c]
+
+
+# ============================================================
+# 签票 API（原 yuanbao_api.py）
+# ============================================================
+
+SIGN_TOKEN_PATH = "/api/v5/robotLogic/sign-token"
+
+#: 可重试的业务错误码
+RETRYABLE_SIGN_CODE = 10099
+SIGN_MAX_RETRIES = 3
+SIGN_RETRY_DELAY_S = 1.0
+
+#: 提前刷新裕量（秒），过期前 60 秒即视为即将过期
+CACHE_REFRESH_MARGIN_S = 60
+
+#: HTTP 超时（秒）
+HTTP_TIMEOUT_S = 10.0
+
+# 模块级缓存
+# key: app_key
+# value: {"token": str, "bot_id": str, "expire_ts": float (unix timestamp)}
+_token_cache: dict[str, dict[str, Any]] = {}
+
+# Per-app_key refresh locks — prevents concurrent duplicate sign-token requests.
+_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_refresh_lock(app_key: str) -> asyncio.Lock:
+    """Return (creating if needed) the per-app_key refresh lock."""
+    if app_key not in _refresh_locks:
+        _refresh_locks[app_key] = asyncio.Lock()
+    return _refresh_locks[app_key]
+
+
+def _compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str) -> str:
+    """
+    计算签名（与 TypeScript 原版对齐）。
+    plain     = nonce + timestamp + app_key + app_secret
+    signature = HMAC-SHA256(key=app_secret, msg=plain).hexdigest()
+    """
+    plain = nonce + timestamp + app_key + app_secret
+    return hmac.new(app_secret.encode(), plain.encode(), hashlib.sha256).hexdigest()
+
+
+def _build_timestamp() -> str:
+    """
+    构造北京时间 ISO-8601 时间戳（与 TypeScript 原版对齐）。
+    格式：2006-01-02T15:04:05+08:00（无毫秒）
+    """
+    bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
+    return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+
+def _is_cache_valid(entry: dict[str, Any]) -> bool:
+    """判断缓存是否有效（未过期且留有裕量）。"""
+    return entry["expire_ts"] - time.time() > CACHE_REFRESH_MARGIN_S
+
+
+async def _do_fetch_sign_token(
+    app_key: str,
+    app_secret: str,
+    sign_token_url: str,
+) -> dict[str, Any]:
+    """
+    发起签票 HTTP 请求，支持自动重试（最多 SIGN_MAX_RETRIES 次）。
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+        for attempt in range(SIGN_MAX_RETRIES + 1):
+            nonce = secrets.token_hex(16)
+            timestamp = _build_timestamp()
+            signature = _compute_signature(nonce, timestamp, app_key, app_secret)
+
+            payload = {
+                "app_key": app_key,
+                "nonce": nonce,
+                "signature": signature,
+                "timestamp": timestamp,
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                "X-AppVersion": "hermes-agent/0.8.0",
+                "X-OperationSystem": "linux",
+                "X-Instance-Id": "16",
+                "X-Bot-Version": "hermes-agent",
+            }
+
+            logger.info(
+                "签票请求: url=%s%s",
+                sign_token_url,
+                f" (重试 {attempt}/{SIGN_MAX_RETRIES})" if attempt > 0 else "",
+            )
+
+            response = await client.post(sign_token_url, json=payload, headers=headers)
+
+            if response.status_code != 200:
+                body = response.text
+                raise RuntimeError(f"签票接口返回 {response.status_code}: {body[:200]}")
+
+            try:
+                result_data: dict[str, Any] = response.json()
+            except Exception as exc:
+                raise ValueError(f"签票接口响应解析失败: {exc}") from exc
+
+            code = result_data.get("code")
+            if code == 0:
+                data = result_data.get("data")
+                if not isinstance(data, dict):
+                    raise ValueError(f"签票响应缺少 data 字段: {result_data}")
+                logger.info("签票成功: bot_id=%s", data.get("bot_id"))
+                return data
+
+            if code == RETRYABLE_SIGN_CODE and attempt < SIGN_MAX_RETRIES:
+                logger.warning(
+                    "签票可重试: code=%s，%ss 后重试 (attempt=%d/%d)",
+                    code,
+                    SIGN_RETRY_DELAY_S,
+                    attempt + 1,
+                    SIGN_MAX_RETRIES,
+                )
+                await asyncio.sleep(SIGN_RETRY_DELAY_S)
+                continue
+
+            msg = result_data.get("msg", "")
+            raise RuntimeError(f"签票错误: code={code}, msg={msg}")
+
+    raise RuntimeError("签票失败: 超过最大重试次数")
+
+
+async def get_sign_token(
+    app_key: str,
+    app_secret: str,
+    sign_token_url: str,
+) -> dict[str, Any]:
+    """
+    获取 WS 鉴权 token（带缓存）。
+
+    缓存命中时直接返回，不重复请求；距过期前 60 秒视为即将过期，触发刷新。
+    """
+    cached = _token_cache.get(app_key)
+    if cached and _is_cache_valid(cached):
+        remain = int(cached["expire_ts"] - time.time())
+        logger.info("使用缓存 token (剩余 %ds)", remain)
+        return dict(cached)
+
+    async with _get_refresh_lock(app_key):
+        cached = _token_cache.get(app_key)
+        if cached and _is_cache_valid(cached):
+            return dict(cached)
+
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+
+        duration: int = data.get("duration", 0)
+        expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
+
+        _token_cache[app_key] = {
+            "token": data.get("token", ""),
+            "bot_id": data.get("bot_id", ""),
+            "duration": duration,
+            "product": data.get("product", ""),
+            "source": data.get("source", ""),
+            "expire_ts": expire_ts,
+        }
+
+    return dict(_token_cache[app_key])
+
+
+async def force_refresh_sign_token(
+    app_key: str,
+    app_secret: str,
+    sign_token_url: str,
+) -> dict[str, Any]:
+    """
+    强制刷新 token（清除缓存后重新签票）。
+    """
+    logger.warning("[force-refresh] 清除缓存并重新签票: app_key=****%s", app_key[-4:])
+    async with _get_refresh_lock(app_key):
+        _token_cache.pop(app_key, None)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+
+        duration: int = data.get("duration", 0)
+        expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
+
+        _token_cache[app_key] = {
+            "token": data.get("token", ""),
+            "bot_id": data.get("bot_id", ""),
+            "duration": duration,
+            "product": data.get("product", ""),
+            "source": data.get("source", ""),
+            "expire_ts": expire_ts,
+        }
+
+    return dict(_token_cache[app_key])

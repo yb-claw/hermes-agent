@@ -204,7 +204,7 @@ class TestProtoRoundTrip:
 
 class TestMarkdownChunking:
     def test_chunks_are_sent_separately(self):
-        from gateway.platforms.yuanbao_markdown import chunk_markdown_text
+        from gateway.platforms.yuanbao import chunk_markdown_text
         long_text = "paragraph\n\n" * 100
         chunks = chunk_markdown_text(long_text, 200)
         assert len(chunks) > 1
@@ -214,7 +214,7 @@ class TestMarkdownChunking:
             assert len(c) > 0
 
     def test_chunk_short_text_no_split(self):
-        from gateway.platforms.yuanbao_markdown import chunk_markdown_text
+        from gateway.platforms.yuanbao import chunk_markdown_text
         text = "hello world"
         chunks = chunk_markdown_text(text, 3000)
         assert chunks == [text]
@@ -226,7 +226,7 @@ class TestMarkdownChunking:
 
 class TestSignToken:
     def test_import_ok(self):
-        from gateway.platforms.yuanbao_api import get_sign_token, force_refresh_sign_token
+        from gateway.platforms.yuanbao import get_sign_token, force_refresh_sign_token
         assert callable(get_sign_token)
         assert callable(force_refresh_sign_token)
 

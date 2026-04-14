@@ -16,7 +16,7 @@ import unittest
 # Ensure project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from gateway.platforms.yuanbao_markdown import (
+from gateway.platforms.yuanbao import (
     chunk_markdown_text,
     has_unclosed_fence,
     ends_with_table_row,
