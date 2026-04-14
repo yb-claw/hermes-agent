@@ -1738,6 +1738,68 @@ class YuanbaoAdapter(BasePlatformAdapter):
         }
 
     # ------------------------------------------------------------------
+    # Trace Context + Markdown Hint
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _generate_trace_id() -> str:
+        """生成分布式追踪 ID（32 位 hex）。"""
+        return uuid.uuid4().hex
+
+    @staticmethod
+    def _build_traceparent(trace_id: str, span_id: Optional[str] = None) -> str:
+        """
+        构造 W3C traceparent 头（简化版）。
+        格式：00-{trace_id}-{span_id}-01
+        """
+        if not span_id:
+            span_id = uuid.uuid4().hex[:16]
+        return f"00-{trace_id}-{span_id}-01"
+
+    @staticmethod
+    def _markdown_hint_system_prompt() -> str:
+        """
+        Markdown 渲染提示（追加到 system prompt）。
+
+        告诉 AI 元宝平台支持 Markdown 渲染，可以使用：
+        - 代码块（```lang）
+        - 表格（| col | col |）
+        - 加粗/斜体
+        """
+        return (
+            "当前平台支持 Markdown 渲染。你可以使用以下格式：\n"
+            "- 代码块：```语言名\\n代码\\n```\n"
+            "- 表格：| 列1 | 列2 |\\n|---|---|\\n| 值1 | 值2 |\n"
+            "- 加粗：**文本** / 斜体：*文本*\n"
+            "请在适当时候使用 Markdown 格式化输出，提升可读性。"
+        )
+
+    @staticmethod
+    def _msg_body_desensitize(msg_body: list) -> list:
+        """
+        消息体脱敏（日志用）。
+
+        对 TIMTextElem 截断长文本，对 TIMImageElem 替换 URL。
+        """
+        result = []
+        for elem in msg_body:
+            msg_type = elem.get("msg_type", "")
+            content = elem.get("msg_content", {})
+            if msg_type == "TIMTextElem":
+                text = content.get("text", "")
+                if len(text) > 100:
+                    text = text[:100] + f"...({len(text)} chars)"
+                result.append({"msg_type": msg_type, "msg_content": {"text": text}})
+            elif msg_type == "TIMImageElem":
+                result.append({"msg_type": msg_type, "msg_content": {"url": "[IMAGE_URL]"}})
+            elif msg_type == "TIMFileElem":
+                fname = content.get("file_name", content.get("fileName", ""))
+                result.append({"msg_type": msg_type, "msg_content": {"file_name": fname}})
+            else:
+                result.append({"msg_type": msg_type, "msg_content": "[REDACTED]"})
+        return result
+
+    # ------------------------------------------------------------------
     # Media validation
     # ------------------------------------------------------------------
 
