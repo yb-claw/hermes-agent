@@ -1946,6 +1946,155 @@ def chunk_markdown_text(text: str, max_chars: int = 3000) -> list[str]:
     return [c for c in result if c]
 
 
+def _infer_block_separator(prev_chunk: str, next_chunk: str) -> str:
+    """
+    推断两个切割片段之间应使用的分隔符。
+
+    规则（对齐 TS markdown-stream.ts）：
+    - 前段以代码块围栏结尾 或 后段以围栏开头 → 单换行 '\\n'
+    - 前段以表格行结尾 且 后段以表格行开头 → 单换行 '\\n'（续表）
+    - 否则 → 双换行 '\\n\\n'（段落分隔）
+
+    Args:
+        prev_chunk: 前一个片段
+        next_chunk: 后一个片段
+
+    Returns:
+        '\\n' 或 '\\n\\n'
+    """
+    prev_trimmed = prev_chunk.rstrip()
+    next_trimmed = next_chunk.lstrip()
+
+    # 前段以围栏结尾 或 后段以围栏开头
+    if prev_trimmed.endswith('```') or next_trimmed.startswith('```'):
+        return '\n'
+
+    # 表格续行
+    if ends_with_table_row(prev_chunk):
+        first_line = next_trimmed.split('\n')[0].strip() if next_trimmed else ''
+        if first_line.startswith('|') and first_line.endswith('|'):
+            return '\n'
+
+    return '\n\n'
+
+
+def _merge_block_streaming_fences(chunks: list[str]) -> list[str]:
+    """
+    流式片段围栏感知合并。
+
+    当流式输出产生的多个片段在围栏中间被截断时，
+    尝试合并相邻片段使围栏完整。
+
+    规则：
+    - 若第 i 个片段有未闭合围栏，且第 i+1 个片段以 ``` 开头，
+      则将 i+1 合并到 i（直到围栏闭合或没有更多片段）。
+    - 合并时使用 _infer_block_separator 推断分隔符。
+
+    Args:
+        chunks: 原始片段列表
+
+    Returns:
+        合并后的片段列表（长度 <= 原始长度）
+    """
+    if not chunks:
+        return []
+
+    result: list[str] = []
+    i = 0
+    while i < len(chunks):
+        current = chunks[i]
+        # 如果当前片段有未闭合围栏，尝试合并后续片段
+        while has_unclosed_fence(current) and i + 1 < len(chunks):
+            sep = _infer_block_separator(current, chunks[i + 1])
+            current = current + sep + chunks[i + 1]
+            i += 1
+        result.append(current)
+        i += 1
+
+    return result
+
+
+def _strip_outer_markdown_fence(text: str) -> str:
+    """
+    剥除外层 Markdown 围栏。
+
+    当 AI 回复整段被 ```markdown\\n...\\n``` 包裹时，去掉外层围栏，
+    保留内容。仅当首行是 ```markdown（大小写不敏感）且末行是 ``` 时才剥除。
+
+    Args:
+        text: 待处理文本
+
+    Returns:
+        剥除外层围栏后的文本（如果不匹配则返回原文）
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    if len(lines) < 3:
+        return text
+
+    first_line = lines[0].strip()
+    last_line = lines[-1].strip()
+
+    # 首行必须是 ```markdown（可选语言标记 md/markdown）
+    if not re.match(r'^```(?:markdown|md)?\s*$', first_line, re.IGNORECASE):
+        return text
+
+    # 末行必须是纯 ```
+    if last_line != '```':
+        return text
+
+    # 剥除首末行
+    inner = '\n'.join(lines[1:-1])
+    return inner
+
+
+def _sanitize_markdown_table(text: str) -> str:
+    """
+    表格输出净化。
+
+    处理 AI 生成的 Markdown 表格中常见的格式问题：
+    1. 去除表格行前后的多余空格
+    2. 确保分隔行（|---|---|）格式正确
+    3. 去除空的表格行
+
+    Args:
+        text: 包含表格的 Markdown 文本
+
+    Returns:
+        净化后的文本
+    """
+    if '|' not in text:
+        return text
+
+    lines = text.split('\n')
+    result_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 表格行处理
+        if stripped.startswith('|') and stripped.endswith('|'):
+            # 分隔行标准化：| --- | --- | → |---|---|
+            if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)+\|$', stripped):
+                cells = stripped.split('|')
+                normalized = '|'.join(
+                    cell.strip() if cell.strip() else cell
+                    for cell in cells
+                )
+                result_lines.append(normalized)
+            elif stripped == '||' or stripped.replace('|', '').strip() == '':
+                # 空表格行 → 跳过
+                continue
+            else:
+                result_lines.append(stripped)
+        else:
+            result_lines.append(line)
+
+    return '\n'.join(result_lines)
+
+
 # ============================================================
 # 签票 API（原 yuanbao_api.py）
 # ============================================================
