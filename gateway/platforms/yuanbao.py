@@ -871,7 +871,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # HEARTBEAT_ACK: Response to our ping
         if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
-            logger.debug("[%s] HEARTBEAT_ACK received", self.name)
+            logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", self.name, msg_id)
+            # resolve pong_future 以停止心跳超时计数
+            if msg_id and msg_id in self._pending_acks:
+                fut = self._pending_acks.pop(msg_id)
+                if not fut.done():
+                    fut.set_result({"head": head})
             return
 
         # Response to an outbound RPC call (e.g. send-message response)
@@ -2088,6 +2093,100 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         except Exception as exc:
             logger.error("[%s] send_sticker() failed: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        filename: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送本地文件（文档）消息。
+
+        与 send_file() 类似，但接收本地路径而非 URL。
+        流程：读取本地文件 → COS 上传 → 构造 TIMFileElem → WS 发送
+        """
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        try:
+            # 0. Drain text buffer before sending media
+            await self._drain_text_before_media(chat_id)
+
+            # 1. 读取本地文件
+            if not os.path.isfile(file_path):
+                return SendResult(success=False, error=f"File not found: {file_path}")
+
+            logger.info("[%s] send_document: reading local file %s", self.name, file_path)
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+
+            if not file_bytes:
+                return SendResult(success=False, error=f"File is empty: {file_path}")
+
+            # 推断文件名和 MIME 类型
+            if not filename:
+                filename = os.path.basename(file_path) or "document"
+            content_type = guess_mime_type(filename) or "application/octet-stream"
+            file_uuid = md5_hex(file_bytes)
+
+            # 2. 获取 COS 上传凭证
+            token_data = await self._get_cached_token()
+            token: str = token_data.get("token", "")
+            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
+
+            credentials = await get_cos_credentials(
+                app_key=self._app_key,
+                sign_token_url=self._sign_token_url,
+                token=token,
+                filename=filename,
+                bot_id=bot_id,
+            )
+
+            # 3. 上传到 COS
+            upload_result = await upload_to_cos(
+                file_bytes=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                credentials=credentials,
+                bucket=credentials["bucketName"],
+                region=credentials["region"],
+            )
+
+            # 4. 构造 TIMFileElem 消息体
+            msg_body = build_file_msg_body(
+                url=upload_result["url"],
+                filename=filename,
+                uuid=file_uuid,
+                size=upload_result["size"],
+            )
+
+            # 5. 若有 caption，追加文字消息体
+            if caption:
+                msg_body.append(
+                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
+                )
+
+            # 6. 发送
+            async with self._send_lock:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    result = await self._send_c2c_msg_body(to_account, msg_body)
+
+            if result.get("success"):
+                return SendResult(success=True, message_id=result.get("msg_key"))
+            return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+        except Exception as exc:
+            logger.error("[%s] send_document() failed: %s", self.name, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def _send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:

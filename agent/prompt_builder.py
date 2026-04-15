@@ -384,6 +384,18 @@ PLATFORM_HINTS = {
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
     ),
+    "yuanbao": (
+        "You are on Yuanbao (腾讯元宝), a Chinese AI assistant platform. "
+        "Markdown formatting is supported (code blocks, tables, bold/italic). "
+        "You CAN send media files natively — to deliver a file to the user, include "
+        "MEDIA:/absolute/path/to/file in your response. The file will be sent as a native "
+        "Yuanbao attachment: images (.jpg, .png, .webp, .gif) are sent as photos, "
+        "and other files (.pdf, .docx, .txt, .zip, etc.) arrive as downloadable documents "
+        "(max 50 MB). You can also include image URLs in markdown format ![alt](url) and "
+        "they will be downloaded and sent as native photos. "
+        "Do NOT tell the user you lack file-sending capability — use MEDIA: syntax "
+        "whenever a file delivery is appropriate."
+    ),
 }
 
 # ---------------------------------------------------------------------------
