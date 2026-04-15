@@ -413,9 +413,9 @@ class TestEncodeOutbound:
         assert len(result) > 0
         # 解码验证 ConnMsg 结构
         dec = decode_conn_msg(result)
-        assert dec["head"]["cmd"] == "/im/send_c2c_msg"
+        assert dec["head"]["cmd"] == "send_c2c_message"
         assert dec["head"]["msg_id"] == "msg-001"
-        assert dec["head"]["module"] == "trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy"
+        assert dec["head"]["module"] == "yuanbao_openclaw_proxy"
         assert len(dec["data"]) > 0
 
     def test_encode_send_group_message(self):
@@ -428,7 +428,7 @@ class TestEncodeOutbound:
         )
         assert isinstance(result, bytes)
         dec = decode_conn_msg(result)
-        assert dec["head"]["cmd"] == "/im/send_group_msg"
+        assert dec["head"]["cmd"] == "send_group_message"
         assert dec["head"]["msg_id"] == "msg-002"
         assert len(dec["data"]) > 0
 
@@ -534,7 +534,7 @@ class TestConstants:
 
     def test_pkg_prefix(self):
         for k, v in BIZ_SERVICES.items():
-            assert v.startswith("trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy"), \
+            assert v.startswith("yuanbao_openclaw_proxy"), \
                 f"{k}: unexpected prefix in {v}"
 
 
@@ -590,7 +590,7 @@ class TestEndToEnd:
         )
         # 接收方解码 ConnMsg
         dec = decode_conn_msg(wire_bytes)
-        assert dec["head"]["cmd"] == "/im/send_c2c_msg"
+        assert dec["head"]["cmd"] == "send_c2c_message"
         assert dec["head"]["msg_id"] == "e2e-001"
 
         # 从 biz payload 中读取 to_account 和 msg_body
@@ -632,7 +632,7 @@ class TestEndToEnd:
             cmd="/im/new_message",
             seq_no=77,
             msg_id="push-abc",
-            module="trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy",
+            module="yuanbao_openclaw_proxy",
             data=biz_payload,
             need_ack=True,
         )
