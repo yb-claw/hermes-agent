@@ -276,6 +276,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Reconnection state
         self._reconnect_attempts: int = 0
         self._consecutive_hb_timeouts: int = 0  # heartbeat timeout counter
+        self._pending_pong: Optional[asyncio.Future] = None  # current in-flight ping future
 
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
@@ -289,6 +290,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
         self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
+
+        # Member cache: group_code -> [{"user_id":..., "nickname":..., ...}, ...]
+        # Populated by get_group_member_list(), used by @mention resolution.
+        self._member_cache: Dict[str, list] = {}
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # Only the first outbound message carries refMsgId for a given inbound msg.
@@ -382,6 +387,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 "[%s] Connected. connectId=%s botId=%s",
                 self.name, self._connect_id, self._bot_id,
             )
+
+            try:
+                from tools.yuanbao_tools import set_adapter
+                set_adapter(self)
+            except Exception as exc:
+                logger.warning("[%s] Failed to inject yuanbao_tools adapter: %s", self.name, exc)
+
             return True
 
         except asyncio.TimeoutError:
@@ -580,6 +592,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 result = await self._send_text_chunk(chat_id, chunk, r_to)
                 if not result.success:
                     return result
+
+        # 消息投递成功后发送 FINISH 心跳，保证时序：RUNNING → 消息到达 → FINISH
+        try:
+            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+        except Exception:
+            pass
         return SendResult(success=True)
 
     async def _send_text_chunk(
@@ -648,14 +666,64 @@ class YuanbaoAdapter(BasePlatformAdapter):
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
+    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
+
+    def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
+        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
+        members = self._member_cache.get(group_code, [])
+        if not members:
+            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+
+        nickname_to_uid = {}
+        for m in members:
+            nick = m.get("nickname") or m.get("nick_name") or ""
+            uid = m.get("user_id") or ""
+            if nick and uid:
+                nickname_to_uid[nick.lower()] = (nick, uid)
+
+        msg_body: list = []
+        last_idx = 0
+        for match in self._AT_USER_RE.finditer(text):
+            start = match.start()
+            if start > last_idx:
+                seg = text[last_idx:start].strip()
+                if seg:
+                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
+
+            nickname = match.group(1)
+            entry = nickname_to_uid.get(nickname.lower())
+            if entry:
+                real_nick, uid = entry
+                msg_body.append({
+                    "msg_type": "TIMCustomElem",
+                    "msg_content": {
+                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
+                    },
+                })
+            else:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
+
+            last_idx = match.end()
+
+        if last_idx < len(text):
+            tail = text[last_idx:].strip()
+            if tail:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
+
+        if not msg_body:
+            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
+
+        return msg_body
+
     async def _send_group_message(
         self,
         group_code: str,
         text: str,
         reply_to: Optional[str] = None,
     ) -> dict:
-        """发送群聊文本消息。"""
-        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+        """发送群聊文本消息，自动将 @nickname 转换为 TIMCustomElem。"""
+        msg_body = self._build_msg_body_with_mentions(text, group_code)
         req_id = f"grp_{next_seq_no()}"
         encoded = encode_send_group_message(
             group_code=group_code,
@@ -697,9 +765,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
             return result
         except asyncio.TimeoutError:
-            logger.warning("[%s] _send_biz_request timeout: req_id=%s", self.name, req_id)
             raise
-        except Exception:
+        except Exception as exc:
             raise
         finally:
             self._pending_acks.pop(req_id, None)
@@ -850,9 +917,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 try:
                     msg_id = str(uuid.uuid4())
                     ping_bytes = encode_ping(msg_id)
-                    # Register a future for this ping to track pong response
+                    # Use a dedicated future for pong — server may not echo msg_id back
                     loop = asyncio.get_running_loop()
                     pong_future: asyncio.Future = loop.create_future()
+                    self._pending_pong = pong_future
+                    # Also register by msg_id as a fallback (in case server does echo it)
                     self._pending_acks[msg_id] = pong_future
                     await self._ws.send(ping_bytes)
                     logger.debug("[%s] PING sent (msg_id=%s)", self.name, msg_id)
@@ -873,6 +942,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                             return
                     finally:
                         self._pending_acks.pop(msg_id, None)
+                        self._pending_pong = None
                 except Exception as exc:
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
         except asyncio.CancelledError:
@@ -933,24 +1003,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
         need_ack = head.get("need_ack", False)
         data: bytes = msg.get("data", b"")
 
-        # HEARTBEAT_ACK: Response to our ping
+        # HEARTBEAT_ACK: Response to our ping — resolve the pending pong_future.
+        # The server may not echo back the msg_id, so we use _pending_pong as the
+        # primary signal and fall back to msg_id lookup for forward-compatibility.
         if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
             logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", self.name, msg_id)
-            # resolve pong_future 以停止心跳超时计数
-            if msg_id and msg_id in self._pending_acks:
+            if self._pending_pong is not None and not self._pending_pong.done():
+                self._pending_pong.set_result(True)
+            elif msg_id and msg_id in self._pending_acks:
                 fut = self._pending_acks.pop(msg_id)
                 if not fut.done():
-                    fut.set_result({"head": head})
+                    fut.set_result(True)
             return
 
-        # Response to an outbound RPC call (e.g. send-message response)
+        # Response to an outbound RPC call (e.g. send-message, query_group_info)
         if cmd_type == CMD_TYPE["Response"]:
             if msg_id and msg_id in self._pending_acks:
                 fut = self._pending_acks.pop(msg_id)
                 if not fut.done():
-                    # RPC responses use a different proto schema than inbound pushes;
-                    # return the head dict so callers can read msg_id/status fields.
-                    fut.set_result({"head": head})
+                    result = {"head": head}
+                    if data:
+                        result["data"] = data
+                    fut.set_result(result)
             else:
                 logger.debug(
                     "[%s] Unmatched Response: cmd=%s msg_id=%s",
@@ -982,6 +1056,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             # Genuine inbound message — dispatch to AI
             if data:
+                logger.info(
+                    "[%s] WS 收到入站消息推送, 开始解码分发: cmd=%s, data长度=%d",
+                    self.name, cmd, len(data),
+                )
                 self._push_to_inbound(head, data)
             return
 
@@ -1048,12 +1126,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
         """
         发送"正在输入"状态心跳（RUNNING），best effort，不抛错。
-        此方法现在委托给 Reply Heartbeat 状态机（如已启动则为 no-op）。
+        由 base 类的 _keep_typing 循环周期调用，委托给 Reply Heartbeat 状态机。
         """
         try:
             await self._start_reply_heartbeat(chat_id)
-        except Exception as exc:
-            logger.debug("[%s] send_typing failed: %s", self.name, exc)
+        except Exception:
+            pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """
+        停止 RUNNING 心跳循环，但不立即发送 FINISH。
+
+        FINISH 由 send() 在消息实际投递后发送，以确保时序正确：
+        RUNNING... → 消息到达 → FINISH。
+
+        gateway/run.py 的 _message_handler 在拿到 agent 结果后、返回 response
+        文本之前就会调用 stop_typing()，此时消息尚未通过 WS 发出，所以这里
+        只停止 RUNNING 循环，FINISH 延迟到 send() 完成后发送。
+        """
+        try:
+            await self._stop_reply_heartbeat(chat_id, send_finish=False)
+        except Exception:
+            pass
 
     async def _start_reply_heartbeat(self, chat_id: str) -> None:
         """
@@ -1068,8 +1162,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # 如果已有任务在跑，只刷新时间戳即可
         existing = self._reply_heartbeat_tasks.get(chat_id)
         if existing and not existing.done():
-            # 通过 task 的 name 来传递 "refresh" 信号实现不了，
-            # 改用一个 dict 来存最后活跃时间
             if not hasattr(self, '_reply_hb_last_active'):
                 self._reply_hb_last_active: Dict[str, float] = {}
             self._reply_hb_last_active[chat_id] = time.time()
@@ -1101,10 +1193,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 # 检查超时
                 last_active = getattr(self, '_reply_hb_last_active', {}).get(chat_id, 0)
                 if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
-                    logger.debug(
-                        "[%s] Reply heartbeat timeout for %s, sending FINISH",
-                        self.name, chat_id,
-                    )
                     break
 
                 if self._ws is None:
@@ -1113,23 +1201,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
 
         except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.debug("[%s] Reply heartbeat worker error: %s", self.name, exc)
+            cancelled = True
+        except Exception:
+            cancelled = False
+        else:
+            cancelled = False
         finally:
-            # 发送 FINISH
-            try:
-                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-            except Exception:
-                pass
+            if not cancelled:
+                try:
+                    await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+                except Exception:
+                    pass
             self._reply_heartbeat_tasks.pop(chat_id, None)
             if hasattr(self, '_reply_hb_last_active'):
                 self._reply_hb_last_active.pop(chat_id, None)
 
-    async def _stop_reply_heartbeat(self, chat_id: str) -> None:
+    async def _stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
         """
-        停止 Reply Heartbeat（发送 FINISH 并取消定时器）。
-        用于 agent 回复完成后调用。
+        停止 Reply Heartbeat 并可选发送 FINISH。
+
+        Args:
+            send_finish: True 时取消 worker 后立即发 FINISH；
+                         False 时仅取消 worker，FINISH 由调用方负责。
         """
         task = self._reply_heartbeat_tasks.pop(chat_id, None)
         if task and not task.done():
@@ -1138,11 +1231,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 await task
             except asyncio.CancelledError:
                 pass
-        # task 的 finally 块会发 FINISH；如果已被取消，补发一次
-        try:
-            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-        except Exception:
-            pass
+        if send_finish:
+            try:
+                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+            except Exception:
+                pass
 
     async def _send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
         """发送单次心跳（RUNNING 或 FINISH），best effort。"""
@@ -1196,7 +1289,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return None
         encoded = encode_query_group_info(group_code)
-        # 提取 req_id（与 encode_query_group_info 中生成的一致）
         from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
         decoded = _decode(encoded)
         req_id = decoded["head"]["msg_id"]
@@ -1260,8 +1352,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return None
             biz_data = response.get("data", b"") or response.get("body", b"")
             if biz_data and isinstance(biz_data, bytes):
-                return decode_get_group_member_list_rsp(biz_data)
-            return {"members": [], "next_offset": 0, "is_complete": True}
+                result = decode_get_group_member_list_rsp(biz_data)
+            else:
+                result = {"members": [], "next_offset": 0, "is_complete": True}
+            if result and result.get("members"):
+                self._member_cache[group_code] = result["members"]
+            return result
         except asyncio.TimeoutError:
             logger.warning("[%s] get_group_member_list timeout: group=%s", self.name, group_code)
             return None
@@ -1458,18 +1554,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
             raw_message=push,
         )
 
-        # Start reply heartbeat (RUNNING) as soon as we dispatch to AI
-        asyncio.create_task(self._start_reply_heartbeat(chat_id))
-        asyncio.create_task(self._handle_message_with_heartbeat(event, chat_id))
-
-    async def _handle_message_with_heartbeat(
-        self, event: MessageEvent, chat_id: str
-    ) -> None:
-        """Dispatch message to AI handler and stop heartbeat when done."""
-        try:
-            await self.handle_message(event)
-        finally:
-            await self._stop_reply_heartbeat(chat_id)
+        # Dispatch to base class handler (spawns background task internally).
+        # The base class _keep_typing loop will call our send_typing() to
+        # start/refresh the reply heartbeat, and stop_typing() will be called
+        # when processing finishes to send FINISH.
+        asyncio.create_task(self.handle_message(event))
 
     def _extract_text(self, msg_body: list) -> str:
         """
@@ -2347,6 +2436,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
                 # Restart background tasks
                 self._reconnect_attempts = 0
+                self._consecutive_hb_timeouts = 0
                 self._mark_connected()
 
                 if self._heartbeat_task and not self._heartbeat_task.done():

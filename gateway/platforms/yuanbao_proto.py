@@ -1160,15 +1160,20 @@ def decode_query_group_info_rsp(data: bytes) -> Optional[dict]:
     """
     解码 QueryGroupInfoRsp biz payload。
 
-    QueryGroupInfoRsp fields:
-      1: code         (int32)
-      2: message      (string)
-      3: group_code   (string)
-      4: group_name   (string)
-      5: owner_id     (string)
-      6: member_count (uint32)
-      7: max_member   (uint32)
-      8: create_time  (uint32)
+    Proto 结构（对齐 TS biz-codec / member.ts queryGroupInfo）：
+
+      message QueryGroupInfoRsp {
+        int32  code       = 1;
+        string message    = 2;
+        GroupInfo group_info = 3;   // 嵌套 message
+      }
+
+      message GroupInfo {
+        string group_name            = 1;
+        string group_owner_user_id   = 2;
+        string group_owner_nickname  = 3;
+        uint32 group_size            = 4;
+      }
 
     Returns:
         解码后的 dict，或 None（解析失败）
@@ -1176,17 +1181,28 @@ def decode_query_group_info_rsp(data: bytes) -> Optional[dict]:
     try:
         fdict = _fields_to_dict(_parse_fields(data))
         code = _get_varint(fdict, 1, 0)
-        result = {
-            "code": code,
-            "message": _get_string(fdict, 2),
-            "group_code": _get_string(fdict, 3),
-            "group_name": _get_string(fdict, 4),
-            "owner_id": _get_string(fdict, 5),
-            "member_count": _get_varint(fdict, 6),
-            "max_member": _get_varint(fdict, 7),
-            "create_time": _get_varint(fdict, 8),
-        }
-        return {k: v for k, v in result.items() if v or k in ("code", "member_count")}
+        msg = _get_string(fdict, 2)
+
+        result: dict = {"code": code}
+        if msg:
+            result["message"] = msg
+
+        # field 3 = nested GroupInfo message
+        gi_entries = fdict.get(3, [])
+        gi_bytes = gi_entries[0][1] if gi_entries else b""
+        if gi_bytes and isinstance(gi_bytes, (bytes, bytearray)):
+            gi = _fields_to_dict(_parse_fields(gi_bytes))
+            result["group_name"] = _get_string(gi, 1) or ""
+            result["owner_id"] = _get_string(gi, 2) or ""
+            result["owner_nickname"] = _get_string(gi, 3) or ""
+            result["member_count"] = _get_varint(gi, 4, 0)
+        else:
+            result["group_name"] = ""
+            result["owner_id"] = ""
+            result["owner_nickname"] = ""
+            result["member_count"] = 0
+
+        return result
     except Exception:
         return None
 
