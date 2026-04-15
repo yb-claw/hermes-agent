@@ -29,7 +29,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
@@ -177,7 +177,7 @@ class _OutboundQueue:
         1. 拼接所有缓冲文本（使用 _infer_block_separator 推断分隔符）
         2. 调用 _strip_outer_markdown_fence 剥除外层围栏
         3. 调用 _sanitize_markdown_table 净化表格
-        4. 调用 chunk_markdown_text 分片
+        4. 调用 truncate_message 分片（保留代码块围栏完整性）
         5. 调用 _merge_block_streaming_fences 合并未闭合围栏
         6. 逐片发送
         """
@@ -197,10 +197,10 @@ class _OutboundQueue:
         merged = _strip_outer_markdown_fence(merged)
         merged = _sanitize_markdown_table(merged)
 
-        # 3. 分片
-        chunks = chunk_markdown_text(merged, self._adapter.MAX_TEXT_CHUNK)
+        # 3. 分片（使用 base class truncate_message 保留代码块围栏完整性）
+        chunks = self._adapter.truncate_message(merged, self._adapter.MAX_TEXT_CHUNK)
 
-        # 4. 合并未闭合围栏
+        # 4. 合并未闭合围栏（处理流式输出产生的断裂围栏）
         chunks = _merge_block_streaming_fences(chunks)
 
         # 5. 发送
@@ -238,7 +238,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
-    MAX_TEXT_CHUNK: int = 3000  # 元宝单条消息字符上限
+    MAX_TEXT_CHUNK: int = 5000  # 元宝单条消息字符上限
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
@@ -485,6 +485,70 @@ class YuanbaoAdapter(BasePlatformAdapter):
         stripped = text.strip()
         return stripped in _SKIPPABLE_PLACEHOLDERS
 
+    @staticmethod
+    def truncate_message(
+        content: str,
+        max_length: int = 5000,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> List[str]:
+        """
+        Split a long message into chunks with table-awareness.
+
+        Tables (contiguous ``| ... |`` rows) are kept as indivisible blocks.
+        Code blocks use the base-class close/reopen fence logic.
+        Page indicators like ``(1/3)`` are stripped from the output.
+
+        Falls back to ``BasePlatformAdapter.truncate_message`` for non-table
+        content and for overall text that fits in a single chunk.
+        """
+        _len = len_fn or len
+        if _len(content) <= max_length:
+            return [content]
+
+        _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
+
+        def _base_split_no_indicator(text: str) -> List[str]:
+            parts = BasePlatformAdapter.truncate_message(text, max_length, len_fn)
+            return [_INDICATOR_RE.sub('', p) for p in parts]
+
+        atoms = _split_into_atoms(content)
+
+        chunks: List[str] = []
+        current_parts: List[str] = []
+        current_len = 0
+
+        def _flush() -> None:
+            if current_parts:
+                merged = '\n\n'.join(current_parts)
+                if _len(merged) <= max_length:
+                    chunks.append(merged)
+                else:
+                    chunks.extend(_base_split_no_indicator(merged))
+
+        for atom in atoms:
+            atom_len = _len(atom)
+            sep_len = 2 if current_parts else 0
+            projected = current_len + sep_len + atom_len
+
+            if projected > max_length and current_parts:
+                _flush()
+                current_parts = []
+                current_len = 0
+
+            if not current_parts and atom_len > max_length:
+                if _is_table_atom(atom):
+                    chunks.append(atom)
+                    continue
+                chunks.extend(_base_split_no_indicator(atom))
+                continue
+
+            current_parts.append(atom)
+            current_len += atom_len
+
+        _flush()
+
+        return chunks if chunks else [content]
+
     async def send(
         self,
         chat_id: str,
@@ -502,7 +566,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         增强逻辑：
           1. 获取或创建该 chat_id 的锁，保证同 chat_id 消息串行发送
-          2. 调用 chunk_markdown_text() 将 content 分片（超过 MAX_TEXT_CHUNK 自动切割）
+          2. 调用 truncate_message() 分片（保留代码块围栏完整性）
           3. 逐片调用 _send_text_chunk() 发送（含重试），任一片失败立即停止
         """
         if self._ws is None:
@@ -510,9 +574,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         lock = self._get_chat_lock(chat_id)
         async with lock:
-            chunks = chunk_markdown_text(content, self.MAX_TEXT_CHUNK)
+            chunks = self.truncate_message(content, self.MAX_TEXT_CHUNK)
             for i, chunk in enumerate(chunks):
-                r_to = reply_to if i == 0 else None  # 只有第一片带 reply_to
+                r_to = reply_to if i == 0 else None
                 result = await self._send_text_chunk(chat_id, chunk, r_to)
                 if not result.success:
                     return result
@@ -2611,7 +2675,7 @@ def chunk_markdown_text(text: str, max_chars: int = 3000) -> list[str]:
     将 Markdown 文本按 max_chars 切割为多个片段。
 
     保证：
-    - 每个片段 <= max_chars 字符（除非单段本身超过限制，如超大代码块/表格）
+    - 每个片段 <= max_chars 字符（除非单个代码块/表格本身超过限制）
     - 代码块（```...```）不在中间被切断
     - 表格行不在中间被切断（表格作为原子块整体输出）
     - 在段落边界切割（空行、句号后等）
