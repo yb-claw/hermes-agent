@@ -68,7 +68,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567'"
             },
             "message": {
                 "type": "string",
@@ -249,9 +249,6 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return match.group(1), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
-    # Matrix room IDs (start with !) and user IDs (start with @) are explicit
-    if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
-        return target_ref, None, True
     return None, None, False
 
 
@@ -328,15 +325,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     """
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
+    from gateway.platforms.telegram import TelegramAdapter
     from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
-
-    # Telegram adapter import is optional (requires python-telegram-bot)
-    try:
-        from gateway.platforms.telegram import TelegramAdapter
-        _telegram_available = True
-    except ImportError:
-        _telegram_available = False
 
     # Feishu adapter import is optional (requires lark-oapi)
     try:
@@ -356,7 +347,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
-        Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
+        Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
@@ -376,7 +367,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # --- Telegram: special handling for media attachments ---
     if platform == Platform.TELEGRAM:
         last_result = None
-        disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _send_telegram(
@@ -385,7 +375,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
-                disable_link_previews=disable_link_previews,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -396,45 +385,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
-    # --- Discord: special handling for media attachments ---
-    if platform == Platform.DISCORD:
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            is_last = (i == len(chunks) - 1)
-            result = await _send_discord(
-                pconfig.token,
-                chat_id,
-                chunk,
-                media_files=media_files if is_last else [],
-                thread_id=thread_id,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+    # --- Yuanbao: route through running adapter (supports text + image + file) ---
+    if platform == Platform.YUANBAO:
+        return await _send_yuanbao(chat_id, message, media_files=media_files)
 
-    # --- Matrix: use the native adapter helper when media is present ---
-    if platform == Platform.MATRIX and media_files:
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            is_last = (i == len(chunks) - 1)
-            result = await _send_matrix_via_adapter(
-                pconfig,
-                chat_id,
-                chunk,
-                media_files=media_files if is_last else [],
-                thread_id=thread_id,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
-
-    # --- Non-Telegram/Discord platforms ---
+    # --- Non-Telegram platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, and weixin; "
+                f"send_message MEDIA delivery is currently only supported for telegram; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -442,12 +401,14 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, and weixin"
+            "native send_message media delivery is currently only supported for telegram"
         )
 
     last_result = None
     for chunk in chunks:
-        if platform == Platform.SLACK:
+        if platform == Platform.DISCORD:
+            result = await _send_discord(pconfig.token, chat_id, chunk, thread_id=thread_id)
+        elif platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
@@ -473,8 +434,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
-        elif platform == Platform.YUANBAO:
-            result = await _send_yuanbao(chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -489,7 +448,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     return last_result
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -525,8 +484,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         thread_kwargs = {}
         if thread_id is not None:
             thread_kwargs["message_thread_id"] = int(thread_id)
-        if disable_link_previews:
-            thread_kwargs["disable_web_page_preview"] = True
 
         last_msg = None
         warnings = []
@@ -616,16 +573,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-async def _send_discord(token, chat_id, message, thread_id=None, media_files=None):
+async def _send_discord(token, chat_id, message, thread_id=None):
     """Send a single message via Discord REST API (no websocket client needed).
 
     Chunking is handled by _send_to_platform() before this is called.
 
     When thread_id is provided, the message is sent directly to that thread
     via the /channels/{thread_id}/messages endpoint.
-
-    Media files are uploaded one-by-one via multipart/form-data after the
-    text message is sent (same pattern as Telegram).
     """
     try:
         import aiohttp
@@ -640,56 +594,14 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
         else:
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
-        auth_headers = {"Authorization": f"Bot {token}"}
-        media_files = media_files or []
-        last_data = None
-        warnings = []
-
+        headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            # Send text message (skip if empty and media is present)
-            if message.strip() or not media_files:
-                headers = {**auth_headers, "Content-Type": "application/json"}
-                async with session.post(url, headers=headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in (200, 201):
-                        body = await resp.text()
-                        return _error(f"Discord API error ({resp.status}): {body}")
-                    last_data = await resp.json()
-
-            # Send each media file as a separate multipart upload
-            for media_path, _is_voice in media_files:
-                if not os.path.exists(media_path):
-                    warning = f"Media file not found, skipping: {media_path}"
-                    logger.warning(warning)
-                    warnings.append(warning)
-                    continue
-                try:
-                    form = aiohttp.FormData()
-                    filename = os.path.basename(media_path)
-                    with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            if resp.status not in (200, 201):
-                                body = await resp.text()
-                                warning = _sanitize_error_text(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = await resp.json()
-                except Exception as e:
-                    warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
-                    logger.error(warning)
-                    warnings.append(warning)
-
-        if last_data is None:
-            error = "No deliverable text or media remained after processing"
-            if warnings:
-                return {"error": error, "warnings": warnings}
-            return {"error": error}
-
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
-        if warnings:
-            result["warnings"] = warnings
-        return result
+            async with session.post(url, headers=headers, json={"content": message}, **_req_kw) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    return _error(f"Discord API error ({resp.status}): {body}")
+                data = await resp.json()
+        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": data.get("id")}
     except Exception as e:
         return _error(f"Discord send failed: {e}")
 
@@ -909,9 +821,7 @@ async def _send_matrix(token, extra, chat_id, message):
         if not homeserver or not token:
             return {"error": "Matrix not configured (MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN required)"}
         txn_id = f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
-        from urllib.parse import quote
-        encoded_room = quote(chat_id, safe="")
-        url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room}/send/m.room.message/{txn_id}"
+        url = f"{homeserver}/_matrix/client/v3/rooms/{chat_id}/send/m.room.message/{txn_id}"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         # Build message payload with optional HTML formatted_body.
@@ -935,66 +845,6 @@ async def _send_matrix(token, extra, chat_id, message):
         return {"success": True, "platform": "matrix", "chat_id": chat_id, "message_id": data.get("event_id")}
     except Exception as e:
         return _error(f"Matrix send failed: {e}")
-
-
-async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
-    """Send via the Matrix adapter so native Matrix media uploads are preserved."""
-    try:
-        from gateway.platforms.matrix import MatrixAdapter
-    except ImportError:
-        return {"error": "Matrix dependencies not installed. Run: pip install 'mautrix[encryption]'"}
-
-    media_files = media_files or []
-
-    try:
-        adapter = MatrixAdapter(pconfig)
-        connected = await adapter.connect()
-        if not connected:
-            return _error("Matrix connect failed")
-
-        metadata = {"thread_id": thread_id} if thread_id else None
-        last_result = None
-
-        if message.strip():
-            last_result = await adapter.send(chat_id, message, metadata=metadata)
-            if not last_result.success:
-                return _error(f"Matrix send failed: {last_result.error}")
-
-        for media_path, is_voice in media_files:
-            if not os.path.exists(media_path):
-                return _error(f"Media file not found: {media_path}")
-
-            ext = os.path.splitext(media_path)[1].lower()
-            if ext in _IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
-            elif ext in _VIDEO_EXTS:
-                last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
-            elif ext in _VOICE_EXTS and is_voice:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
-            elif ext in _AUDIO_EXTS:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
-            else:
-                last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
-
-            if not last_result.success:
-                return _error(f"Matrix media send failed: {last_result.error}")
-
-        if last_result is None:
-            return {"error": "No deliverable text or media remained after processing MEDIA tags"}
-
-        return {
-            "success": True,
-            "platform": "matrix",
-            "chat_id": chat_id,
-            "message_id": last_result.message_id,
-        }
-    except Exception as e:
-        return _error(f"Matrix send failed: {e}")
-    finally:
-        try:
-            await adapter.disconnect()
-        except Exception:
-            pass
 
 
 async def _send_homeassistant(token, extra, chat_id, message):
@@ -1248,8 +1098,11 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error(f"QQBot send failed: {e}")
 
 
-async def _send_yuanbao(chat_id, message):
+async def _send_yuanbao(chat_id, message, media_files=None):
     """Send via Yuanbao using the running gateway adapter's WebSocket connection.
+
+    Follows the same pattern as _send_weixin: thin wrapper that delegates
+    to a platform-side helper for text + media delivery.
 
     Yuanbao uses a persistent WebSocket for all messaging, so we must route
     through the running YuanbaoAdapter instance (injected into yuanbao_tools).
@@ -1271,11 +1124,8 @@ async def _send_yuanbao(chat_id, message):
         )
 
     try:
-        result = await adapter.send(chat_id, message)
-        if result.success:
-            return {"success": True, "platform": "yuanbao", "chat_id": chat_id}
-        else:
-            return _error(f"Yuanbao send failed: {result.error or 'unknown error'}")
+        from gateway.platforms.yuanbao import send_yuanbao_direct
+        return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
 

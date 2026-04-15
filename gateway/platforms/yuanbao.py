@@ -29,7 +29,8 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -1947,6 +1948,101 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.error("[%s] send_image() failed: %s", self.name, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送本地图片文件。
+
+        与 send_image() 类似，但接收本地路径而非 URL，直接读取文件字节，
+        跳过 HTTP 下载步骤，直接走 COS 上传 → TIMImageElem 流程。
+        参考 send_document() 的本地文件读取逻辑。
+        """
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        try:
+            # 0. Drain text buffer before sending media
+            await self._drain_text_before_media(chat_id)
+
+            # 1. 读取本地文件
+            if not os.path.isfile(image_path):
+                return SendResult(success=False, error=f"File not found: {image_path}")
+
+            logger.info("[%s] send_image_file: reading local file %s", self.name, image_path)
+            with open(image_path, "rb") as f:
+                file_bytes = f.read()
+
+            if not file_bytes:
+                return SendResult(success=False, error=f"File is empty: {image_path}")
+
+            filename = os.path.basename(image_path) or "image.jpg"
+            content_type = guess_mime_type(filename) or "image/jpeg"
+            file_uuid = md5_hex(file_bytes)
+
+            # 2. 获取 COS 上传凭证
+            token_data = await self._get_cached_token()
+            token: str = token_data.get("token", "")
+            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
+
+            credentials = await get_cos_credentials(
+                app_key=self._app_key,
+                sign_token_url=self._sign_token_url,
+                token=token,
+                filename=filename,
+                bot_id=bot_id,
+            )
+
+            # 3. 上传到 COS
+            upload_result = await upload_to_cos(
+                file_bytes=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                credentials=credentials,
+                bucket=credentials["bucketName"],
+                region=credentials["region"],
+            )
+
+            # 4. 构造 TIMImageElem 消息体
+            msg_body = build_image_msg_body(
+                url=upload_result["url"],
+                uuid=file_uuid,
+                filename=filename,
+                size=upload_result["size"],
+                width=upload_result.get("width", 0),
+                height=upload_result.get("height", 0),
+                mime_type=content_type,
+            )
+
+            # 5. 若有 caption，追加文字消息体
+            if caption:
+                msg_body.append(
+                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
+                )
+
+            # 6. 发送
+            async with self._send_lock:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    result = await self._send_c2c_msg_body(to_account, msg_body)
+
+            if result.get("success"):
+                return SendResult(success=True, message_id=result.get("msg_key"))
+            return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+        except Exception as exc:
+            logger.error("[%s] send_image_file() failed: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
     async def send_file(
         self,
         chat_id: str,
@@ -3033,3 +3129,53 @@ async def force_refresh_sign_token(
         }
 
     return dict(_token_cache[app_key])
+
+
+# ---------------------------------------------------------------------------
+# Module-level send helper (used by send_message tool)
+# ---------------------------------------------------------------------------
+
+_YUANBAO_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+async def send_yuanbao_direct(
+    adapter: "YuanbaoAdapter",
+    chat_id: str,
+    message: str,
+    media_files: Optional[List[Tuple[str, bool]]] = None,
+) -> Dict[str, Any]:
+    """
+    Send helper for the ``send_message`` tool — text + media via Yuanbao.
+
+    Unlike Weixin which creates a fresh adapter per call, Yuanbao reuses the
+    running gateway adapter (persistent WebSocket). Logic mirrors
+    send_weixin_direct: send text first, then iterate media_files by extension.
+    """
+    last_result: Optional[SendResult] = None
+
+    # 1. 发送文本
+    if message.strip():
+        last_result = await adapter.send(chat_id, message)
+        if not last_result.success:
+            return {"error": f"Yuanbao send failed: {last_result.error}"}
+
+    # 2. 遍历 media_files，按扩展名分发
+    for media_path, _is_voice in media_files or []:
+        ext = Path(media_path).suffix.lower()
+        if ext in _YUANBAO_IMAGE_EXTS:
+            last_result = await adapter.send_image_file(chat_id, media_path)
+        else:
+            last_result = await adapter.send_document(chat_id, media_path)
+
+        if not last_result.success:
+            return {"error": f"Yuanbao media send failed: {last_result.error}"}
+
+    if last_result is None:
+        return {"error": "No deliverable text or media remained after processing"}
+
+    return {
+        "success": True,
+        "platform": "yuanbao",
+        "chat_id": chat_id,
+        "message_id": last_result.message_id if last_result else None,
+    }
