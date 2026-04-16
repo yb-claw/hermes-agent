@@ -30,7 +30,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -178,7 +178,7 @@ class _OutboundQueue:
         1. 拼接所有缓冲文本（使用 _infer_block_separator 推断分隔符）
         2. 调用 _strip_outer_markdown_fence 剥除外层围栏
         3. 调用 _sanitize_markdown_table 净化表格
-        4. 调用 chunk_markdown_text 分片
+        4. 调用 truncate_message 分片（保留代码块围栏完整性）
         5. 调用 _merge_block_streaming_fences 合并未闭合围栏
         6. 逐片发送
         """
@@ -198,10 +198,10 @@ class _OutboundQueue:
         merged = _strip_outer_markdown_fence(merged)
         merged = _sanitize_markdown_table(merged)
 
-        # 3. 分片
-        chunks = chunk_markdown_text(merged, self._adapter.MAX_TEXT_CHUNK)
+        # 3. 分片（使用 base class truncate_message 保留代码块围栏完整性）
+        chunks = self._adapter.truncate_message(merged, self._adapter.MAX_TEXT_CHUNK)
 
-        # 4. 合并未闭合围栏
+        # 4. 合并未闭合围栏（处理流式输出产生的断裂围栏）
         chunks = _merge_block_streaming_fences(chunks)
 
         # 5. 发送
@@ -239,7 +239,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
-    MAX_TEXT_CHUNK: int = 3000  # 元宝单条消息字符上限
+    MAX_TEXT_CHUNK: int = 4000  # 元宝单条消息字符上限 (临时调小验证分块)
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
@@ -277,6 +277,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Reconnection state
         self._reconnect_attempts: int = 0
         self._consecutive_hb_timeouts: int = 0  # heartbeat timeout counter
+        self._pending_pong: Optional[asyncio.Future] = None  # current in-flight ping future
 
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
@@ -290,6 +291,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
         self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
+
+        # Member cache: group_code -> [{"user_id":..., "nickname":..., ...}, ...]
+        # Populated by get_group_member_list(), used by @mention resolution.
+        self._member_cache: Dict[str, list] = {}
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # Only the first outbound message carries refMsgId for a given inbound msg.
@@ -383,6 +388,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 "[%s] Connected. connectId=%s botId=%s",
                 self.name, self._connect_id, self._bot_id,
             )
+
+            try:
+                from tools.yuanbao_tools import set_adapter
+                set_adapter(self)
+            except Exception as exc:
+                logger.warning("[%s] Failed to inject yuanbao_tools adapter: %s", self.name, exc)
+
             return True
 
         except asyncio.TimeoutError:
@@ -486,6 +498,83 @@ class YuanbaoAdapter(BasePlatformAdapter):
         stripped = text.strip()
         return stripped in _SKIPPABLE_PLACEHOLDERS
 
+    @staticmethod
+    def truncate_message(
+        content: str,
+        max_length: int = 5000,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> List[str]:
+        """
+        Split a long message into chunks with table-awareness.
+
+        Tables (contiguous ``| ... |`` rows) are kept as indivisible blocks.
+        Code blocks use the base-class close/reopen fence logic.
+        Page indicators like ``(1/3)`` are stripped from the output.
+
+        Falls back to ``BasePlatformAdapter.truncate_message`` for non-table
+        content and for overall text that fits in a single chunk.
+        """
+        _len = len_fn or len
+        if _len(content) <= max_length:
+            return [content]
+
+        _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
+
+        def _base_split_no_indicator(text: str) -> List[str]:
+            parts = BasePlatformAdapter.truncate_message(text, max_length, len_fn)
+            return [_INDICATOR_RE.sub('', p) for p in parts]
+
+        atoms = _split_into_atoms(content)
+
+        chunks: List[str] = []
+        current_parts: List[str] = []
+        current_len = 0  # tracks actual merged length including separators
+
+        def _flush() -> None:
+            if current_parts:
+                merged = '\n\n'.join(current_parts)
+                if _len(merged) <= max_length:
+                    chunks.append(merged)
+                else:
+                    chunks.extend(_base_split_no_indicator(merged))
+
+        for atom in atoms:
+            atom_len = _len(atom)
+            sep_len = 2 if current_parts else 0
+            projected = current_len + sep_len + atom_len
+
+            if projected > max_length and current_parts:
+                _flush()
+                current_parts = []
+                current_len = 0
+                sep_len = 0
+
+            if not current_parts and atom_len > max_length:
+                if _is_table_atom(atom):
+                    chunks.append(atom)
+                    continue
+                chunks.extend(_base_split_no_indicator(atom))
+                continue
+
+            current_parts.append(atom)
+            current_len += sep_len + atom_len
+
+        _flush()
+
+        # Merge small trailing/leading chunks with their neighbours
+        if len(chunks) > 1:
+            merged_chunks: List[str] = [chunks[0]]
+            for chunk in chunks[1:]:
+                prev = merged_chunks[-1]
+                combined = prev + '\n\n' + chunk
+                if _len(combined) <= max_length:
+                    merged_chunks[-1] = combined
+                else:
+                    merged_chunks.append(chunk)
+            chunks = merged_chunks
+
+        return chunks if chunks else [content]
+
     async def send(
         self,
         chat_id: str,
@@ -503,7 +592,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         增强逻辑：
           1. 获取或创建该 chat_id 的锁，保证同 chat_id 消息串行发送
-          2. 调用 chunk_markdown_text() 将 content 分片（超过 MAX_TEXT_CHUNK 自动切割）
+          2. 调用 truncate_message() 分片（保留代码块围栏完整性）
           3. 逐片调用 _send_text_chunk() 发送（含重试），任一片失败立即停止
         """
         if self._ws is None:
@@ -511,12 +600,23 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         lock = self._get_chat_lock(chat_id)
         async with lock:
-            chunks = chunk_markdown_text(content, self.MAX_TEXT_CHUNK)
+            chunks = self.truncate_message(content, self.MAX_TEXT_CHUNK)
+            logger.info(
+                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
+                self.name, len(content), self.MAX_TEXT_CHUNK,
+                len(chunks), [len(c) for c in chunks],
+            )
             for i, chunk in enumerate(chunks):
-                r_to = reply_to if i == 0 else None  # 只有第一片带 reply_to
+                r_to = reply_to if i == 0 else None
                 result = await self._send_text_chunk(chat_id, chunk, r_to)
                 if not result.success:
                     return result
+
+        # 消息投递成功后发送 FINISH 心跳，保证时序：RUNNING → 消息到达 → FINISH
+        try:
+            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+        except Exception:
+            pass
         return SendResult(success=True)
 
     async def _send_text_chunk(
@@ -585,14 +685,64 @@ class YuanbaoAdapter(BasePlatformAdapter):
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
+    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
+
+    def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
+        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
+        members = self._member_cache.get(group_code, [])
+        if not members:
+            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+
+        nickname_to_uid = {}
+        for m in members:
+            nick = m.get("nickname") or m.get("nick_name") or ""
+            uid = m.get("user_id") or ""
+            if nick and uid:
+                nickname_to_uid[nick.lower()] = (nick, uid)
+
+        msg_body: list = []
+        last_idx = 0
+        for match in self._AT_USER_RE.finditer(text):
+            start = match.start()
+            if start > last_idx:
+                seg = text[last_idx:start].strip()
+                if seg:
+                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
+
+            nickname = match.group(1)
+            entry = nickname_to_uid.get(nickname.lower())
+            if entry:
+                real_nick, uid = entry
+                msg_body.append({
+                    "msg_type": "TIMCustomElem",
+                    "msg_content": {
+                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
+                    },
+                })
+            else:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
+
+            last_idx = match.end()
+
+        if last_idx < len(text):
+            tail = text[last_idx:].strip()
+            if tail:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
+
+        if not msg_body:
+            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
+
+        return msg_body
+
     async def _send_group_message(
         self,
         group_code: str,
         text: str,
         reply_to: Optional[str] = None,
     ) -> dict:
-        """发送群聊文本消息。"""
-        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+        """发送群聊文本消息，自动将 @nickname 转换为 TIMCustomElem。"""
+        msg_body = self._build_msg_body_with_mentions(text, group_code)
         req_id = f"grp_{next_seq_no()}"
         encoded = encode_send_group_message(
             group_code=group_code,
@@ -634,9 +784,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
             return result
         except asyncio.TimeoutError:
-            logger.warning("[%s] _send_biz_request timeout: req_id=%s", self.name, req_id)
             raise
-        except Exception:
+        except Exception as exc:
             raise
         finally:
             self._pending_acks.pop(req_id, None)
@@ -787,9 +936,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 try:
                     msg_id = str(uuid.uuid4())
                     ping_bytes = encode_ping(msg_id)
-                    # Register a future for this ping to track pong response
+                    # Use a dedicated future for pong — server may not echo msg_id back
                     loop = asyncio.get_running_loop()
                     pong_future: asyncio.Future = loop.create_future()
+                    self._pending_pong = pong_future
+                    # Also register by msg_id as a fallback (in case server does echo it)
                     self._pending_acks[msg_id] = pong_future
                     await self._ws.send(ping_bytes)
                     logger.debug("[%s] PING sent (msg_id=%s)", self.name, msg_id)
@@ -810,6 +961,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                             return
                     finally:
                         self._pending_acks.pop(msg_id, None)
+                        self._pending_pong = None
                 except Exception as exc:
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
         except asyncio.CancelledError:
@@ -870,24 +1022,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
         need_ack = head.get("need_ack", False)
         data: bytes = msg.get("data", b"")
 
-        # HEARTBEAT_ACK: Response to our ping
+        # HEARTBEAT_ACK: Response to our ping — resolve the pending pong_future.
+        # The server may not echo back the msg_id, so we use _pending_pong as the
+        # primary signal and fall back to msg_id lookup for forward-compatibility.
         if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
             logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", self.name, msg_id)
-            # resolve pong_future 以停止心跳超时计数
-            if msg_id and msg_id in self._pending_acks:
+            if self._pending_pong is not None and not self._pending_pong.done():
+                self._pending_pong.set_result(True)
+            elif msg_id and msg_id in self._pending_acks:
                 fut = self._pending_acks.pop(msg_id)
                 if not fut.done():
-                    fut.set_result({"head": head})
+                    fut.set_result(True)
             return
 
-        # Response to an outbound RPC call (e.g. send-message response)
+        # Response to an outbound RPC call (e.g. send-message, query_group_info)
         if cmd_type == CMD_TYPE["Response"]:
             if msg_id and msg_id in self._pending_acks:
                 fut = self._pending_acks.pop(msg_id)
                 if not fut.done():
-                    # RPC responses use a different proto schema than inbound pushes;
-                    # return the head dict so callers can read msg_id/status fields.
-                    fut.set_result({"head": head})
+                    result = {"head": head}
+                    if data:
+                        result["data"] = data
+                    fut.set_result(result)
             else:
                 logger.debug(
                     "[%s] Unmatched Response: cmd=%s msg_id=%s",
@@ -919,6 +1075,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             # Genuine inbound message — dispatch to AI
             if data:
+                logger.info(
+                    "[%s] WS 收到入站消息推送, 开始解码分发: cmd=%s, data长度=%d",
+                    self.name, cmd, len(data),
+                )
                 self._push_to_inbound(head, data)
             return
 
@@ -985,12 +1145,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
         """
         发送"正在输入"状态心跳（RUNNING），best effort，不抛错。
-        此方法现在委托给 Reply Heartbeat 状态机（如已启动则为 no-op）。
+        由 base 类的 _keep_typing 循环周期调用，委托给 Reply Heartbeat 状态机。
         """
         try:
             await self._start_reply_heartbeat(chat_id)
-        except Exception as exc:
-            logger.debug("[%s] send_typing failed: %s", self.name, exc)
+        except Exception:
+            pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """
+        停止 RUNNING 心跳循环，但不立即发送 FINISH。
+
+        FINISH 由 send() 在消息实际投递后发送，以确保时序正确：
+        RUNNING... → 消息到达 → FINISH。
+
+        gateway/run.py 的 _message_handler 在拿到 agent 结果后、返回 response
+        文本之前就会调用 stop_typing()，此时消息尚未通过 WS 发出，所以这里
+        只停止 RUNNING 循环，FINISH 延迟到 send() 完成后发送。
+        """
+        try:
+            await self._stop_reply_heartbeat(chat_id, send_finish=False)
+        except Exception:
+            pass
 
     async def _start_reply_heartbeat(self, chat_id: str) -> None:
         """
@@ -1005,8 +1181,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # 如果已有任务在跑，只刷新时间戳即可
         existing = self._reply_heartbeat_tasks.get(chat_id)
         if existing and not existing.done():
-            # 通过 task 的 name 来传递 "refresh" 信号实现不了，
-            # 改用一个 dict 来存最后活跃时间
             if not hasattr(self, '_reply_hb_last_active'):
                 self._reply_hb_last_active: Dict[str, float] = {}
             self._reply_hb_last_active[chat_id] = time.time()
@@ -1038,10 +1212,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 # 检查超时
                 last_active = getattr(self, '_reply_hb_last_active', {}).get(chat_id, 0)
                 if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
-                    logger.debug(
-                        "[%s] Reply heartbeat timeout for %s, sending FINISH",
-                        self.name, chat_id,
-                    )
                     break
 
                 if self._ws is None:
@@ -1050,23 +1220,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
 
         except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.debug("[%s] Reply heartbeat worker error: %s", self.name, exc)
+            cancelled = True
+        except Exception:
+            cancelled = False
+        else:
+            cancelled = False
         finally:
-            # 发送 FINISH
-            try:
-                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-            except Exception:
-                pass
+            if not cancelled:
+                try:
+                    await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+                except Exception:
+                    pass
             self._reply_heartbeat_tasks.pop(chat_id, None)
             if hasattr(self, '_reply_hb_last_active'):
                 self._reply_hb_last_active.pop(chat_id, None)
 
-    async def _stop_reply_heartbeat(self, chat_id: str) -> None:
+    async def _stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
         """
-        停止 Reply Heartbeat（发送 FINISH 并取消定时器）。
-        用于 agent 回复完成后调用。
+        停止 Reply Heartbeat 并可选发送 FINISH。
+
+        Args:
+            send_finish: True 时取消 worker 后立即发 FINISH；
+                         False 时仅取消 worker，FINISH 由调用方负责。
         """
         task = self._reply_heartbeat_tasks.pop(chat_id, None)
         if task and not task.done():
@@ -1075,11 +1250,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 await task
             except asyncio.CancelledError:
                 pass
-        # task 的 finally 块会发 FINISH；如果已被取消，补发一次
-        try:
-            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-        except Exception:
-            pass
+        if send_finish:
+            try:
+                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+            except Exception:
+                pass
 
     async def _send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
         """发送单次心跳（RUNNING 或 FINISH），best effort。"""
@@ -1133,7 +1308,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return None
         encoded = encode_query_group_info(group_code)
-        # 提取 req_id（与 encode_query_group_info 中生成的一致）
         from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
         decoded = _decode(encoded)
         req_id = decoded["head"]["msg_id"]
@@ -1197,8 +1371,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return None
             biz_data = response.get("data", b"") or response.get("body", b"")
             if biz_data and isinstance(biz_data, bytes):
-                return decode_get_group_member_list_rsp(biz_data)
-            return {"members": [], "next_offset": 0, "is_complete": True}
+                result = decode_get_group_member_list_rsp(biz_data)
+            else:
+                result = {"members": [], "next_offset": 0, "is_complete": True}
+            if result and result.get("members"):
+                self._member_cache[group_code] = result["members"]
+            return result
         except asyncio.TimeoutError:
             logger.warning("[%s] get_group_member_list timeout: group=%s", self.name, group_code)
             return None
@@ -1378,14 +1556,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             user_name=sender_nickname or None,
         )
 
-        # ---- Command handling ----
-        # Check synchronously if text looks like a command, then dispatch async
-        rewritten = self._rewrite_slash_command(text)
-        if rewritten.startswith('/'):
-            asyncio.create_task(
-                self._dispatch_command(rewritten, chat_id, source, msg_id_field)
-            )
-            return
+        # Normalize full-width slash (Chinese input) before forwarding
+        text = self._rewrite_slash_command(text)
 
         event = MessageEvent(
             text=text,
@@ -1395,18 +1567,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
             raw_message=push,
         )
 
-        # Start reply heartbeat (RUNNING) as soon as we dispatch to AI
-        asyncio.create_task(self._start_reply_heartbeat(chat_id))
-        asyncio.create_task(self._handle_message_with_heartbeat(event, chat_id))
-
-    async def _handle_message_with_heartbeat(
-        self, event: MessageEvent, chat_id: str
-    ) -> None:
-        """Dispatch message to AI handler and stop heartbeat when done."""
-        try:
-            await self.handle_message(event)
-        finally:
-            await self._stop_reply_heartbeat(chat_id)
+        # Dispatch to base class handler (spawns background task internally).
+        # The base class _keep_typing loop will call our send_typing() to
+        # start/refresh the reply heartbeat, and stop_typing() will be called
+        # when processing finishes to send FINISH.
+        asyncio.create_task(self.handle_message(event))
 
     def _extract_text(self, msg_body: list) -> str:
         """
@@ -1446,174 +1611,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         return " ".join(parts) if parts else ""
 
-    # ------------------------------------------------------------------
-    # 命令框架
-    # ------------------------------------------------------------------
-
-    # 群聊中允许执行的公开命令（不需要 Owner 身份）
-    GROUP_PUBLIC_COMMANDS = frozenset({"/status", "/help", "/ping"})
-
-    async def _dispatch_command(
-        self, text: str, chat_id: str, source: Any, reply_to_msg_id: str
-    ) -> None:
-        """Dispatch command and send reply. Called as a task from _push_to_inbound."""
-        try:
-            reply = await self._handle_command(text, chat_id, source)
-            if reply is not None:
-                await self.send(chat_id, reply, reply_to=reply_to_msg_id or None)
-        except Exception as exc:
-            logger.error("[%s] _dispatch_command failed: %s", self.name, exc)
-
-    async def _handle_command(self, text: str, chat_id: str, source: Any) -> Optional[str]:
-        """
-        命令路由入口。如果 text 是斜杠命令则处理并返回回复文本，否则返回 None。
-
-        Args:
-            text: 用户输入文本
-            chat_id: 聊天 ID
-            source: SessionSource
-
-        Returns:
-            命令回复文本（str），或 None（非命令）
-        """
-        text = self._rewrite_slash_command(text)
-        if not text.startswith('/'):
-            return None
-
-        parts = text.strip().split(None, 1)
-        cmd = parts[0].lower()
-        args = parts[1] if len(parts) > 1 else ""
-
-        # 群聊中非公开命令 → 引导私聊
-        chat_type = "group" if chat_id.startswith("group:") else "dm"
-        if chat_type == "group" and cmd not in self.GROUP_PUBLIC_COMMANDS:
-            return f"该命令请私聊我执行: {cmd}"
-
-        if cmd == "/status":
-            return self._cmd_status()
-        elif cmd == "/help":
-            return self._cmd_help()
-        elif cmd == "/ping":
-            return "pong"
-        elif cmd == "/upgrade":
-            if not self._resolve_command_auth(source):
-                return "仅 Bot Owner 可以执行 /upgrade 命令"
-            return await self._cmd_upgrade(args)
-        elif cmd == "/issue-log":
-            if not self._resolve_command_auth(source):
-                return "仅 Bot Owner 可以执行 /issue-log 命令"
-            return await self._cmd_issue_log(args)
-        else:
-            return None  # 未知命令，交给 AI 处理
-
-    def _resolve_command_auth(self, source: Any) -> bool:
-        """
-        检查是否为 Bot Owner（命令鉴权）。
-
-        支持配置 bot_owner_id 或 allow_from 列表。
-        """
-        user_id = getattr(source, 'user_id', None) or ""
-        if not user_id:
-            return False
-
-        # Check bot_owner_id from config
-        owner_id = getattr(self._config, 'yuanbao_bot_owner_id', None) or os.getenv("YUANBAO_BOT_OWNER_ID", "")
-        if owner_id and user_id == owner_id.strip():
-            return True
-
-        # Check allow_from list
-        allow_from = getattr(self._config, 'allow_from', None) or []
-        if user_id in allow_from:
-            return True
-
-        return False
-
     @staticmethod
     def _rewrite_slash_command(text: str) -> str:
         """
-        斜杠命令预处理：标准化命令格式。
-
-        - 去除前后空白
-        - 中文全角斜杠 → 半角
+        Normalize input text: strip whitespace and convert full-width slash (Chinese
+        input method) to ASCII slash so commands are recognized correctly.
         """
         text = text.strip()
         if text.startswith('\uff0f'):  # 全角斜杠
             text = '/' + text[1:]
         return text
-
-    def _cmd_status(self) -> str:
-        """执行 /status 命令，返回 bot 状态信息。"""
-        try:
-            from hermes_cli import __version__ as hermes_version
-        except ImportError:
-            hermes_version = "unknown"
-
-        status = self.get_status()
-        connected = "已连接" if status.get("connected") else "未连接"
-        bot_id = status.get("bot_id", "N/A")
-        connect_id = status.get("connect_id", "N/A")
-        reconnects = status.get("reconnect_attempts", 0)
-
-        return (
-            f"hermes-agent({hermes_version})\n"
-            f"状态: {connected}\n"
-            f"Bot ID: {bot_id}\n"
-            f"Connect ID: {connect_id}\n"
-            f"重连次数: {reconnects}"
-        )
-
-    @staticmethod
-    def _cmd_help() -> str:
-        """执行 /help 命令。"""
-        return (
-            "可用命令:\n"
-            "/status - 查看 Bot 状态\n"
-            "/help - 显示帮助\n"
-            "/ping - 连通性测试\n"
-            "/upgrade [version] - 升级 Bot（仅 Owner）\n"
-            "/issue-log - 导出诊断日志（仅 Owner）"
-        )
-
-    async def _cmd_upgrade(self, args: str) -> str:
-        """
-        执行 /upgrade 命令（Owner 限制）。
-        触发 hermes-agent 自身升级流程。
-        """
-        version = args.strip() if args else "latest"
-        logger.info("[%s] /upgrade requested: version=%s", self.name, version)
-        # TODO: Implement actual upgrade trigger via hermes CLI
-        return f"升级请求已收到，目标版本: {version}\n请通过服务器终端执行: hermes update {version}"
-
-    async def _cmd_issue_log(self, args: str) -> str:
-        """
-        执行 /issue-log 命令（Owner 限制）。
-
-        收集最近日志信息，方便诊断问题。
-        """
-        import io
-        lines = []
-        lines.append("=== Issue Log ===")
-        lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-        # Connection status
-        status = self.get_status()
-        lines.append(f"Connected: {status.get('connected')}")
-        lines.append(f"Bot ID: {status.get('bot_id', 'N/A')}")
-        lines.append(f"Connect ID: {status.get('connect_id', 'N/A')}")
-        lines.append(f"Reconnect Attempts: {status.get('reconnect_attempts', 0)}")
-
-        # Heartbeat state
-        lines.append(f"Active Reply Heartbeats: {len(self._reply_heartbeat_tasks)}")
-        lines.append(f"Consecutive HB Timeouts: {self._consecutive_hb_timeouts}")
-
-        # Queue state
-        lines.append(f"Outbound Queues: {len(self._outbound_queues)}")
-        lines.append(f"Pending ACKs: {len(self._pending_acks)}")
-
-        # Group history
-        lines.append(f"Group History Chats: {len(self._group_history)}")
-
-        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # DM 主动私聊 + 访问控制
@@ -2379,6 +2386,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
                 # Restart background tasks
                 self._reconnect_attempts = 0
+                self._consecutive_hb_timeouts = 0
                 self._mark_connected()
 
                 if self._heartbeat_task and not self._heartbeat_task.done():
@@ -2702,19 +2710,19 @@ def _split_into_atoms(text: str) -> list[str]:
     return atoms
 
 
-def chunk_markdown_text(text: str, max_chars: int = 3000) -> list[str]:
+def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
     """
     将 Markdown 文本按 max_chars 切割为多个片段。
 
     保证：
-    - 每个片段 <= max_chars 字符（除非单段本身超过限制，如超大代码块/表格）
+    - 每个片段 <= max_chars 字符（除非单个代码块/表格本身超过限制）
     - 代码块（```...```）不在中间被切断
     - 表格行不在中间被切断（表格作为原子块整体输出）
     - 在段落边界切割（空行、句号后等）
 
     Args:
         text: 待切割的 Markdown 文本
-        max_chars: 每片段最大字符数，默认 3000
+        max_chars: 每片段最大字符数，默认 4000
 
     Returns:
         切割后的文本片段列表（非空）

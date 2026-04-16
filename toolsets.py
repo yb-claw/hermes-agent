@@ -60,6 +60,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Yuanbao platform tools (gated on adapter injection via check_fn)
+    "yb_query_group_info", "yb_query_group_members",
 ]
 
 
@@ -198,6 +200,12 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "yuanbao": {
+        "description": "Yuanbao platform tools - group info, member queries",
+        "tools": ["yb_query_group_info", "yb_query_group_members"],
         "includes": []
     },
 
