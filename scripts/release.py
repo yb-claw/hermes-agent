@@ -211,8 +211,10 @@ AUTHOR_MAP = {
     "zhiheng.liu@bytedance.com": "ZaynJarvis",
     "izhaolongfei@gmail.com": "loongfay",
     "296659110@qq.com": "lrt4836",
-    "fe.daniel91@gmail.com": "DanielFe",
+    "fe.daniel91@gmail.com": "beforeload",
     "libo1106@foxmail.com": "libo1106",
+    "295367131@qq.com": "295367131",
+    "295367132@qq.com": "IxAres",
 }
 
 
