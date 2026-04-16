@@ -113,7 +113,7 @@ def get_active_adapter() -> Optional["YuanbaoAdapter"]:
 
 
 DEFAULT_WS_GATEWAY_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection"
-DEFAULT_SIGN_TOKEN_URL = "https://yuanbao.tencent.com/api/sign-token"
+DEFAULT_SIGN_TOKEN_URL = "https://bot.yuanbao.tencent.com/api/v5/robotLogic/sign-token"
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
