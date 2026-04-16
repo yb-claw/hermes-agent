@@ -1497,14 +1497,6 @@ class GatewayRunner:
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
                     logger.info("✓ %s connected", platform.value)
-                    # Inject adapter into platform-specific tool modules
-                    if platform == Platform.YUANBAO:
-                        try:
-                            from tools.yuanbao_tools import set_adapter
-                            set_adapter(adapter)
-                            logger.debug("Injected YuanbaoAdapter into yuanbao_tools")
-                        except Exception as e:
-                            logger.warning("Failed to inject YuanbaoAdapter into yuanbao_tools: %s", e)
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     if adapter.has_fatal_error:
@@ -1814,15 +1806,6 @@ class GatewayRunner:
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         logger.info("✓ %s reconnected successfully", platform.value)
-
-                        # Inject adapter into platform-specific tool modules
-                        if platform == Platform.YUANBAO:
-                            try:
-                                from tools.yuanbao_tools import set_adapter
-                                set_adapter(adapter)
-                                logger.debug("Re-injected YuanbaoAdapter into yuanbao_tools after reconnect")
-                            except Exception as e:
-                                logger.warning("Failed to re-inject YuanbaoAdapter: %s", e)
 
                         # Rebuild channel directory with the new adapter
                         try:

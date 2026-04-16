@@ -5,8 +5,8 @@ yuanbao_tools.py - 元宝平台工具集
   - get_group_info        : 查询群基本信息（群名、群主、成员数）
   - query_group_members   : 查询群成员（按名搜索、列举 bot、列举全部）
 
-适配器注入：
-  在 YuanbaoAdapter.connect() 成功后调用 set_adapter(self) 完成注入。
+The active adapter singleton lives in ``gateway.platforms.yuanbao`` and is
+accessed via ``get_active_adapter()``.
 """
 
 from __future__ import annotations
@@ -16,31 +16,10 @@ from typing import TYPE_CHECKING, Optional
 
 logger = logging.getLogger(__name__)
 
+from gateway.platforms.yuanbao import get_active_adapter
+
 if TYPE_CHECKING:
     from gateway.platforms.yuanbao import YuanbaoAdapter
-
-# ---------------------------------------------------------------------------
-# 模块级 adapter 引用（延迟注入）
-# ---------------------------------------------------------------------------
-
-_adapter_ref: Optional["YuanbaoAdapter"] = None
-
-
-def set_adapter(adapter: "YuanbaoAdapter") -> None:
-    """注入 YuanbaoAdapter 实例，在 adapter.connect() 成功后调用。"""
-    global _adapter_ref
-    _adapter_ref = adapter
-    logger.info("[yuanbao_tools] adapter injected: %s", getattr(adapter, "name", adapter))
-
-
-def _get_adapter() -> "YuanbaoAdapter":
-    """获取 adapter，未注入时抛出 RuntimeError。"""
-    if _adapter_ref is None:
-        raise RuntimeError(
-            "YuanbaoAdapter not injected. Call yuanbao_tools.set_adapter(adapter) "
-            "after connect() succeeds."
-        )
-    return _adapter_ref
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +43,10 @@ async def get_group_info(group_code: str) -> dict:
     if not group_code:
         return {"success": False, "error": "group_code is required"}
 
-    adapter = _get_adapter()
+    adapter = get_active_adapter()
+    if adapter is None:
+        return {"success": False, "error": "Yuanbao adapter is not connected"}
+
     try:
         gi = await adapter.query_group_info(group_code)
         if gi is None:
@@ -102,7 +84,10 @@ async def query_group_members(
     if not group_code:
         return {"success": False, "error": "group_code is required"}
 
-    adapter = _get_adapter()
+    adapter = get_active_adapter()
+    if adapter is None:
+        return {"success": False, "error": "Yuanbao adapter is not connected"}
+
     try:
         raw = await adapter.get_group_member_list(group_code)
         if raw is None:
@@ -180,8 +165,8 @@ from tools.registry import registry, tool_result, tool_error  # noqa: E402
 
 
 def _check_yuanbao():
-    """Toolset availability check — True when adapter has been injected."""
-    return _adapter_ref is not None
+    """Toolset availability check — True when adapter is connected."""
+    return get_active_adapter() is not None
 
 
 async def _handle_yb_query_group_info(args, **kw):

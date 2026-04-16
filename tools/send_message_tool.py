@@ -1104,19 +1104,20 @@ async def _send_yuanbao(chat_id, message, media_files=None):
     Follows the same pattern as _send_weixin: thin wrapper that delegates
     to a platform-side helper for text + media delivery.
 
-    Yuanbao uses a persistent WebSocket for all messaging, so we must route
-    through the running YuanbaoAdapter instance (injected into yuanbao_tools).
+    Yuanbao uses a persistent WebSocket — unlike HTTP-based platforms, we
+    cannot create a throwaway client.  We obtain the running singleton from
+    the adapter module itself (``get_active_adapter``).
 
     chat_id format:
       - Group: "group:<group_code>"
       - DM:    "direct:<account_id>" or just "<account_id>"
     """
     try:
-        from tools.yuanbao_tools import _adapter_ref
+        from gateway.platforms.yuanbao import get_active_adapter, send_yuanbao_direct
     except ImportError:
-        return _error("Yuanbao tools module not available.")
+        return _error("Yuanbao adapter module not available.")
 
-    adapter = _adapter_ref
+    adapter = get_active_adapter()
     if adapter is None:
         return _error(
             "Yuanbao adapter is not running. "
@@ -1124,7 +1125,6 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         )
 
     try:
-        from gateway.platforms.yuanbao import send_yuanbao_direct
         return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")

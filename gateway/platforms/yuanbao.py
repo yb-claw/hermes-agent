@@ -91,6 +91,20 @@ from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level active adapter singleton.
+# Set by YuanbaoAdapter.connect(), cleared by disconnect().
+# Consumers (cron delivery, send_message tool) import get_active_adapter()
+# to obtain the running instance without going through yuanbao_tools.
+# ---------------------------------------------------------------------------
+_active_adapter: Optional["YuanbaoAdapter"] = None
+
+
+def get_active_adapter() -> Optional["YuanbaoAdapter"]:
+    """Return the currently connected YuanbaoAdapter, or None."""
+    return _active_adapter
+
+
 DEFAULT_WS_GATEWAY_URL = "wss://yuanbao.tencent.com/ws"
 DEFAULT_SIGN_TOKEN_URL = "https://yuanbao.tencent.com/api/sign-token"
 
@@ -378,6 +392,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
             self._mark_connected()
+            self._loop = asyncio.get_running_loop()
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
             )
@@ -389,11 +404,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 self.name, self._connect_id, self._bot_id,
             )
 
-            try:
-                from tools.yuanbao_tools import set_adapter
-                set_adapter(self)
-            except Exception as exc:
-                logger.warning("[%s] Failed to inject yuanbao_tools adapter: %s", self.name, exc)
+            global _active_adapter
+            _active_adapter = self
 
             return True
 
@@ -408,6 +420,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Cancel background tasks and close the WebSocket connection."""
+        global _active_adapter
+        if _active_adapter is self:
+            _active_adapter = None
+
         self._running = False
         self._mark_disconnected()
 
