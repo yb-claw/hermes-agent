@@ -154,7 +154,8 @@ class PlatformConfig:
     reply_to_mode: str = "first"
     
     # Yuanbao (元宝 IM Bot) platform-specific settings
-    yuanbao_app_key: Optional[str] = None         # App Key，用于签票接口鉴权
+    yuanbao_app_id: Optional[str] = None          # App ID（推荐），用于签票接口鉴权
+    yuanbao_app_key: Optional[str] = None         # App Key（兼容旧配置，等同 App ID）
     yuanbao_app_secret: Optional[str] = None      # App Secret，用于 HMAC 签名
     yuanbao_bot_id: Optional[str] = None          # Bot 账号 ID（可选，sign-token 接口会返回）
     yuanbao_ws_gateway_url: Optional[str] = None  # WS 网关地址（如 wss://xxx）
@@ -175,6 +176,8 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
+        if self.yuanbao_app_id:
+            result["yuanbao_app_id"] = self.yuanbao_app_id
         if self.yuanbao_app_key:
             result["yuanbao_app_key"] = self.yuanbao_app_key
         if self.yuanbao_app_secret:
@@ -1075,13 +1078,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
 
     # Yuanbao (元宝 IM Bot)
-    yuanbao_app_key = os.getenv("YUANBAO_APP_KEY")
+    # 优先读取 YUANBAO_APP_ID，兼容旧的 YUANBAO_APP_KEY
+    yuanbao_app_id = os.getenv("YUANBAO_APP_ID") or os.getenv("YUANBAO_APP_KEY")
     yuanbao_app_secret = os.getenv("YUANBAO_APP_SECRET")
-    if yuanbao_app_key and yuanbao_app_secret:
+    if yuanbao_app_id and yuanbao_app_secret:
         if Platform.YUANBAO not in config.platforms:
             config.platforms[Platform.YUANBAO] = PlatformConfig()
         config.platforms[Platform.YUANBAO].enabled = True
-        config.platforms[Platform.YUANBAO].yuanbao_app_key = yuanbao_app_key
+        config.platforms[Platform.YUANBAO].yuanbao_app_id = yuanbao_app_id
+        # 同时保留 app_key 以便兼容
+        config.platforms[Platform.YUANBAO].yuanbao_app_key = yuanbao_app_id
         config.platforms[Platform.YUANBAO].yuanbao_app_secret = yuanbao_app_secret
         yuanbao_bot_id = os.getenv("YUANBAO_BOT_ID")
         if yuanbao_bot_id:

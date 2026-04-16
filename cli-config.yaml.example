@@ -883,11 +883,11 @@ display:
 # Yuanbao (元宝 IM Bot) Platform Configuration
 # =============================================================================
 # Connect to Tencent Yuanbao IM Bot via WebSocket long-connection.
-# Required: YUANBAO_APP_KEY and YUANBAO_APP_SECRET in .env
+# Required: YUANBAO_APP_ID and YUANBAO_APP_SECRET in .env
 #           (or configure under platforms.yuanbao below)
 #
 # Environment variables (recommended — avoids storing secrets in this file):
-#   YUANBAO_APP_KEY         - App Key for sign-token API authentication
+#   YUANBAO_APP_ID          - App ID for sign-token API authentication
 #   YUANBAO_APP_SECRET      - App Secret for HMAC signing
 #   YUANBAO_BOT_ID          - Bot account ID (optional, returned by sign-token)
 #   YUANBAO_WS_GATEWAY_URL  - WebSocket gateway URL (e.g. wss://your-ws-gateway)
@@ -897,7 +897,7 @@ display:
 # platforms:
 #   yuanbao:
 #     enabled: true
-#     yuanbao_app_key: "your-app-key"           # App Key，用于签票接口鉴权
+#     yuanbao_app_id: "your-app-id"              # App ID，用于签票接口鉴权
 #     yuanbao_app_secret: "your-app-secret"     # App Secret，用于 HMAC 签名
 #     yuanbao_bot_id: "your-bot-id"             # Bot 账号 ID（可选，sign-token 接口会返回）
 #     yuanbao_ws_gateway_url: "wss://your-ws-gateway"  # WS 网关地址
