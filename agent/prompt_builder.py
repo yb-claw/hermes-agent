@@ -384,6 +384,12 @@ PLATFORM_HINTS = {
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
     ),
+    "yuanbao": (
+        "You are on Yuanbao, a Tencent IM-based messaging platform. "
+        "Keep messages concise as there is a 4000-character limit per message. "
+        "Markdown formatting is NOT supported — use plain text only. "
+        "Avoid wrapping entire replies in code blocks."
+    ),
 }
 
 # ---------------------------------------------------------------------------

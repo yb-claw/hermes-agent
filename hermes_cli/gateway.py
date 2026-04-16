@@ -2002,10 +2002,29 @@ _PLATFORMS = [
              "help": "OpenID to deliver cron results and notifications to."},
         ],
     },
+    {
+        "key": "yuanbao",
+        "label": "Yuanbao (Tencent IM Bot)",
+        "emoji": "🤖",
+        "token_var": "YUANBAO_APP_KEY",
+        "setup_instructions": [
+            "1. Register a Yuanbao Bot application",
+            "2. Note your App Key and App Secret",
+            "3. Configure WebSocket gateway URL if not using default",
+        ],
+        "vars": [
+            {"name": "YUANBAO_APP_KEY", "prompt": "Yuanbao App Key", "password": False,
+             "help": "Your Yuanbao Bot App Key."},
+            {"name": "YUANBAO_APP_SECRET", "prompt": "Yuanbao App Secret", "password": True,
+             "help": "Your Yuanbao Bot App Secret."},
+            {"name": "YUANBAO_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated, leave empty for open access)", "password": False,
+             "is_allowlist": True,
+             "help": "Optional — restrict DM access to specific user IDs."},
+            {"name": "YUANBAO_HOME_CHANNEL", "prompt": "Home channel (chat ID for cron delivery, or empty)", "password": False,
+             "help": "Chat ID to deliver cron results and notifications to."},
+        ],
+    },
 ]
-
-
-def _platform_status(platform: dict) -> str:
     """Return a plain-text status string for a platform.
 
     Returns uncolored text so it can safely be embedded in

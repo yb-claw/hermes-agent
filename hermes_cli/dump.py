@@ -132,6 +132,7 @@ def _configured_platforms() -> list[str]:
         "wecom_callback": "WECOM_CALLBACK_CORP_ID",
         "weixin": "WEIXIN_ACCOUNT_ID",
         "qqbot": "QQ_APP_ID",
+        "yuanbao": "YUANBAO_APP_KEY",
     }
     return [name for name, env in checks.items() if os.getenv(env)]
 

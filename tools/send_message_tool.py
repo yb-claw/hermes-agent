@@ -153,6 +153,7 @@ def _handle_send(args):
         "signal": Platform.SIGNAL,
         "bluebubbles": Platform.BLUEBUBBLES,
         "qqbot": Platform.QQBOT,
+        "yuanbao": Platform.YUANBAO,
         "matrix": Platform.MATRIX,
         "mattermost": Platform.MATTERMOST,
         "homeassistant": Platform.HOMEASSISTANT,
@@ -472,6 +473,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.YUANBAO:
+            result = await _send_yuanbao(pconfig, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1243,6 +1246,47 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
+
+
+async def _send_yuanbao(pconfig, chat_id, message):
+    """Send via Yuanbao using a temporary adapter instance.
+
+    Yuanbao sends messages over WebSocket, so we spin up a short-lived
+    adapter, connect (which establishes WS + auth), send the message,
+    and disconnect.  This mirrors how qqbot uses its REST API one-shot.
+    """
+    try:
+        from gateway.platforms.yuanbao import YuanbaoAdapter, check_yuanbao_requirements
+    except ImportError:
+        return _error("Yuanbao adapter not available")
+
+    if not check_yuanbao_requirements():
+        return _error("Yuanbao requires aiohttp and httpx. Run: pip install aiohttp httpx")
+
+    extra = pconfig.extra or {}
+    app_key = extra.get("app_key") or os.getenv("YUANBAO_APP_KEY", "")
+    app_secret = extra.get("app_secret") or os.getenv("YUANBAO_APP_SECRET", "")
+    static_token = extra.get("token") or os.getenv("YUANBAO_TOKEN", "")
+    if not static_token and (not app_key or not app_secret):
+        return _error("Yuanbao: YUANBAO_APP_KEY / YUANBAO_APP_SECRET not configured.")
+
+    try:
+        adapter = YuanbaoAdapter(pconfig)
+        connected = await adapter.connect()
+        if not connected:
+            err = adapter.fatal_error_message or "Connection failed"
+            return _error(f"Yuanbao: {err}")
+        try:
+            result = await adapter.send(chat_id=chat_id, content=message[:4000])
+            if result.success:
+                return {"success": True, "platform": "yuanbao", "chat_id": chat_id,
+                        "message_id": result.message_id}
+            else:
+                return _error(f"Yuanbao send failed: {result.error}")
+        finally:
+            await adapter.disconnect()
+    except Exception as e:
+        return _error(f"Yuanbao send failed: {e}")
 
 
 # --- Registry ---

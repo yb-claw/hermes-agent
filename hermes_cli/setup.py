@@ -2120,6 +2120,15 @@ def _setup_qqbot():
         _setup_standard_platform(qq_platform)
 
 
+def _setup_yuanbao():
+    """Configure Yuanbao (Tencent IM Bot) via standard platform setup."""
+    from hermes_cli.gateway import _PLATFORMS
+    yuanbao_platform = next((p for p in _PLATFORMS if p["key"] == "yuanbao"), None)
+    if yuanbao_platform:
+        from hermes_cli.gateway import _setup_standard_platform
+        _setup_standard_platform(yuanbao_platform)
+
+
 def _setup_webhooks():
     """Configure webhook integration."""
     print_header("Webhooks")
@@ -2184,6 +2193,7 @@ _GATEWAY_PLATFORMS = [
     ("Weixin (WeChat)", "WEIXIN_ACCOUNT_ID", _setup_weixin),
     ("BlueBubbles (iMessage)", "BLUEBUBBLES_SERVER_URL", _setup_bluebubbles),
     ("QQ Bot", "QQ_APP_ID", _setup_qqbot),
+    ("Yuanbao (Tencent IM Bot)", "YUANBAO_APP_KEY", _setup_yuanbao),
     ("Webhooks (GitHub, GitLab, etc.)", "WEBHOOK_ENABLED", _setup_webhooks),
 ]
 

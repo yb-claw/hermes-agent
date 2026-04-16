@@ -306,6 +306,7 @@ def show_status(args):
         "Weixin": ("WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL"),
         "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
         "QQBot": ("QQ_APP_ID", "QQ_HOME_CHANNEL"),
+        "Yuanbao": ("YUANBAO_APP_KEY", "YUANBAO_HOME_CHANNEL"),
     }
     
     for name, (token_var, home_var) in platforms.items():

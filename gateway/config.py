@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    YUANBAO = "yuanbao"
 
 
 @dataclass
@@ -306,6 +307,9 @@ class GatewayConfig:
                 connected.append(platform)
             # QQBot uses extra dict for app credentials
             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
+                connected.append(platform)
+            # Yuanbao uses appKey + appSecret for auth
+            elif platform == Platform.YUANBAO and config.extra.get("app_key") and config.extra.get("app_secret"):
                 connected.append(platform)
         return connected
     
@@ -1135,6 +1139,42 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=bluebubbles_home,
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
         )
+
+    # Yuanbao (Tencent IM Bot)
+    yuanbao_app_key = os.getenv("YUANBAO_APP_KEY")
+    yuanbao_app_secret = os.getenv("YUANBAO_APP_SECRET")
+    if yuanbao_app_key and yuanbao_app_secret:
+        if Platform.YUANBAO not in config.platforms:
+            config.platforms[Platform.YUANBAO] = PlatformConfig()
+        config.platforms[Platform.YUANBAO].enabled = True
+        extra = config.platforms[Platform.YUANBAO].extra
+        extra["app_key"] = yuanbao_app_key
+        extra["app_secret"] = yuanbao_app_secret
+        yuanbao_api_domain = os.getenv("YUANBAO_API_DOMAIN", "").strip()
+        if yuanbao_api_domain:
+            extra["api_domain"] = yuanbao_api_domain
+        yuanbao_ws_url = os.getenv("YUANBAO_WS_URL", "").strip()
+        if yuanbao_ws_url:
+            extra["ws_url"] = yuanbao_ws_url
+        yuanbao_token = os.getenv("YUANBAO_TOKEN", "").strip()
+        if yuanbao_token:
+            extra["token"] = yuanbao_token
+        yuanbao_dm_policy = os.getenv("YUANBAO_DM_POLICY", "").strip().lower()
+        if yuanbao_dm_policy:
+            extra["dm_policy"] = yuanbao_dm_policy
+        yuanbao_allowed_users = os.getenv("YUANBAO_ALLOWED_USERS", "").strip()
+        if yuanbao_allowed_users:
+            extra["allow_from"] = yuanbao_allowed_users
+        yuanbao_require_mention = os.getenv("YUANBAO_REQUIRE_MENTION", "").strip()
+        if yuanbao_require_mention:
+            extra["require_mention"] = yuanbao_require_mention.lower() in ("true", "1", "yes")
+        yuanbao_home = os.getenv("YUANBAO_HOME_CHANNEL", "").strip()
+        if yuanbao_home:
+            config.platforms[Platform.YUANBAO].home_channel = HomeChannel(
+                platform=Platform.YUANBAO,
+                chat_id=yuanbao_home,
+                name=os.getenv("YUANBAO_HOME_CHANNEL_NAME", "Home"),
+            )
 
     # QQ (Official Bot API v2)
     qq_app_id = os.getenv("QQ_APP_ID")
