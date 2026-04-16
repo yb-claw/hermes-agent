@@ -1153,9 +1153,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_api_domain = os.getenv("YUANBAO_API_DOMAIN", "").strip()
         if yuanbao_api_domain:
             extra["api_domain"] = yuanbao_api_domain
-        yuanbao_ws_url = os.getenv("YUANBAO_WS_URL", "").strip()
+        yuanbao_ws_url = (os.getenv("YUANBAO_WS_URL") or os.getenv("YUANBAO_WS_GATEWAY_URL") or "").strip()
         if yuanbao_ws_url:
             extra["ws_url"] = yuanbao_ws_url
+        yuanbao_sign_token_url = os.getenv("YUANBAO_SIGN_TOKEN_URL", "").strip()
+        if yuanbao_sign_token_url:
+            extra["sign_token_url"] = yuanbao_sign_token_url
         yuanbao_token = os.getenv("YUANBAO_TOKEN", "").strip()
         if yuanbao_token:
             extra["token"] = yuanbao_token

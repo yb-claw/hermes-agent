@@ -13,7 +13,8 @@ Configuration in config.yaml:
           app_key: "your-app-key"          # or YUANBAO_APP_KEY env var
           app_secret: "your-app-secret"    # or YUANBAO_APP_SECRET env var
           api_domain: "api.example.com"    # or YUANBAO_API_DOMAIN env var
-          ws_url: "wss://ws.example.com"   # or YUANBAO_WS_URL env var
+          ws_url: "wss://ws.example.com"   # or YUANBAO_WS_URL / YUANBAO_WS_GATEWAY_URL
+          sign_token_url: ""                 # or YUANBAO_SIGN_TOKEN_URL (overrides api_domain)
           token: ""                        # pre-signed static token (optional)
           dm_policy: "open"                # open | allowlist | disabled
           allow_from: ["user_id_1"]
@@ -612,7 +613,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._app_key = str(extra.get("app_key") or os.getenv("YUANBAO_APP_KEY", "")).strip()
         self._app_secret = str(extra.get("app_secret") or os.getenv("YUANBAO_APP_SECRET", "")).strip()
         self._api_domain = str(extra.get("api_domain") or os.getenv("YUANBAO_API_DOMAIN", DEFAULT_API_DOMAIN)).strip()
-        self._ws_url = str(extra.get("ws_url") or os.getenv("YUANBAO_WS_URL", DEFAULT_WS_GATEWAY_URL)).strip()
+        self._ws_url = str(
+            extra.get("ws_url")
+            or os.getenv("YUANBAO_WS_URL")
+            or os.getenv("YUANBAO_WS_GATEWAY_URL")  # legacy env var name
+            or DEFAULT_WS_GATEWAY_URL
+        ).strip()
+        self._sign_token_url_override = str(
+            extra.get("sign_token_url")
+            or os.getenv("YUANBAO_SIGN_TOKEN_URL", "")
+        ).strip() or None
         self._static_token = str(extra.get("token") or os.getenv("YUANBAO_TOKEN", "")).strip()
         self._route_env = str(extra.get("route_env", "")).strip()
         self._require_mention = bool(extra.get("require_mention", True))
@@ -782,7 +792,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _fetch_sign_token(self) -> Dict[str, Any]:
         """Call the sign-token API to get a new token."""
-        url = f"https://{self._api_domain}{SIGN_TOKEN_PATH}"
+        url = self._sign_token_url_override or f"https://{self._api_domain}{SIGN_TOKEN_PATH}"
 
         nonce = uuid.uuid4().hex
         # Generate Beijing time ISO 8601 timestamp

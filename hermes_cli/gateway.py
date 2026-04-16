@@ -2025,6 +2025,9 @@ _PLATFORMS = [
         ],
     },
 ]
+
+
+def _platform_status(platform: dict) -> str:
     """Return a plain-text status string for a platform.
 
     Returns uncolored text so it can safely be embedded in
