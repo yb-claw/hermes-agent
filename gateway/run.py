@@ -829,7 +829,7 @@ class GatewayRunner:
         session_key: Optional[str] = None,
     ):
         """Run the sync memory flush in a thread pool so it won't block the event loop."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
             self._flush_memories_for_session,
@@ -3464,7 +3464,7 @@ class GatewayRunner:
                                 )
                                 _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                loop = asyncio.get_event_loop()
+                                loop = asyncio.get_running_loop()
                                 _compressed, _ = await loop.run_in_executor(
                                     None,
                                     lambda: _hyg_agent._compress_context(
@@ -6026,7 +6026,7 @@ class GatewayRunner:
             if compress_start >= compress_end:
                 return "Nothing to compress yet (the transcript is still all protected context)."
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             compressed, _ = await loop.run_in_executor(
                 None,
                 lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens)
@@ -6408,7 +6408,7 @@ class GatewayRunner:
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
 
-            loop = _asyncio.get_event_loop()
+            loop = _asyncio.get_running_loop()
 
             def _run_insights():
                 db = SessionDB()
@@ -6425,7 +6425,7 @@ class GatewayRunner:
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _load_mcp_config, _servers, _lock
 
@@ -8080,7 +8080,7 @@ class GatewayRunner:
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
-        _loop_for_step = asyncio.get_event_loop()
+        _loop_for_step = asyncio.get_running_loop()
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
@@ -9318,6 +9318,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             loop.add_signal_handler(signal.SIGUSR1, restart_signal_handler)
         except NotImplementedError:
             pass
+
+    loop = asyncio.get_running_loop()
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, shutdown_signal_handler)
+            except NotImplementedError:
+                pass
+        if hasattr(signal, "SIGUSR1"):
+            try:
+                loop.add_signal_handler(signal.SIGUSR1, restart_signal_handler)
+            except NotImplementedError:
+                pass
+    else:
+        logger.info("Skipping signal handlers (not running in main thread).")
     
     # Start the gateway
     success = await runner.start()
