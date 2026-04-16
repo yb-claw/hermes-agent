@@ -66,6 +66,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     YUANBAO = "yuanbao"
+    QQBOT = "qqbot"
 
 
 @dataclass
@@ -1174,3 +1175,30 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.default_reset_policy.at_hour = int(reset_hour)
         except ValueError:
             pass
+
+
+# 已知的占位符 token，不应用于实际连接
+_PLACEHOLDER_TOKENS = frozenset({
+    "***",
+    "changeme",
+    "your_api_key",
+    "placeholder",
+    "your_token_here",
+    "insert_token_here",
+})
+
+
+def _validate_gateway_config(config: GatewayConfig) -> None:
+    """验证网关配置，禁用使用占位符 token 的平台。"""
+    for platform, pconfig in config.platforms.items():
+        if not pconfig.enabled:
+            continue
+        token = (pconfig.token or "").strip()
+        if token and token.lower() in _PLACEHOLDER_TOKENS:
+            logger.error(
+                "Platform %s has a placeholder token ('%s') — disabling. "
+                "Replace it with a real token in your .env or config.yaml.",
+                platform.value,
+                token,
+            )
+            pconfig.enabled = False
