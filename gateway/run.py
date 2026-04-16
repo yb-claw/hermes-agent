@@ -9085,6 +9085,7 @@ class GatewayRunner:
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending = None
+            pending_event = None
             if result and adapter and session_key:
                 if result.get("interrupted"):
                     pending = _dequeue_pending_text(adapter, session_key)
