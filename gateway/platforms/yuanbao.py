@@ -208,6 +208,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._reconnecting: bool = False         # guards against concurrent reconnects
         self._consecutive_hb_timeouts: int = 0  # heartbeat timeout counter
         self._pending_pong: Optional[asyncio.Future] = None  # current in-flight ping future
+        self._reconnect_in_progress: bool = False  # guards against concurrent reconnect tasks
+
+        # Set of background tasks — prevent GC from collecting fire-and-forget tasks
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
@@ -260,6 +264,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
             or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
         )
         self._group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
+
+    # ------------------------------------------------------------------
+    # Task tracking helper
+    # ------------------------------------------------------------------
+
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Register a fire-and-forget task so it won't be GC'd prematurely."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # ------------------------------------------------------------------
     # Abstract method implementations
@@ -418,6 +432,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not task.done():
                 task.cancel()
         self._inbound_tasks.clear()
+
+        # Clear module-level refresh locks to avoid stale locks from a previous event loop
+        _refresh_locks.clear()
 
         await self._cleanup_ws()
         logger.info("[%s] Disconnected", self.name)
@@ -769,8 +786,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[dict] = None,
-        **kwargs: Any,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
         发送文本消息，支持自动分片、per-chat-id 顺序保障。
@@ -1264,7 +1280,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Genuine inbound message — dispatch to AI
             if data:
                 logger.info(
-                    "[%s] WS 收到入站消息推送, 开始解码分发: cmd=%s, data长度=%d",
+                    "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
                     self.name, cmd, len(data),
                 )
                 self._push_to_inbound(head, data)
@@ -1330,7 +1346,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 {
                     "role": "user",
                     "content": attributed,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
                     "observed": True,
                 },
             )
@@ -3259,11 +3275,18 @@ HTTP_TIMEOUT_S = 10.0
 _token_cache: dict[str, dict[str, Any]] = {}
 
 # Per-app_key refresh locks — prevents concurrent duplicate sign-token requests.
+# Safety note: Locks are created lazily inside _get_refresh_lock(), which is only
+# called from async functions (running event loop), so the Lock is always bound to
+# the correct loop.  disconnect() clears this dict to prevent stale locks from a
+# previous event loop persisting across reconnects.
 _refresh_locks: dict[str, asyncio.Lock] = {}
 
 
 def _get_refresh_lock(app_key: str) -> asyncio.Lock:
-    """Return (creating if needed) the per-app_key refresh lock."""
+    """Return (creating if needed) the per-app_key refresh lock.
+
+    Must only be called from within a running event loop (async context).
+    """
     if app_key not in _refresh_locks:
         _refresh_locks[app_key] = asyncio.Lock()
     return _refresh_locks[app_key]
@@ -3326,33 +3349,33 @@ async def _do_fetch_sign_token(
                 headers["X-Route-Env"] = route_env
 
             logger.info(
-                "签票请求: url=%s%s",
+                "Sign token request: url=%s%s",
                 sign_token_url,
-                f" (重试 {attempt}/{SIGN_MAX_RETRIES})" if attempt > 0 else "",
+                f" (retry {attempt}/{SIGN_MAX_RETRIES})" if attempt > 0 else "",
             )
 
             response = await client.post(sign_token_url, json=payload, headers=headers)
 
             if response.status_code != 200:
                 body = response.text
-                raise RuntimeError(f"签票接口返回 {response.status_code}: {body[:200]}")
+                raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
 
             try:
                 result_data: dict[str, Any] = response.json()
             except Exception as exc:
-                raise ValueError(f"签票接口响应解析失败: {exc}") from exc
+                raise ValueError(f"Sign token response parse error: {exc}") from exc
 
             code = result_data.get("code")
             if code == 0:
                 data = result_data.get("data")
                 if not isinstance(data, dict):
-                    raise ValueError(f"签票响应缺少 data 字段: {result_data}")
-                logger.info("签票成功: bot_id=%s", data.get("bot_id"))
+                    raise ValueError(f"Sign token response missing 'data' field: {result_data}")
+                logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
                 return data
 
             if code == RETRYABLE_SIGN_CODE and attempt < SIGN_MAX_RETRIES:
                 logger.warning(
-                    "签票可重试: code=%s，%ss 后重试 (attempt=%d/%d)",
+                    "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
                     code,
                     SIGN_RETRY_DELAY_S,
                     attempt + 1,
@@ -3362,9 +3385,9 @@ async def _do_fetch_sign_token(
                 continue
 
             msg = result_data.get("msg", "")
-            raise RuntimeError(f"签票错误: code={code}, msg={msg}")
+            raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
 
-    raise RuntimeError("签票失败: 超过最大重试次数")
+    raise RuntimeError("Sign token failed: max retries exceeded")
 
 
 async def get_sign_token(
@@ -3381,7 +3404,7 @@ async def get_sign_token(
     cached = _token_cache.get(app_key)
     if cached and _is_cache_valid(cached):
         remain = int(cached["expire_ts"] - time.time())
-        logger.info("使用缓存 token (剩余 %ds)", remain)
+        logger.info("Using cached token (%ds remaining)", remain)
         return dict(cached)
 
     async with _get_refresh_lock(app_key):
@@ -3415,7 +3438,7 @@ async def force_refresh_sign_token(
     """
     强制刷新 token（清除缓存后重新签票）。
     """
-    logger.warning("[force-refresh] 清除缓存并重新签票: app_key=****%s", app_key[-4:])
+    logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
     async with _get_refresh_lock(app_key):
         _token_cache.pop(app_key, None)
         data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)

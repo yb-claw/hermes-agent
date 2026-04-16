@@ -118,7 +118,7 @@ def _require_token(request: Request) -> None:
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
+    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         auth = request.headers.get("authorization", "")
         expected = f"Bearer {_SESSION_TOKEN}"
         if not hmac.compare_digest(auth.encode(), expected.encode()):
@@ -2284,7 +2284,11 @@ def _mount_plugin_api_routes():
         api_file_name = plugin.get("_api_file")
         if not api_file_name:
             continue
-        api_path = Path(plugin["_dir"]) / api_file_name
+        plugin_dir = Path(plugin["_dir"])
+        api_path = (plugin_dir / api_file_name).resolve()
+        if not api_path.is_relative_to(plugin_dir.resolve()):
+            _log.warning("Plugin %s api path escapes plugin directory", plugin["name"])
+            continue
         if not api_path.exists():
             _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
             continue
