@@ -8,7 +8,7 @@ will be added in follow-up tasks.
 Configuration in config.yaml (or via env vars):
     platforms:
       yuanbao:
-        yuanbao_app_key: "..."        # or YUANBAO_APP_KEY
+        yuanbao_app_id: "..."         # or YUANBAO_APP_ID
         yuanbao_app_secret: "..."     # or YUANBAO_APP_SECRET
         yuanbao_bot_id: "..."         # or YUANBAO_BOT_ID  (optional, returned by sign-token)
         yuanbao_ws_gateway_url: "wss://..." # or YUANBAO_WS_GATEWAY_URL
@@ -26,8 +26,8 @@ import os
 import re
 import secrets
 import time
+import urllib.parse
 import uuid
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -43,7 +43,13 @@ except ImportError:
     websockets = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
     download_url as media_download_url,
     get_cos_credentials,
@@ -87,9 +93,23 @@ from gateway.platforms.yuanbao_proto import (
     encode_get_group_member_list,
     next_seq_no,
 )
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level active adapter singleton.
+# Set by YuanbaoAdapter.connect(), cleared by disconnect().
+# Consumers (cron delivery, send_message tool) import get_active_adapter()
+# to obtain the running instance without going through yuanbao_tools.
+# ---------------------------------------------------------------------------
+_active_adapter: Optional["YuanbaoAdapter"] = None
+
+
+def get_active_adapter() -> Optional["YuanbaoAdapter"]:
+    """Return the currently connected YuanbaoAdapter, or None."""
+    return _active_adapter
+
 
 DEFAULT_WS_GATEWAY_URL = "wss://yuanbao.tencent.com/ws"
 DEFAULT_SIGN_TOKEN_URL = "https://yuanbao.tencent.com/api/sign-token"
@@ -110,7 +130,7 @@ HEARTBEAT_TIMEOUT_THRESHOLD = 2
 AUTH_FAILED_CODES = {4001, 4002, 4003}      # permanent auth failure, re-sign token
 AUTH_RETRYABLE_CODES = {4010, 4011, 4099}   # transient, can retry with same token
 
-# Maximum number of distinct chat IDs tracked in _chat_locks / _group_history.
+# Maximum number of distinct chat IDs tracked in _chat_locks.
 # Oldest entry is evicted when the limit is reached to prevent unbounded growth.
 _CHAT_DICT_MAX_SIZE = 1000
 
@@ -121,6 +141,10 @@ REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # 30 秒无活动自动停止
 # Reply-to 引用配置
 REPLY_REF_TTL_S = 300.0            # 引用去重 TTL（5 分钟）
 _REPLY_REF_MAX_ENTRIES = 500       # 引用去重字典最大容量
+
+# 慢响应提示：agent 处理超过此时长（秒）未产出任何数据时，推送等待提示给用户
+SLOW_RESPONSE_TIMEOUT_S = 120.0
+SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
 
 # 占位符消息过滤（当无实际媒体内容时跳过这些纯占位符）
 _SKIPPABLE_PLACEHOLDERS = frozenset({
@@ -138,8 +162,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.YUANBAO)
 
         # Credentials / endpoints from config or environment
+        # 优先使用 app_id（推荐），兼容旧的 app_key
         self._app_key: str = (
-            config.yuanbao_app_key or os.getenv("YUANBAO_APP_KEY", "")
+            config.yuanbao_app_id
+            or config.yuanbao_app_key
+            or os.getenv("YUANBAO_APP_ID", "")
+            or os.getenv("YUANBAO_APP_KEY", "")
         ).strip()
         self._app_secret: str = (
             config.yuanbao_app_secret or os.getenv("YUANBAO_APP_SECRET", "")
@@ -154,6 +182,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._sign_token_url: str = (
             config.yuanbao_sign_token_url
             or os.getenv("YUANBAO_SIGN_TOKEN_URL", DEFAULT_SIGN_TOKEN_URL)
+        ).strip()
+        self._route_env: str = (
+            config.yuanbao_route_env
+            or os.getenv("YUANBAO_ROUTE_ENV", "")
         ).strip()
 
         # Runtime state
@@ -175,10 +207,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
 
-        # Group chat history: chat_id -> deque of {sender_id, text, ts}
-        # Upper-bounded to _CHAT_DICT_MAX_SIZE entries; oldest evicted first.
-        self._group_history: Dict[str, deque] = {}
-
         # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
         self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
 
@@ -186,15 +214,47 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Populated by get_group_member_list(), used by @mention resolution.
         self._member_cache: Dict[str, list] = {}
 
+        # Inbound message deduplication (WS reconnect / network jitter)
+        self._dedup = MessageDeduplicator(ttl_seconds=300)
+
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # Only the first outbound message carries refMsgId for a given inbound msg.
         self._reply_ref_used: Dict[str, float] = {}
+
+        # Slow-response notifier: chat_id -> asyncio.Task
+        # Fires a "please wait" message if the agent takes > SLOW_RESPONSE_TIMEOUT_S
+        self._slow_response_tasks: Dict[str, asyncio.Task] = {}
 
         # replyToMode config: 'off' | 'first' | 'all' (default: 'first')
         self._reply_to_mode: str = (
             getattr(config, 'yuanbao_reply_to_mode', None)
             or os.getenv("YUANBAO_REPLY_TO_MODE", "first")
         ).strip().lower()
+
+        # ------------------------------------------------------------------
+        # DM / Group 访问控制策略（平台层过滤，与 wecom.py 对齐）
+        # ------------------------------------------------------------------
+        self._dm_policy: str = (
+            config.yuanbao_dm_policy
+            or os.getenv("YUANBAO_DM_POLICY", "open")
+        ).strip().lower()
+
+        _dm_allow_from_raw: str = (
+            config.yuanbao_dm_allow_from
+            or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
+        )
+        self._dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
+
+        self._group_policy: str = (
+            config.yuanbao_group_policy
+            or os.getenv("YUANBAO_GROUP_POLICY", "open")
+        ).strip().lower()
+
+        _group_allow_from_raw: str = (
+            config.yuanbao_group_allow_from
+            or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
+        )
+        self._group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
 
     # ------------------------------------------------------------------
     # Abstract method implementations
@@ -219,7 +279,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if not self._app_key or not self._app_secret:
             msg = (
                 "Yuanbao startup failed: "
-                "YUANBAO_APP_KEY and YUANBAO_APP_SECRET are required"
+                "YUANBAO_APP_ID (or YUANBAO_APP_KEY) and YUANBAO_APP_SECRET are required"
             )
             self._set_fatal_error("yuanbao_missing_credentials", msg, retryable=False)
             logger.error("[%s] %s", self.name, msg)
@@ -240,7 +300,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Step 1: Get sign token
             logger.info("[%s] Fetching sign token from %s", self.name, self._sign_token_url)
             token_data = await get_sign_token(
-                self._app_key, self._app_secret, self._sign_token_url
+                self._app_key, self._app_secret, self._sign_token_url,
+                route_env=self._route_env,
             )
 
             # Update bot_id if returned by sign-token API
@@ -268,6 +329,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
             self._mark_connected()
+            self._loop = asyncio.get_running_loop()
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
             )
@@ -279,11 +341,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 self.name, self._connect_id, self._bot_id,
             )
 
-            try:
-                from tools.yuanbao_tools import set_adapter
-                set_adapter(self)
-            except Exception as exc:
-                logger.warning("[%s] Failed to inject yuanbao_tools adapter: %s", self.name, exc)
+            global _active_adapter
+            _active_adapter = self
 
             return True
 
@@ -298,6 +357,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Cancel background tasks and close the WebSocket connection."""
+        global _active_adapter
+        if _active_adapter is self:
+            _active_adapter = None
+
         self._running = False
         self._mark_disconnected()
 
@@ -329,6 +392,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not task.done():
                 task.cancel()
         self._reply_heartbeat_tasks.clear()
+
+        # Cancel all slow-response notifiers
+        for task in list(self._slow_response_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._slow_response_tasks.clear()
 
         await self._cleanup_ws()
         logger.info("[%s] Disconnected", self.name)
@@ -383,10 +452,209 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return from_account == bot_id
 
     @staticmethod
-    def _is_skippable_placeholder(text: str) -> bool:
+    def _is_skippable_placeholder(text: str, media_count: int = 0) -> bool:
         """检测是否为纯占位符消息（无实际内容时应跳过）。"""
+        if media_count > 0:
+            return False
         stripped = text.strip()
         return stripped in _SKIPPABLE_PLACEHOLDERS
+
+    @staticmethod
+    def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        从 cloud_custom_data 提取引用上下文，映射到 MessageEvent.reply_to_*。
+
+        返回:
+          (reply_to_message_id, reply_to_text)
+        """
+        if not cloud_custom_data:
+            return None, None
+        try:
+            parsed = json.loads(cloud_custom_data)
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+
+        quote = parsed.get("quote") if isinstance(parsed, dict) else None
+        if not isinstance(quote, dict):
+            return None, None
+
+        # type=2 对应图片引用，部分场景 desc 为空，给一个占位描述。
+        quote_type = int(quote.get("type") or 0)
+        desc = str(quote.get("desc") or "").strip()
+        if quote_type == 2 and not desc:
+            desc = "[image]"
+        if not desc:
+            return None, None
+
+        quote_id = str(quote.get("id") or "").strip() or None
+        sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
+        quote_text = f"{sender}: {desc}" if sender else desc
+        return quote_id, quote_text
+
+    @staticmethod
+    def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
+        """
+        从 TIM msg_body 提取入站图片/文件引用。
+
+        返回值示例：
+          [{"kind": "image", "url": "https://..."}, {"kind": "file", "url": "...", "name": "a.pdf"}]
+        """
+        refs: List[Dict[str, str]] = []
+        for elem in msg_body or []:
+            if not isinstance(elem, dict):
+                continue
+            msg_type = elem.get("msg_type", "")
+            content = elem.get("msg_content", {}) or {}
+            if not isinstance(content, dict):
+                continue
+
+            if msg_type == "TIMImageElem":
+                # 与 openclaw 插件保持一致：优先中图（索引 1），否则回退索引 0。
+                image_info_array = content.get("image_info_array")
+                if not isinstance(image_info_array, list):
+                    image_info_array = []
+                image_info = None
+                if len(image_info_array) > 1 and isinstance(image_info_array[1], dict):
+                    image_info = image_info_array[1]
+                elif len(image_info_array) > 0 and isinstance(image_info_array[0], dict):
+                    image_info = image_info_array[0]
+                image_url = str((image_info or {}).get("url") or "").strip()
+                if image_url:
+                    refs.append({"kind": "image", "url": image_url})
+                continue
+
+            if msg_type == "TIMFileElem":
+                file_url = str(content.get("url") or "").strip()
+                file_name = (
+                    str(content.get("file_name") or "").strip()
+                    or str(content.get("fileName") or "").strip()
+                    or str(content.get("filename") or "").strip()
+                )
+                if file_url:
+                    ref: Dict[str, str] = {"kind": "file", "url": file_url}
+                    if file_name:
+                        ref["name"] = file_name
+                    refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _guess_image_ext_from_url(url: str) -> str:
+        """根据 URL 路径猜测图片扩展名。"""
+        path = urllib.parse.urlparse(url).path
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}:
+            return ext
+        return ".jpg"
+
+    async def _resolve_inbound_media_urls(
+        self, media_refs: List[Dict[str, str]]
+    ) -> Tuple[List[str], List[str]]:
+        """
+        解析入站图片/文件 URL（不落地本地缓存），返回 (media_urls, media_types)。
+        """
+        media_urls: List[str] = []
+        media_types: List[str] = []
+
+        for ref in media_refs:
+            kind = str(ref.get("kind") or "").strip().lower()
+            url = str(ref.get("url") or "").strip()
+            if kind not in {"image", "file"} or not url:
+                continue
+
+            try:
+                fetch_url = await self._resolve_inbound_download_url(url)
+            except Exception as exc:
+                logger.warning("[%s] inbound media resolve failed: kind=%s url=%s err=%s", self.name, kind, url, exc)
+                continue
+
+            # 按资源类型推断 MIME，直接把 fetch_url 传给模型侧。
+            if kind == "image":
+                ext = self._guess_image_ext_from_url(fetch_url)
+                mime = guess_mime_type(f"image{ext}")
+                if not mime.startswith("image/"):
+                    mime = "image/jpeg"
+                media_urls.append(fetch_url)
+                media_types.append(mime)
+                continue
+
+            file_name = str(ref.get("name") or "").strip()
+            if not file_name:
+                parsed = urllib.parse.urlparse(fetch_url)
+                file_name = os.path.basename(parsed.path) or "file"
+            mime = guess_mime_type(file_name) or "application/octet-stream"
+            media_urls.append(fetch_url)
+            media_types.append(mime)
+
+        return media_urls, media_types
+
+    async def _resolve_inbound_download_url(self, url: str) -> str:
+        """
+        将元宝资源占位下载链接解析为可直接拉取的真实 URL。
+
+        元宝入站图片/文件常见 URL 形态：
+          https://hunyuan.tencent.com/api/resource/download?resourceId=...
+        该地址直接 GET 会 401，需要调用业务接口：
+          GET /api/resource/v1/download?resourceId=...
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return url
+
+        query = urllib.parse.parse_qs(parsed.query)
+        resource_ids = query.get("resourceId") or query.get("resourceid") or []
+        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        if not resource_id:
+            return url
+
+        token_data = await self._get_cached_token()
+        token = str(token_data.get("token") or "").strip()
+        source = str(token_data.get("source") or "web").strip() or "web"
+        bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
+        if not token or not bot_id:
+            return url
+
+        sign_base = urllib.parse.urlparse(self._sign_token_url)
+        api_base = f"{sign_base.scheme}://{sign_base.netloc}"
+        api_url = f"{api_base}/api/resource/v1/download"
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-ID": bot_id,
+            "X-Token": token,
+            "X-Source": source,
+        }
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            for attempt in range(2):
+                resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
+                if resp.status_code == 401 and attempt == 0:
+                    # token 过期时强制刷新一次后重试
+                    token_data = await force_refresh_sign_token(self._app_key, self._app_secret, self._sign_token_url)
+                    token = str(token_data.get("token") or "").strip()
+                    source = str(token_data.get("source") or source or "web").strip() or "web"
+                    bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
+                    if not token or not bot_id:
+                        break
+                    headers["X-ID"] = bot_id
+                    headers["X-Token"] = token
+                    headers["X-Source"] = source
+                    continue
+
+                resp.raise_for_status()
+                payload = resp.json()
+                code = payload.get("code")
+                if code not in (None, 0):
+                    raise RuntimeError(
+                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
+                    )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
+                if real_url:
+                    return real_url
+                raise RuntimeError("resource/v1/download missing url/realUrl")
+
+        return url
 
     @staticmethod
     def truncate_message(
@@ -487,6 +755,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
+
+        self._cancel_slow_response_notifier(chat_id)
 
         lock = self._get_chat_lock(chat_id)
         async with lock:
@@ -712,7 +982,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         token = token_data.get("token", "")
         uid = self._bot_id or token_data.get("bot_id", "")
         source = token_data.get("source") or "bot"  # use API-returned source; default to 'bot' (not 'web') to receive inbound pushes
-        route_env = token_data.get("route_env", "") or ""
+        route_env = self._route_env or token_data.get("route_env", "") or ""
 
         msg_id = str(uuid.uuid4())
 
@@ -1005,28 +1275,39 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _build_group_context(self, chat_id: str, current_sender: str, current_msg: str) -> str:
-        """
-        将该 chat_id 的群聊历史 + 当前消息拼成完整 context（Markdown 格式）。
+    # ------------------------------------------------------------------
+    # Group chat: observe messages into session transcript
+    # ------------------------------------------------------------------
 
-        格式：
-            **[历史消息]**
-            用户A: 消息1
-            用户B: 消息2
-            ...
-            **[当前消息]**
-            用户C: 当前消息内容
+    def _observe_group_message(
+        self, source: SessionSource, sender_display: str, text: str,
+    ) -> None:
+        """Write a group message into the session transcript without triggering the agent.
+
+        This allows the model to see the full group conversation when it is
+        eventually invoked via @bot.  Messages are stored with ``role: "user"``
+        and a ``[sender]`` prefix so the model can distinguish participants.
+
+        Requires ``group_sessions_per_user: false`` in the platform extra
+        config so that all participants share a single session transcript.
         """
-        history = self._group_history.get(chat_id)
-        lines: list[str] = []
-        if history:
-            lines.append("**[历史消息]**")
-            for entry in history:
-                lines.append(f"{entry['sender_id']}: {entry['text']}")
-            lines.append("")
-        lines.append("**[当前消息]**")
-        lines.append(f"{current_sender}: {current_msg}")
-        return "\n".join(lines)
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            session_entry = store.get_or_create_session(source)
+            attributed = f"[{sender_display}] {text}"
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": attributed,
+                    "timestamp": datetime.now().isoformat(),
+                    "observed": True,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to observe group message: %s", self.name, exc)
 
     # ------------------------------------------------------------------
     # Reply Heartbeat 状态机
@@ -1057,6 +1338,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
             await self._stop_reply_heartbeat(chat_id, send_finish=False)
         except Exception:
             pass
+
+    async def _process_message_background(self, event, session_key: str) -> None:
+        """Wrap base class processing with a slow-response notifier."""
+        chat_id = event.source.chat_id
+        await self._start_slow_response_notifier(chat_id)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            self._cancel_slow_response_notifier(chat_id)
 
     async def _start_reply_heartbeat(self, chat_id: str) -> None:
         """
@@ -1173,6 +1463,39 @@ class YuanbaoAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.debug("[%s] _send_heartbeat_once failed: %s", self.name, exc)
+
+    # ------------------------------------------------------------------
+    # Slow-response notifier (超时未回复提示)
+    # ------------------------------------------------------------------
+
+    async def _start_slow_response_notifier(self, chat_id: str) -> None:
+        """Start a delayed task that notifies the user when the agent is slow."""
+        self._cancel_slow_response_notifier(chat_id)
+        task = asyncio.create_task(
+            self._slow_response_notifier(chat_id),
+            name=f"yuanbao-slow-resp-{chat_id}",
+        )
+        self._slow_response_tasks[chat_id] = task
+
+    async def _slow_response_notifier(self, chat_id: str) -> None:
+        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
+        try:
+            await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
+            logger.info(
+                "[%s] Agent response exceeded %ds for %s, sending wait notice",
+                self.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
+            )
+            await self._send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("[%s] Slow-response notifier failed: %s", self.name, exc)
+
+    def _cancel_slow_response_notifier(self, chat_id: str) -> None:
+        """Cancel the pending slow-response notifier for *chat_id*, if any."""
+        task = self._slow_response_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
 
     # ------------------------------------------------------------------
     # 群查询方法
@@ -1389,6 +1712,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         sender_nickname: str = push.get("sender_nickname", "")
         msg_body: list = push.get("msg_body", [])
         msg_id_field: str = push.get("msg_id", "")
+        cloud_custom_data: str = push.get("cloud_custom_data", "")
+
+        # ---- Inbound dedup ----
+        if msg_id_field and self._dedup.is_duplicate(msg_id_field):
+            logger.debug("[%s] Duplicate message ignored: msg_id=%s", self.name, msg_id_field)
+            return
 
         # ---- Self-reference filter ----
         if self._is_self_reference(from_account, self._bot_id):
@@ -1405,36 +1734,29 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_type = "dm"
             chat_name = sender_nickname or from_account
 
-        # ---- Group chat: history recording + @Bot filter ----
-        if chat_type == "group":
-            text_for_history = self._extract_text(msg_body)
-            # Record every group message into history
-            if chat_id not in self._group_history:
-                if len(self._group_history) >= _CHAT_DICT_MAX_SIZE:
-                    self._group_history.pop(next(iter(self._group_history)))
-                self._group_history[chat_id] = deque(maxlen=50)
-            self._group_history[chat_id].append({
-                "sender_id": from_account,
-                "text": text_for_history,
-                "ts": int(time.time() * 1000),
-            })
-
-            # Only trigger AI when @Bot
-            if not self._is_at_bot(msg_body):
-                logger.info(
-                    "[%s] Group message recorded (no @bot): chat=%s from=%s",
-                    self.name, chat_id, from_account,
+        # ---- 平台层访问控制过滤 ----
+        if chat_type == "dm":
+            if not self._is_dm_allowed(from_account):
+                logger.debug(
+                    "[%s] DM from %s blocked by dm_policy=%s",
+                    self.name, from_account, self._dm_policy,
+                )
+                return
+        elif chat_type == "group":
+            if not self._is_group_allowed(group_code):
+                logger.debug(
+                    "[%s] Group %s blocked by group_policy=%s",
+                    self.name, group_code, self._group_policy,
                 )
                 return
 
-            # Build context-enriched content
-            text = self._build_group_context(chat_id, from_account, text_for_history)
-        else:
-            text = self._extract_text(msg_body)
+        # Extract raw text first (before any history enrichment)
+        raw_text = self._rewrite_slash_command(self._extract_text(msg_body))
+        media_refs = self._extract_inbound_media_refs(msg_body)
 
         # ---- Placeholder filter ----
-        if self._is_skippable_placeholder(text):
-            logger.debug("[%s] Skipping placeholder message: %r", self.name, text)
+        if self._is_skippable_placeholder(raw_text, len(media_refs)):
+            logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
         source = SessionSource(
@@ -1443,25 +1765,45 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             chat_name=chat_name,
             user_id=from_account or None,
-            user_name=sender_nickname or None,
+            user_name=sender_nickname or from_account,
+            # For group chats, set a synthetic thread_id so
+            # build_session_key treats it like a shared thread —
+            # user_id is kept for auth but excluded from the session
+            # key, matching how Telegram/Feishu handle shared threads.
+            thread_id="main" if chat_type == "group" else None,
         )
 
-        # Normalize full-width slash (Chinese input) before forwarding
-        text = self._rewrite_slash_command(text)
+        # ---- Group chat: observe non-@bot messages, reply only on @Bot ----
+        if chat_type == "group" and not self._is_at_bot(msg_body):
+            self._observe_group_message(source, sender_nickname or from_account, raw_text)
+            logger.info(
+                "[%s] Group message observed (no @bot): chat=%s from=%s",
+                self.name, chat_id, from_account,
+            )
+            return
 
-        event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
-            source=source,
-            message_id=msg_id_field or None,
-            raw_message=push,
-        )
+        msg_type = self._classify_message_type(raw_text, msg_body)
 
-        # Dispatch to base class handler (spawns background task internally).
-        # The base class _keep_typing loop will call our send_typing() to
-        # start/refresh the reply heartbeat, and stop_typing() will be called
-        # when processing finishes to send FINISH.
-        asyncio.create_task(self.handle_message(event))
+        async def _dispatch_inbound_event() -> None:
+            media_urls, media_types = await self._resolve_inbound_media_urls(media_refs)
+            if self._is_skippable_placeholder(raw_text, len(media_urls)):
+                logger.debug("[%s] Skip placeholder after media download: %r", self.name, raw_text)
+                return
+            reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
+            event = MessageEvent(
+                text=raw_text,
+                message_type=msg_type,
+                source=source,
+                message_id=msg_id_field or None,
+                raw_message=push,
+                media_urls=media_urls,
+                media_types=media_types,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
+            )
+            await self.handle_message(event)
+
+        asyncio.create_task(_dispatch_inbound_event())
 
     def _extract_text(self, msg_body: list) -> str:
         """
@@ -1471,6 +1813,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         - TIMFileElem      → "[文件: {filename}]"
         - TIMSoundElem     → "[语音]"
         - TIMVideoFileElem → "[视频]"
+        - TIMFaceElem      → "[表情: {name}]" 或 "[表情]"
         - TIMCustomElem    → 尝试提取 data 字段，否则 "[自定义消息]"
         - 多个 elem 用空格拼接
         """
@@ -1486,7 +1829,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             elif elem_type == "TIMImageElem":
                 parts.append("[图片]")
             elif elem_type == "TIMFileElem":
-                filename = content.get("fileName", content.get("filename", ""))
+                filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
                 parts.append(f"[文件: {filename}]" if filename else "[文件]")
             elif elem_type == "TIMSoundElem":
                 parts.append("[语音]")
@@ -1494,7 +1837,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 parts.append("[视频]")
             elif elem_type == "TIMCustomElem":
                 data_val = content.get("data", "")
-                parts.append(data_val if data_val else "[自定义消息]")
+                if data_val:
+                    try:
+                        custom = json.loads(data_val)
+                        if isinstance(custom, dict) and custom.get("elem_type") == 1002:
+                            parts.append(custom.get("text", "[提及]"))
+                        else:
+                            parts.append("[当前消息暂不支持查看]")
+                    except (json.JSONDecodeError, TypeError):
+                        parts.append(data_val)
+                else:
+                    parts.append("[当前消息暂不支持查看]")
+            elif elem_type == "TIMFaceElem":
+                # 贴纸/表情：从 data JSON 中提取 name
+                raw_data = content.get("data", "")
+                face_name = ""
+                if raw_data:
+                    try:
+                        face_data = json.loads(raw_data)
+                        face_name = (face_data.get("name") or "").strip()
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+                parts.append(f"[表情: {face_name}]" if face_name else "[表情]")
             elif elem_type:
                 # Unknown element type — include type as placeholder
                 parts.append(f"[{elem_type}]")
@@ -1511,6 +1875,23 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if text.startswith('\uff0f'):  # 全角斜杠
             text = '/' + text[1:]
         return text
+
+    @staticmethod
+    def _classify_message_type(text: str, msg_body: list) -> MessageType:
+        """Determine MessageType from text content and msg_body elements."""
+        if text.startswith("/"):
+            return MessageType.COMMAND
+        for elem in msg_body:
+            etype = elem.get("msg_type", "")
+            if etype == "TIMImageElem":
+                return MessageType.PHOTO
+            if etype == "TIMSoundElem":
+                return MessageType.VOICE
+            if etype == "TIMVideoFileElem":
+                return MessageType.VIDEO
+            if etype == "TIMFileElem":
+                return MessageType.DOCUMENT
+        return MessageType.TEXT
 
     # ------------------------------------------------------------------
     # DM 主动私聊 + 访问控制
@@ -1536,39 +1917,25 @@ class YuanbaoAdapter(BasePlatformAdapter):
         chat_id = f"direct:{user_id}"
         return await self.send(chat_id, text)
 
-    def _resolve_dm_access(self, user_id: str) -> bool:
-        """
-        DM 访问控制。
-
-        策略（从配置/环境变量读取）：
-        - 'open': 允许所有用户
-        - 'allowlist': 仅白名单用户
-        - 'disabled': 禁止所有 DM
-
-        配置项：
-        - yuanbao_dm_policy / YUANBAO_DM_POLICY（默认 'open'）
-        - yuanbao_dm_allow_from / YUANBAO_DM_ALLOW_FROM（逗号分隔的用户 ID 列表）
-        """
-        policy = (
-            getattr(self._config, 'yuanbao_dm_policy', None)
-            or os.getenv("YUANBAO_DM_POLICY", "open")
-        ).strip().lower()
-
-        if policy == "disabled":
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """平台层 DM 入站过滤（open / allowlist / disabled）。"""
+        if self._dm_policy == "disabled":
             return False
-        if policy == "open":
-            return True
-        if policy == "allowlist":
-            allow_from_str = (
-                getattr(self._config, 'yuanbao_dm_allow_from', None)
-                or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
-            )
-            if isinstance(allow_from_str, list):
-                allow_list = allow_from_str
-            else:
-                allow_list = [x.strip() for x in str(allow_from_str).split(",") if x.strip()]
-            return user_id in allow_list
-        return True  # 未知策略默认放行
+        if self._dm_policy == "allowlist":
+            return sender_id.strip() in self._dm_allow_from
+        return True
+
+    def _is_group_allowed(self, group_code: str) -> bool:
+        """平台层群聊入站过滤（open / allowlist / disabled）。"""
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "allowlist":
+            return group_code.strip() in self._group_allow_from
+        return True
+
+    def _resolve_dm_access(self, user_id: str) -> bool:
+        """主动 DM 发送授权，复用 _is_dm_allowed()。"""
+        return self._is_dm_allowed(user_id)
 
     # ------------------------------------------------------------------
     # Agent 工具方法（可注册为 AI toolset）
@@ -1752,6 +2119,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 1. 下载图片
             logger.info("[%s] send_image: downloading %s", self.name, image_url)
@@ -1776,6 +2145,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -1841,6 +2211,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 1. 读取本地文件
             if not os.path.isfile(image_path):
@@ -1868,6 +2240,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -1935,6 +2308,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 1. 下载文件
             logger.info("[%s] send_file: downloading %s", self.name, file_url)
@@ -1961,6 +2336,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2028,6 +2404,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             if sticker_name is not None:
                 sticker = get_sticker_by_name(sticker_name)
@@ -2078,6 +2456,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 1. 读取本地文件
             if not os.path.isfile(file_path):
@@ -2107,6 +2487,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2195,7 +2576,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         获取当前有效的签票 token（走模块级缓存）。
         """
         return await get_sign_token(
-            self._app_key, self._app_secret, self._sign_token_url
+            self._app_key, self._app_secret, self._sign_token_url,
+            route_env=self._route_env,
         )
 
     async def _reconnect_with_backoff(self) -> bool:
@@ -2221,7 +2603,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             try:
                 # Force-refresh token to avoid using a stale one
                 token_data = await force_refresh_sign_token(
-                    self._app_key, self._app_secret, self._sign_token_url
+                    self._app_key, self._app_secret, self._sign_token_url,
+                    route_env=self._route_env,
                 )
                 if token_data.get("bot_id"):
                     self._bot_id = str(token_data["bot_id"])
@@ -2366,6 +2749,7 @@ def _parse_json_push(raw_json: dict) -> dict | None:
         "msg_seq": raw_json.get("msg_seq", 0) or raw_json.get("MsgSeq", 0),
         "msg_id": raw_json.get("msg_id", "") or raw_json.get("msg_key", "") or raw_json.get("MsgKey", ""),
         "msg_body": msg_body,
+        "cloud_custom_data": raw_json.get("cloud_custom_data", "") or raw_json.get("CloudCustomData", ""),
         "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
     }
 
@@ -2864,6 +3248,7 @@ async def _do_fetch_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     发起签票 HTTP 请求，支持自动重试（最多 SIGN_MAX_RETRIES 次）。
@@ -2888,6 +3273,8 @@ async def _do_fetch_sign_token(
                 "X-Instance-Id": "16",
                 "X-Bot-Version": "hermes-agent",
             }
+            if route_env:
+                headers["X-Route-Env"] = route_env
 
             logger.info(
                 "签票请求: url=%s%s",
@@ -2935,6 +3322,7 @@ async def get_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     获取 WS 鉴权 token（带缓存）。
@@ -2952,7 +3340,7 @@ async def get_sign_token(
         if cached and _is_cache_valid(cached):
             return dict(cached)
 
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
@@ -2973,6 +3361,7 @@ async def force_refresh_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     强制刷新 token（清除缓存后重新签票）。
@@ -2980,7 +3369,7 @@ async def force_refresh_sign_token(
     logger.warning("[force-refresh] 清除缓存并重新签票: app_key=****%s", app_key[-4:])
     async with _get_refresh_lock(app_key):
         _token_cache.pop(app_key, None)
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600

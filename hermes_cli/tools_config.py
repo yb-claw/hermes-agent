@@ -83,6 +83,7 @@ CONFIGURABLE_TOOLSETS = [
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
+    ("messaging",       "📨 Cross-Platform Messaging",  "send_message"),
     ("rl",              "🧪 RL Training",               "Tinker-Atropos training tools"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries"),
@@ -154,6 +155,7 @@ TOOL_CATEGORIES = {
         "providers": [
             {
                 "name": "Nous Subscription",
+                "badge": "subscription",
                 "tag": "Managed OpenAI TTS billed to your subscription",
                 "env_vars": [],
                 "tts_provider": "openai",
@@ -163,21 +165,32 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Microsoft Edge TTS",
-                "tag": "Free - no API key needed",
+                "badge": "★ recommended · free",
+                "tag": "Good quality, no API key needed",
                 "env_vars": [],
                 "tts_provider": "edge",
             },
             {
                 "name": "OpenAI TTS",
-                "tag": "Premium - high quality voices",
+                "badge": "paid",
+                "tag": "High quality voices",
                 "env_vars": [
                     {"key": "VOICE_TOOLS_OPENAI_KEY", "prompt": "OpenAI API key", "url": "https://platform.openai.com/api-keys"},
                 ],
                 "tts_provider": "openai",
             },
             {
+                "name": "xAI TTS",
+                "tag": "Grok voices - requires xAI API key",
+                "env_vars": [
+                    {"key": "XAI_API_KEY", "prompt": "xAI API key", "url": "https://console.x.ai/"},
+                ],
+                "tts_provider": "xai",
+            },
+            {
                 "name": "ElevenLabs",
-                "tag": "Premium - most natural voices",
+                "badge": "paid",
+                "tag": "Most natural voices",
                 "env_vars": [
                     {"key": "ELEVENLABS_API_KEY", "prompt": "ElevenLabs API key", "url": "https://elevenlabs.io/app/settings/api-keys"},
                 ],
@@ -185,7 +198,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Mistral (Voxtral TTS)",
-                "tag": "Multilingual, native Opus, needs MISTRAL_API_KEY",
+                "badge": "paid",
+                "tag": "Multilingual, native Opus",
                 "env_vars": [
                     {"key": "MISTRAL_API_KEY", "prompt": "Mistral API key", "url": "https://console.mistral.ai/"},
                 ],
@@ -201,6 +215,7 @@ TOOL_CATEGORIES = {
         "providers": [
             {
                 "name": "Nous Subscription",
+                "badge": "subscription",
                 "tag": "Managed Firecrawl billed to your subscription",
                 "web_backend": "firecrawl",
                 "env_vars": [],
@@ -210,7 +225,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Firecrawl Cloud",
-                "tag": "Hosted service - search, extract, and crawl",
+                "badge": "★ recommended",
+                "tag": "Full-featured search, extract, and crawl",
                 "web_backend": "firecrawl",
                 "env_vars": [
                     {"key": "FIRECRAWL_API_KEY", "prompt": "Firecrawl API key", "url": "https://firecrawl.dev"},
@@ -218,7 +234,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Exa",
-                "tag": "AI-native search and contents",
+                "badge": "paid",
+                "tag": "Neural search with semantic understanding",
                 "web_backend": "exa",
                 "env_vars": [
                     {"key": "EXA_API_KEY", "prompt": "Exa API key", "url": "https://exa.ai"},
@@ -226,7 +243,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Parallel",
-                "tag": "AI-native search and extract",
+                "badge": "paid",
+                "tag": "AI-powered search and extract",
                 "web_backend": "parallel",
                 "env_vars": [
                     {"key": "PARALLEL_API_KEY", "prompt": "Parallel API key", "url": "https://parallel.ai"},
@@ -234,7 +252,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Tavily",
-                "tag": "AI-native search, extract, and crawl",
+                "badge": "free tier",
+                "tag": "Search, extract, and crawl — 1000 free searches/mo",
                 "web_backend": "tavily",
                 "env_vars": [
                     {"key": "TAVILY_API_KEY", "prompt": "Tavily API key", "url": "https://app.tavily.com/home"},
@@ -242,7 +261,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Firecrawl Self-Hosted",
-                "tag": "Free - run your own instance",
+                "badge": "free · self-hosted",
+                "tag": "Run your own Firecrawl instance (Docker)",
                 "web_backend": "firecrawl",
                 "env_vars": [
                     {"key": "FIRECRAWL_API_URL", "prompt": "Your Firecrawl instance URL (e.g., http://localhost:3002)"},
@@ -256,6 +276,7 @@ TOOL_CATEGORIES = {
         "providers": [
             {
                 "name": "Nous Subscription",
+                "badge": "subscription",
                 "tag": "Managed FAL image generation billed to your subscription",
                 "env_vars": [],
                 "requires_nous_auth": True,
@@ -264,6 +285,7 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "FAL.ai",
+                "badge": "paid",
                 "tag": "FLUX 2 Pro with auto-upscaling",
                 "env_vars": [
                     {"key": "FAL_KEY", "prompt": "FAL API key", "url": "https://fal.ai/dashboard/keys"},
@@ -277,6 +299,7 @@ TOOL_CATEGORIES = {
         "providers": [
             {
                 "name": "Nous Subscription (Browser Use cloud)",
+                "badge": "subscription",
                 "tag": "Managed Browser Use billed to your subscription",
                 "env_vars": [],
                 "browser_provider": "browser-use",
@@ -287,14 +310,16 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Local Browser",
-                "tag": "Free headless Chromium (no API key needed)",
+                "badge": "★ recommended · free",
+                "tag": "Headless Chromium, no API key needed",
                 "env_vars": [],
                 "browser_provider": "local",
                 "post_setup": "agent_browser",
             },
             {
                 "name": "Browserbase",
-                "tag": "Cloud browser with stealth & proxies",
+                "badge": "paid",
+                "tag": "Cloud browser with stealth and proxies",
                 "env_vars": [
                     {"key": "BROWSERBASE_API_KEY", "prompt": "Browserbase API key", "url": "https://browserbase.com"},
                     {"key": "BROWSERBASE_PROJECT_ID", "prompt": "Browserbase project ID"},
@@ -304,6 +329,7 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Browser Use",
+                "badge": "paid",
                 "tag": "Cloud browser with remote execution",
                 "env_vars": [
                     {"key": "BROWSER_USE_API_KEY", "prompt": "Browser Use API key", "url": "https://browser-use.com"},
@@ -313,6 +339,7 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Firecrawl",
+                "badge": "paid",
                 "tag": "Cloud browser with remote execution",
                 "env_vars": [
                     {"key": "FIRECRAWL_API_KEY", "prompt": "Firecrawl API key", "url": "https://firecrawl.dev"},
@@ -322,7 +349,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Camofox",
-                "tag": "Local anti-detection browser (Firefox/Camoufox)",
+                "badge": "free · local",
+                "tag": "Anti-detection browser (Firefox/Camoufox)",
                 "env_vars": [
                     {"key": "CAMOFOX_URL", "prompt": "Camofox server URL", "default": "http://localhost:9377",
                      "url": "https://github.com/jo-inc/camofox-browser"},
@@ -395,7 +423,7 @@ def _run_post_setup(post_setup_key: str):
             _print_warning("    Node.js not found - browser tools require: npm install (in hermes-agent directory)")
 
     elif post_setup_key == "camofox":
-        camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camoufox-browser"
+        camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser"
         if not camofox_dir.exists() and shutil.which("npm"):
             _print_info("    Installing Camofox browser server...")
             import subprocess
@@ -409,7 +437,7 @@ def _run_post_setup(post_setup_key: str):
                 _print_warning("    npm install failed - run manually: npm install")
         if camofox_dir.exists():
             _print_info("    Start the Camofox server:")
-            _print_info("      npx @askjo/camoufox-browser")
+            _print_info("      npx @askjo/camofox-browser")
             _print_info("    First run downloads the Camoufox engine (~300MB)")
             _print_info("    Or use Docker: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
         elif not shutil.which("npm"):
@@ -946,7 +974,8 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
         # Plain text labels only (no ANSI codes in menu items)
         provider_choices = []
         for p in providers:
-            tag = f" ({p['tag']})" if p.get("tag") else ""
+            badge = f" [{p['badge']}]" if p.get("badge") else ""
+            tag = f" — {p['tag']}" if p.get("tag") else ""
             configured = ""
             env_vars = p.get("env_vars", [])
             if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
@@ -956,7 +985,7 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
                     configured = ""
                 else:
                     configured = " [configured]"
-            provider_choices.append(f"{p['name']}{tag}{configured}")
+            provider_choices.append(f"{p['name']}{badge}{tag}{configured}")
 
         # Add skip option
         provider_choices.append("Skip — keep defaults / configure later")
@@ -1212,7 +1241,8 @@ def _configure_tool_category_for_reconfig(ts_key: str, cat: dict, config: dict):
 
         provider_choices = []
         for p in providers:
-            tag = f" ({p['tag']})" if p.get("tag") else ""
+            badge = f" [{p['badge']}]" if p.get("badge") else ""
+            tag = f" — {p['tag']}" if p.get("tag") else ""
             configured = ""
             env_vars = p.get("env_vars", [])
             if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
@@ -1222,7 +1252,7 @@ def _configure_tool_category_for_reconfig(ts_key: str, cat: dict, config: dict):
                     configured = ""
                 else:
                     configured = " [configured]"
-            provider_choices.append(f"{p['name']}{tag}{configured}")
+            provider_choices.append(f"{p['name']}{badge}{tag}{configured}")
 
         default_idx = _detect_active_provider_index(providers, config)
 

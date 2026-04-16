@@ -353,6 +353,7 @@ async def get_cos_credentials(
     filename: str = "file",
     file_id: Optional[str] = None,
     bot_id: str = "",
+    route_env: str = "",
 ) -> dict:
     """
     调用 genUploadInfo 接口获取 COS 临时密钥及上传配置。
@@ -393,6 +394,8 @@ async def get_cos_credentials(
         "X-ID": bot_id or app_key,
         "X-Source": "web",
     }
+    if route_env:
+        headers["X-Route-Env"] = route_env
     body = {
         "fileName": filename,
         "fileId": file_id,

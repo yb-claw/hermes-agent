@@ -16,7 +16,7 @@ model:
   #   "nous"         - Nous Portal OAuth (requires: hermes login)
   #   "nous-api"     - Nous Portal API key (requires: NOUS_API_KEY)
   #   "anthropic"    - Direct Anthropic API (requires: ANTHROPIC_API_KEY)
-  #   "openai-codex" - OpenAI Codex (requires: hermes login --provider openai-codex)
+  #   "openai-codex" - OpenAI Codex (requires: hermes auth)
   #   "copilot"      - GitHub Copilot / GitHub Models (requires: GITHUB_TOKEN)
   #   "gemini"      - Use Google AI Studio direct (requires: GOOGLE_API_KEY or GEMINI_API_KEY)
   #   "zai"         - Use z.ai / ZhipuAI GLM models (requires: GLM_API_KEY)
@@ -24,6 +24,9 @@ model:
   #   "minimax"      - MiniMax global (requires: MINIMAX_API_KEY)
   #   "minimax-cn"   - MiniMax China (requires: MINIMAX_CN_API_KEY)
   #   "huggingface"  - Hugging Face Inference (requires: HF_TOKEN)
+  #   "xiaomi"       - Xiaomi MiMo (requires: XIAOMI_API_KEY)
+  #   "arcee"        - Arcee AI Trinity models (requires: ARCEEAI_API_KEY)
+  #   "ollama-cloud" - Ollama Cloud (requires: OLLAMA_API_KEY — https://ollama.com/settings)
   #   "kilocode"     - KiloCode gateway (requires: KILOCODE_API_KEY)
   #   "ai-gateway"   - Vercel AI Gateway (requires: AI_GATEWAY_API_KEY)
   #
@@ -34,12 +37,6 @@ model:
   #     provider: "lmstudio"
   #     base_url: "http://localhost:1234/v1"
   #   No API key needed — local servers typically ignore auth.
-  #
-  #   For Ollama Cloud (https://ollama.com/pricing):
-  #     provider: "custom"
-  #     base_url: "https://ollama.com/v1"
-  #   Set OLLAMA_API_KEY in .env — automatically picked up when base_url
-  #   points to ollama.com.
   #
   # Can also be overridden with --provider flag or HERMES_INFERENCE_PROVIDER env var.
   provider: "auto"
@@ -342,6 +339,7 @@ compression:
 #   "openrouter" - Force OpenRouter (requires OPENROUTER_API_KEY)
 #   "nous"       - Force Nous Portal (requires: hermes login)
 #   "gemini"      - Force Google AI Studio direct (requires: GOOGLE_API_KEY or GEMINI_API_KEY)
+#   "ollama-cloud" - Ollama Cloud (requires: OLLAMA_API_KEY)
 #   "codex"       - Force Codex OAuth (requires: hermes model → Codex).
 #                  Uses gpt-5.3-codex which supports vision.
 #   "main"       - Use your custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY).
@@ -567,6 +565,18 @@ platform_toolsets:
   signal: [hermes-signal]
   homeassistant: [hermes-homeassistant]
   yuanbao: [hermes-telegram]  # Yuanbao uses the same toolset as other messaging platforms
+
+# =============================================================================
+# Gateway Platform Settings
+# =============================================================================
+# Optional per-platform messaging settings.
+# Platform-specific knobs live under `extra`.
+#
+# platforms:
+#   telegram:
+#     reply_to_mode: "first"  # off | first | all
+#     extra:
+#       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)
@@ -883,11 +893,11 @@ display:
 # Yuanbao (元宝 IM Bot) Platform Configuration
 # =============================================================================
 # Connect to Tencent Yuanbao IM Bot via WebSocket long-connection.
-# Required: YUANBAO_APP_KEY and YUANBAO_APP_SECRET in .env
+# Required: YUANBAO_APP_ID and YUANBAO_APP_SECRET in .env
 #           (or configure under platforms.yuanbao below)
 #
 # Environment variables (recommended — avoids storing secrets in this file):
-#   YUANBAO_APP_KEY         - App Key for sign-token API authentication
+#   YUANBAO_APP_ID          - App ID for sign-token API authentication
 #   YUANBAO_APP_SECRET      - App Secret for HMAC signing
 #   YUANBAO_BOT_ID          - Bot account ID (optional, returned by sign-token)
 #   YUANBAO_WS_GATEWAY_URL  - WebSocket gateway URL (e.g. wss://your-ws-gateway)
@@ -897,7 +907,7 @@ display:
 # platforms:
 #   yuanbao:
 #     enabled: true
-#     yuanbao_app_key: "your-app-key"           # App Key，用于签票接口鉴权
+#     yuanbao_app_id: "your-app-id"              # App ID，用于签票接口鉴权
 #     yuanbao_app_secret: "your-app-secret"     # App Secret，用于 HMAC 签名
 #     yuanbao_bot_id: "your-bot-id"             # Bot 账号 ID（可选，sign-token 接口会返回）
 #     yuanbao_ws_gateway_url: "wss://your-ws-gateway"  # WS 网关地址

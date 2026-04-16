@@ -154,11 +154,17 @@ class PlatformConfig:
     reply_to_mode: str = "first"
     
     # Yuanbao (元宝 IM Bot) platform-specific settings
-    yuanbao_app_key: Optional[str] = None         # App Key，用于签票接口鉴权
+    yuanbao_app_id: Optional[str] = None          # App ID（推荐），用于签票接口鉴权
+    yuanbao_app_key: Optional[str] = None         # App Key（兼容旧配置，等同 App ID）
     yuanbao_app_secret: Optional[str] = None      # App Secret，用于 HMAC 签名
     yuanbao_bot_id: Optional[str] = None          # Bot 账号 ID（可选，sign-token 接口会返回）
     yuanbao_ws_gateway_url: Optional[str] = None  # WS 网关地址（如 wss://xxx）
     yuanbao_sign_token_url: Optional[str] = None  # 签票接口地址（HTTP）
+    yuanbao_route_env: Optional[str] = None       # 内部路由环境标识（如测试/预发/生产）
+    yuanbao_dm_policy: Optional[str] = None       # DM 策略: open | allowlist | disabled
+    yuanbao_dm_allow_from: Optional[str] = None    # DM 白名单（逗号分隔 user_id）
+    yuanbao_group_policy: Optional[str] = None     # 群聊策略: open | allowlist | disabled
+    yuanbao_group_allow_from: Optional[str] = None # 群聊白名单（逗号分隔 group_code）
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -175,6 +181,8 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
+        if self.yuanbao_app_id:
+            result["yuanbao_app_id"] = self.yuanbao_app_id
         if self.yuanbao_app_key:
             result["yuanbao_app_key"] = self.yuanbao_app_key
         if self.yuanbao_app_secret:
@@ -185,6 +193,16 @@ class PlatformConfig:
             result["yuanbao_ws_gateway_url"] = self.yuanbao_ws_gateway_url
         if self.yuanbao_sign_token_url:
             result["yuanbao_sign_token_url"] = self.yuanbao_sign_token_url
+        if self.yuanbao_route_env:
+            result["yuanbao_route_env"] = self.yuanbao_route_env
+        if self.yuanbao_dm_policy:
+            result["yuanbao_dm_policy"] = self.yuanbao_dm_policy
+        if self.yuanbao_dm_allow_from:
+            result["yuanbao_dm_allow_from"] = self.yuanbao_dm_allow_from
+        if self.yuanbao_group_policy:
+            result["yuanbao_group_policy"] = self.yuanbao_group_policy
+        if self.yuanbao_group_allow_from:
+            result["yuanbao_group_allow_from"] = self.yuanbao_group_allow_from
         return result
     
     @classmethod
@@ -200,11 +218,17 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             extra=data.get("extra", {}),
+            yuanbao_app_id=data.get("yuanbao_app_id"),
             yuanbao_app_key=data.get("yuanbao_app_key"),
             yuanbao_app_secret=data.get("yuanbao_app_secret"),
             yuanbao_bot_id=data.get("yuanbao_bot_id"),
             yuanbao_ws_gateway_url=data.get("yuanbao_ws_gateway_url"),
             yuanbao_sign_token_url=data.get("yuanbao_sign_token_url"),
+            yuanbao_route_env=data.get("yuanbao_route_env"),
+            yuanbao_dm_policy=data.get("yuanbao_dm_policy"),
+            yuanbao_dm_allow_from=data.get("yuanbao_dm_allow_from"),
+            yuanbao_group_policy=data.get("yuanbao_group_policy"),
+            yuanbao_group_allow_from=data.get("yuanbao_group_allow_from"),
         )
 
 
@@ -570,6 +594,12 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if plat == Platform.DISCORD and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                if "channel_prompts" in platform_cfg:
+                    channel_prompts = platform_cfg["channel_prompts"]
+                    if isinstance(channel_prompts, dict):
+                        bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
+                    else:
+                        bridged["channel_prompts"] = channel_prompts
                 if not bridged:
                     continue
                 plat_data = platforms_data.setdefault(plat.value, {})
@@ -643,6 +673,18 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
                 if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
+                if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
+                    os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
+                if "disable_link_previews" in telegram_cfg:
+                    plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
+                    if not isinstance(plat_data, dict):
+                        plat_data = {}
+                        platforms_data[Platform.TELEGRAM.value] = plat_data
+                    extra = plat_data.setdefault("extra", {})
+                    if not isinstance(extra, dict):
+                        extra = {}
+                        plat_data["extra"] = extra
+                    extra["disable_link_previews"] = telegram_cfg["disable_link_previews"]
 
             whatsapp_cfg = yaml_cfg.get("whatsapp", {})
             if isinstance(whatsapp_cfg, dict):
@@ -1075,13 +1117,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
 
     # Yuanbao (元宝 IM Bot)
-    yuanbao_app_key = os.getenv("YUANBAO_APP_KEY")
+    # 优先读取 YUANBAO_APP_ID，兼容旧的 YUANBAO_APP_KEY
+    yuanbao_app_id = os.getenv("YUANBAO_APP_ID") or os.getenv("YUANBAO_APP_KEY")
     yuanbao_app_secret = os.getenv("YUANBAO_APP_SECRET")
-    if yuanbao_app_key and yuanbao_app_secret:
+    if yuanbao_app_id and yuanbao_app_secret:
         if Platform.YUANBAO not in config.platforms:
             config.platforms[Platform.YUANBAO] = PlatformConfig()
         config.platforms[Platform.YUANBAO].enabled = True
-        config.platforms[Platform.YUANBAO].yuanbao_app_key = yuanbao_app_key
+        config.platforms[Platform.YUANBAO].yuanbao_app_id = yuanbao_app_id
+        # 同时保留 app_key 以便兼容
+        config.platforms[Platform.YUANBAO].yuanbao_app_key = yuanbao_app_id
         config.platforms[Platform.YUANBAO].yuanbao_app_secret = yuanbao_app_secret
         yuanbao_bot_id = os.getenv("YUANBAO_BOT_ID")
         if yuanbao_bot_id:
@@ -1092,6 +1137,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_sign_token_url = os.getenv("YUANBAO_SIGN_TOKEN_URL")
         if yuanbao_sign_token_url:
             config.platforms[Platform.YUANBAO].yuanbao_sign_token_url = yuanbao_sign_token_url
+        yuanbao_route_env = os.getenv("YUANBAO_ROUTE_ENV")
+        if yuanbao_route_env:
+            config.platforms[Platform.YUANBAO].yuanbao_route_env = yuanbao_route_env
         yuanbao_home = os.getenv("YUANBAO_HOME_CHANNEL")
         if yuanbao_home:
             config.platforms[Platform.YUANBAO].home_channel = HomeChannel(
@@ -1099,6 +1147,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=yuanbao_home,
                 name=os.getenv("YUANBAO_HOME_CHANNEL_NAME", "Home"),
             )
+        yuanbao_dm_policy = os.getenv("YUANBAO_DM_POLICY")
+        if yuanbao_dm_policy:
+            config.platforms[Platform.YUANBAO].yuanbao_dm_policy = yuanbao_dm_policy.strip().lower()
+        yuanbao_dm_allow_from = os.getenv("YUANBAO_DM_ALLOW_FROM")
+        if yuanbao_dm_allow_from:
+            config.platforms[Platform.YUANBAO].yuanbao_dm_allow_from = yuanbao_dm_allow_from
+        yuanbao_group_policy = os.getenv("YUANBAO_GROUP_POLICY")
+        if yuanbao_group_policy:
+            config.platforms[Platform.YUANBAO].yuanbao_group_policy = yuanbao_group_policy.strip().lower()
+        yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
+        if yuanbao_group_allow_from:
+            config.platforms[Platform.YUANBAO].yuanbao_group_allow_from = yuanbao_group_allow_from
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
