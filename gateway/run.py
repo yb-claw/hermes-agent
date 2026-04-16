@@ -9234,15 +9234,15 @@ class GatewayRunner:
                         pass
 
                 return await self._run_agent(
-                    message=pending,
+                    message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
-                    source=source,
+                    source=next_source,
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
-                    channel_prompt=pending_event.channel_prompt,
+                    channel_prompt=pending_event.channel_prompt if pending_event else channel_prompt,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
