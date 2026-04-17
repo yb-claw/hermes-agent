@@ -147,19 +147,19 @@ AUTH_RETRYABLE_CODES = {4010, 4011, 4099}   # transient, can retry with same tok
 # Oldest entry is evicted when the limit is reached to prevent unbounded growth.
 _CHAT_DICT_MAX_SIZE = 1000
 
-# Reply Heartbeat 配置
-REPLY_HEARTBEAT_INTERVAL_S = 2.0   # 每 2 秒续发 RUNNING
-REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # 30 秒无活动自动停止
+# Reply Heartbeat configuration
+REPLY_HEARTBEAT_INTERVAL_S = 2.0   # Send RUNNING every 2 seconds
+REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # Auto-stop after 30 seconds of inactivity
 
-# Reply-to 引用配置
-REPLY_REF_TTL_S = 300.0            # 引用去重 TTL（5 分钟）
-_REPLY_REF_MAX_ENTRIES = 500       # 引用去重字典最大容量
+# Reply-to reference configuration
+REPLY_REF_TTL_S = 300.0            # Reference dedup TTL (5 minutes)
+_REPLY_REF_MAX_ENTRIES = 500       # Max capacity of reference dedup dict
 
-# 慢响应提示：agent 处理超过此时长（秒）未产出任何数据时，推送等待提示给用户
+# Slow-response hint: push a waiting message when agent produces no data for this duration (seconds)
 SLOW_RESPONSE_TIMEOUT_S = 120.0
-SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
+SLOW_RESPONSE_MESSAGE = "The task is a bit complex, working hard on it, please wait patiently..."
 
-# 占位符消息过滤（当无实际媒体内容时跳过这些纯占位符）
+# Placeholder message filter (skip these pure placeholders when no actual media content)
 _SKIPPABLE_PLACEHOLDERS = frozenset({
     "[image]", "[图片]", "[file]", "[文件]",
     "[video]", "[视频]", "[voice]", "[语音]",
@@ -190,7 +190,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
-    MAX_TEXT_CHUNK: int = 4000  # 元宝单条消息字符上限
+    MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
@@ -257,7 +257,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         ).strip().lower()
 
         # ------------------------------------------------------------------
-        # DM / Group 访问控制策略（平台层过滤，与 wecom.py 对齐）
+        # DM / Group access control policy (platform-level filter, aligned with wecom.py)
         # ------------------------------------------------------------------
         self._dm_policy: str = (
             config.yuanbao_dm_policy
@@ -477,14 +477,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     def _should_attach_reply_ref(self, inbound_msg_id: str) -> bool:
         """
-        判断是否应该为本次出站消息附加 refMsgId。
+        Determine whether to attach refMsgId to this outbound message.
 
-        规则：
-        - replyToMode='off' → 永不附加
-        - replyToMode='all' → 始终附加
-        - replyToMode='first'（默认）→ 同一入站消息只有首次回复附加
+        Rules:
+        - replyToMode='off' → never attach
+        - replyToMode='all' → always attach
+        - replyToMode='first' (default) → only attach for the first reply to the same inbound message
 
-        带 TTL 清理，防止内存泄漏。
+        With TTL cleanup to prevent memory leaks.
         """
         if self._reply_to_mode == "off":
             return False
@@ -495,13 +495,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         now = time.time()
 
-        # 清理过期条目
+        # Clean up expired entries
         if len(self._reply_ref_used) > _REPLY_REF_MAX_ENTRIES:
             expired = [k for k, ts in self._reply_ref_used.items() if now - ts > REPLY_REF_TTL_S]
             for k in expired:
                 self._reply_ref_used.pop(k, None)
 
-        # 检查是否已使用
+        # Check if already used
         if inbound_msg_id in self._reply_ref_used:
             return False
 
@@ -510,14 +510,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_self_reference(from_account: str, bot_id: Optional[str]) -> bool:
-        """检测是否是 bot 自己的消息（自引用）。"""
+        """Detect whether the message is from the bot itself (self-reference)."""
         if not from_account or not bot_id:
             return False
         return from_account == bot_id
 
     @staticmethod
     def _is_skippable_placeholder(text: str, media_count: int = 0) -> bool:
-        """检测是否为纯占位符消息（无实际内容时应跳过）。"""
+        """Detect whether the message is a pure placeholder (should be skipped when no actual content)."""
         if media_count > 0:
             return False
         stripped = text.strip()
@@ -526,9 +526,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
         """
-        从 cloud_custom_data 提取引用上下文，映射到 MessageEvent.reply_to_*。
+        Extract quote context from cloud_custom_data, mapping to MessageEvent.reply_to_*.
 
-        返回:
+        Returns:
           (reply_to_message_id, reply_to_text)
         """
         if not cloud_custom_data:
@@ -542,7 +542,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if not isinstance(quote, dict):
             return None, None
 
-        # type=2 对应图片引用，部分场景 desc 为空，给一个占位描述。
+        # type=2 corresponds to image reference; desc may be empty in some cases, provide a placeholder.
         quote_type = int(quote.get("type") or 0)
         desc = str(quote.get("desc") or "").strip()
         if quote_type == 2 and not desc:
@@ -558,9 +558,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
         """
-        从 TIM msg_body 提取入站图片/文件引用。
+        Extract inbound image/file references from TIM msg_body.
 
-        返回值示例：
+        Return example:
           [{"kind": "image", "url": "https://..."}, {"kind": "file", "url": "...", "name": "a.pdf"}]
         """
         refs: List[Dict[str, str]] = []
@@ -573,7 +573,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 continue
 
             if msg_type == "TIMImageElem":
-                # 与 openclaw 插件保持一致：优先中图（索引 1），否则回退索引 0。
+                # Align with openclaw plugin: prefer medium image (index 1), fallback to index 0.
                 image_info_array = content.get("image_info_array")
                 if not isinstance(image_info_array, list):
                     image_info_array = []
@@ -603,7 +603,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _guess_image_ext_from_url(url: str) -> str:
-        """根据 URL 路径猜测图片扩展名。"""
+        """Guess image extension from URL path."""
         path = urllib.parse.urlparse(url).path
         ext = os.path.splitext(path)[1].lower()
         if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}:
@@ -614,7 +614,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self, media_refs: List[Dict[str, str]]
     ) -> Tuple[List[str], List[str]]:
         """
-        解析入站图片/文件 URL（不落地本地缓存），返回 (media_urls, media_types)。
+        Parse inbound image/file URLs (no local caching), return (media_urls, media_types).
         """
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -631,7 +631,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 logger.warning("[%s] inbound media resolve failed: kind=%s url=%s err=%s", self.name, kind, url, exc)
                 continue
 
-            # 按资源类型推断 MIME，直接把 fetch_url 传给模型侧。
+            # Infer MIME by resource type, pass fetch_url directly to the model side.
             if kind == "image":
                 ext = self._guess_image_ext_from_url(fetch_url)
                 mime = guess_mime_type(f"image{ext}")
@@ -653,11 +653,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _resolve_inbound_download_url(self, url: str) -> str:
         """
-        将元宝资源占位下载链接解析为可直接拉取的真实 URL。
+        Resolve Yuanbao resource placeholder download link to a directly fetchable real URL.
 
-        元宝入站图片/文件常见 URL 形态：
+        Common URL patterns for Yuanbao inbound images/files:
           https://hunyuan.tencent.com/api/resource/download?resourceId=...
-        该地址直接 GET 会 401，需要调用业务接口：
+        Direct GET on this URL returns 401; need to call the business API:
           GET /api/resource/v1/download?resourceId=...
         """
         try:
@@ -691,7 +691,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             for attempt in range(2):
                 resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
                 if resp.status_code == 401 and attempt == 0:
-                    # token 过期时强制刷新一次后重试
+                    # Force refresh token once on expiry and retry
                     token_data = await force_refresh_sign_token(self._app_key, self._app_secret, self._api_domain)
                     token = str(token_data.get("token") or "").strip()
                     source = str(token_data.get("source") or source or "web").strip() or "web"
@@ -803,16 +803,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
-        发送文本消息，支持自动分片、per-chat-id 顺序保障。
+        Send text message with auto-chunking and per-chat-id ordering guarantee.
 
-        chat_id 格式：
-          - C2C:  "direct:{account_id}" 或直接 "{account_id}"（无前缀）
-          - 群聊: "group:{group_code}"
+        chat_id format:
+          - C2C:  "direct:{account_id}" or plain "{account_id}" (no prefix)
+          - Group: "group:{group_code}"
 
-        增强逻辑：
-          1. 获取或创建该 chat_id 的锁，保证同 chat_id 消息串行发送
-          2. 调用 truncate_message() 分片（保留代码块围栏完整性）
-          3. 逐片调用 _send_text_chunk() 发送（含重试），任一片失败立即停止
+        Enhanced logic:
+          1. Acquire or create a lock for the chat_id to ensure serial sending per chat_id
+          2. Call truncate_message() for chunking (preserving code fence integrity)
+          3. Send each chunk via _send_text_chunk() (with retry); stop immediately on any failure
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
@@ -834,7 +834,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 if not result.success:
                     return result
 
-        # 消息投递成功后发送 FINISH 心跳，保证时序：RUNNING → 消息到达 → FINISH
+        # Send FINISH heartbeat after message delivery to ensure ordering: RUNNING → message arrives → FINISH
         try:
             await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
         except Exception:
@@ -849,11 +849,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         retry: int = 3,
     ) -> SendResult:
         """
-        发送单个文本片段，带重试（指数退避：1s, 2s, 4s）。
+        Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s).
 
-        - 最多重试 retry 次
-        - 每次失败后等待 2^attempt 秒（0→1s, 1→2s, 2→4s）
-        - 返回最终结果
+        - Retry up to `retry` times
+        - Wait 2^attempt seconds after each failure (0→1s, 1→2s, 2→4s)
+        - Return the final result
         """
         last_error: str = "Unknown error"
         for attempt in range(retry):
@@ -890,7 +890,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
 
     async def _send_c2c_message(self, to_account: str, text: str) -> dict:
-        """发送 C2C 文本消息，返回 {success: bool, msg_key: str}。"""
+        """Send C2C text message, return {success: bool, msg_key: str}."""
         msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
         req_id = f"c2c_{next_seq_no()}"
         encoded = encode_send_c2c_message(
@@ -963,7 +963,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         text: str,
         reply_to: Optional[str] = None,
     ) -> dict:
-        """发送群聊文本消息，自动将 @nickname 转换为 TIMCustomElem。"""
+        """Send group text message, auto-converting @nickname to TIMCustomElem."""
         msg_body = self._build_msg_body_with_mentions(text, group_code)
         req_id = f"grp_{next_seq_no()}"
         encoded = encode_send_group_message(
@@ -988,12 +988,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         timeout: float = DEFAULT_SEND_TIMEOUT,
     ) -> dict:
         """
-        发送业务层请求并等待响应。
+        Send a business-layer request and wait for the response.
 
-        1. 注册 Future 到 self._pending_acks[req_id]
-        2. 发送 encoded_conn_msg（bytes）到 WS
+        1. Register a Future in self._pending_acks[req_id]
+        2. Send encoded_conn_msg (bytes) to WS
         3. asyncio.wait_for(future, timeout)
-        4. 超时/异常时清理 pending_acks
+        4. Clean up pending_acks on timeout/exception
         """
         if self._ws is None:
             raise RuntimeError("Not connected")
@@ -1190,16 +1190,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _receive_loop(self) -> None:
         """
-        接收循环：
-        1. 读取 WS 帧（raw bytes）
-        2. 调用 decode_conn_msg() 解码
-        3. 根据 cmd_type 分发：
-           - Response + "ping"      : HEARTBEAT_ACK，只记录 log
-           - Response (其他)       : RPC 响应，resolve pending_acks
-           - Push (cmd_type=2)     : 服务器推送，判断是入站消息还是 RPC 响应
-           - 其他                  : 忽略或 log
-        4. 每条 need_ack=True 的 Push 都回 PushAck
-        5. WS 断开时（ConnectionClosed）觧发 _reconnect_with_backoff()
+        Receive loop:
+        1. Read WS frame (raw bytes)
+        2. Decode via decode_conn_msg()
+        3. Dispatch by cmd_type:
+           - Response + "ping"      : HEARTBEAT_ACK, log only
+           - Response (other)       : RPC response, resolve pending_acks
+           - Push (cmd_type=2)     : Server push, determine if inbound message or RPC response
+           - Other                  : Ignore or log
+        4. Send PushAck for every Push with need_ack=True
+        5. Trigger _reconnect_with_backoff() on WS disconnect (ConnectionClosed)
         """
         try:
             async for raw in self._ws:  # type: ignore[union-attr]
@@ -1227,7 +1227,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             self._schedule_reconnect()
 
     async def _handle_frame(self, raw: bytes) -> None:
-        """处理单个 WebSocket 帧。"""
+        """Handle a single WebSocket frame."""
         try:
             msg = decode_conn_msg(raw)
         except Exception as exc:
@@ -1312,11 +1312,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     def _is_at_bot(self, msg_body: list) -> bool:
         """
-        检测消息是否 @Bot。
+        Detect whether the message @Bot.
 
-        AT 元素格式：TIMCustomElem，msg_content.data 是 JSON 字符串：
+        AT element format: TIMCustomElem, msg_content.data is a JSON string:
             {"elem_type": 1002, "text": "@xxx", "user_id": "<botId>"}
-        elem_type == 1002 且 user_id == self._bot_id 时视为 @Bot。
+        Considered @Bot when elem_type == 1002 and user_id == self._bot_id.
         """
         if not self._bot_id:
             return False
@@ -1344,52 +1344,52 @@ class YuanbaoAdapter(BasePlatformAdapter):
         from_account: str,
     ) -> Tuple[Optional[str], Optional[str], bool]:
         """
-        识别"群内白名单斜杠命令"并判定发送者身份。
+        Identify "in-group allowlisted slash commands" and determine sender identity.
 
-        匹配条件（全部满足才视为白名单命令）:
-          - 群聊 (chat_type == "group")
-          - msg_body 去除所有 TIMCustomElem（如 @Bot AT 元素）后，剩下
-            必须是单个 TIMTextElem（即除 AT 外只剩一段纯文本）
-          - 该文本首 token 命中 allowlist
+        Match conditions (all must be met to be considered an allowlisted command):
+          - Group chat (chat_type == "group")
+          - After removing all TIMCustomElem (e.g. @Bot AT elements) from msg_body,
+              there must be exactly one TIMTextElem (i.e. only one plain text segment besides AT)
+          - The first token of that text matches the allowlist
 
-        返回 (cmd, cmd_line, is_owner):
-          - (None, None, False): 非白名单命令，调用方走正常消息分派流程
-          - (cmd,  cmd_line, True):  owner 命中，调用方应跳过 @Bot 检测，
-            并将 event.text 置为 cmd_line（避免 @Bot 前缀干扰命令识别）
-          - (cmd,  cmd_line, False): 白名单命令但发送者非 owner，调用方应拒绝
+        Returns (cmd, cmd_line, is_owner):
+          - (None, None, False): Not an allowlisted command; caller proceeds with normal message dispatch
+          - (cmd,  cmd_line, True):  Owner match; caller should skip @Bot detection,
+              and set event.text to cmd_line (to avoid @Bot prefix interfering with command recognition)
+          - (cmd,  cmd_line, False): Allowlisted command but sender is not owner; caller should reject
 
-        其中 `cmd` 是首 token（如 `"/new"`），`cmd_line` 是规范化后的
-        完整命令行文本（含参数，如 `"/queue 分析一下日志"`）。
+        Where `cmd` is the first token (e.g. `"/new"`), `cmd_line` is the normalized
+        full command line text (with arguments, e.g. `"/queue analyze the logs"`).
 
-        Owner 身份判断依据：push.bot_owner_id == from_account。
-        bot_owner_id 由腾讯 IM 后端在每条下行消息中注入；为空时视为非 owner。
+        Owner identity is determined by: push.bot_owner_id == from_account.
+        bot_owner_id is injected by Tencent IM backend in each downstream message; empty means non-owner.
 
-        注：命令识别在 GatewayRunner._handle_message 里走 event.get_command()
-        基于 event.text；owner 场景下须把 event.text 换成本函数返回的 cmd_line，
-        否则 event.text 仍是 "@Bot /new" 之类含 AT 前缀的串，命令识别会失败。
+        Note: Command recognition in GatewayRunner._handle_message uses event.get_command()
+        based on event.text; in owner scenarios, event.text must be replaced with cmd_line from this function,
+        otherwise event.text remains something like "@Bot /new" with AT prefix, causing command recognition to fail.
         """
-        # Bot owner 可在群内不 @Bot 直接执行的斜杠命令白名单（增减改这里）
+        # Slash command allowlist that bot owner can execute in group without @Bot (modify here)
         allowlist = frozenset({
-            "/new",         # 开始新会话
-            "/reset",       # /new 别名
-            "/retry",       # 重试上一条消息
-            "/undo",        # 删除上一轮用户/助手对话
-            "/stop",        # 杀掉所有正在运行的后台进程
-            "/approve",     # 批准待处理的危险命令
-            "/deny",        # 拒绝待处理的危险命令
-            "/background",  # 在后台运行一个提示
-            "/bg",          # /background 别名
-            "/btw",         # 基于当前会话上下文的临时侧问
-            "/queue",       # 将提示加入下一轮队列
-            "/q",           # /queue 别名
+            "/new",         # Start new session
+            "/reset",       # Alias for /new
+            "/retry",       # Retry last message
+            "/undo",        # Delete last user/assistant turn
+            "/stop",        # Kill all running background processes
+            "/approve",     # Approve pending dangerous command
+            "/deny",        # Deny pending dangerous command
+            "/background",  # Run a prompt in background
+            "/bg",          # Alias for /background
+            "/btw",         # Temporary side question based on current session context
+            "/queue",       # Queue a prompt for next turn
+            "/q",           # Alias for /queue
         })
 
         if chat_type != "group" or not allowlist:
             return None, None, False
 
-        # 提取 msg_body 中的 TIMTextElem：仅当恰好只有一段文本时才做命令识别。
-        # 其他类型（AT / 图片 / 表情等）不影响——避免 _extract_text 把 AT 拼
-        # 成 "@xxx /new" 干扰命令识别。
+        # Extract TIMTextElem from msg_body: only do command recognition when there is exactly one text segment.
+        # Other types (AT / image / emoji etc.) are ignored — to prevent _extract_text from concatenating AT
+        # into "@xxx /new" which would interfere with command recognition.
         text_elems = [
             e for e in (msg_body or [])
             if e.get("msg_type") == "TIMTextElem"
@@ -1398,14 +1398,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return None, None, False
 
         text = (text_elems[0].get("msg_content") or {}).get("text", "")
-        cmd_line = self._rewrite_slash_command(text)  # 规范化全角斜杠 + strip
+        cmd_line = self._rewrite_slash_command(text)  # Normalize full-width slash + strip
         if not cmd_line.startswith("/"):
             return None, None, False
         cmd = cmd_line.split(maxsplit=1)[0].lower()
         if cmd not in allowlist:
             return None, None, False
 
-        # 发送者身份校验：bot owner ⇔ push.from_account == push.bot_owner_id
+        # Sender identity check: bot owner ⇔ push.from_account == push.bot_owner_id
         owner_id = (push or {}).get("bot_owner_id") or ""
         is_owner = bool(owner_id) and owner_id == from_account
 
@@ -1456,13 +1456,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to observe group message: %s", self.name, exc)
 
     # ------------------------------------------------------------------
-    # Reply Heartbeat 状态机
+    # Reply Heartbeat state machine
     # ------------------------------------------------------------------
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
         """
-        发送"正在输入"状态心跳（RUNNING），best effort，不抛错。
-        由 base 类的 _keep_typing 循环周期调用，委托给 Reply Heartbeat 状态机。
+        Send "typing" status heartbeat (RUNNING), best effort, no exception raised.
+        Called periodically by the base class _keep_typing loop, delegated to the Reply Heartbeat state machine.
         """
         try:
             await self._start_reply_heartbeat(chat_id)
@@ -1471,14 +1471,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def stop_typing(self, chat_id: str) -> None:
         """
-        停止 RUNNING 心跳循环，但不立即发送 FINISH。
+        Stop the RUNNING heartbeat loop without sending FINISH immediately.
 
-        FINISH 由 send() 在消息实际投递后发送，以确保时序正确：
-        RUNNING... → 消息到达 → FINISH。
+        FINISH is sent by send() after actual message delivery to ensure correct ordering:
+        RUNNING... → message arrives → FINISH.
 
-        gateway/run.py 的 _message_handler 在拿到 agent 结果后、返回 response
-        文本之前就会调用 stop_typing()，此时消息尚未通过 WS 发出，所以这里
-        只停止 RUNNING 循环，FINISH 延迟到 send() 完成后发送。
+        gateway/run.py's _message_handler calls stop_typing() after getting the agent result
+        but before returning the response text; at this point the message hasn't been sent via WS yet,
+        so we only stop the RUNNING loop here; FINISH is deferred until send() completes.
         """
         try:
             await self._stop_reply_heartbeat(chat_id, send_finish=False)
@@ -1496,10 +1496,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _start_reply_heartbeat(self, chat_id: str) -> None:
         """
-        启动或续期 Reply Heartbeat 定时续发（RUNNING，每 2s 一次）。
+        Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s).
 
-        如果该 chat_id 已有活跃的 heartbeat task，则仅刷新时间戳（不重复启动）。
-        30 秒无续期调用时自动停止（发送 FINISH）。
+        If the chat_id already has an active heartbeat task, only refresh the timestamp (no duplicate start).
+        Auto-stop (send FINISH) after 30 seconds without renewal.
         """
         if self._ws is None or not self._bot_id:
             return
@@ -1519,11 +1519,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _reply_heartbeat_worker(self, chat_id: str) -> None:
         """
-        后台协程：每 2 秒发送一次 RUNNING 心跳。
-        30 秒无续期 → 发送 FINISH 并退出。
+        Background coroutine: send RUNNING heartbeat every 2 seconds.
+        30 seconds without renewal → send FINISH and exit.
         """
         try:
-            # 立即发一次 RUNNING
+            # Send RUNNING immediately
             await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
 
             while True:
@@ -1555,11 +1555,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
         """
-        停止 Reply Heartbeat 并可选发送 FINISH。
+        Stop Reply Heartbeat and optionally send FINISH.
 
         Args:
-            send_finish: True 时取消 worker 后立即发 FINISH；
-                         False 时仅取消 worker，FINISH 由调用方负责。
+            send_finish: When True, send FINISH immediately after cancelling the worker;
+                         When False, only cancel the worker; FINISH is the caller's responsibility.
         """
         task = self._reply_heartbeat_tasks.pop(chat_id, None)
         if task and not task.done():
@@ -1575,7 +1575,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 pass
 
     async def _send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
-        """发送单次心跳（RUNNING 或 FINISH），best effort。"""
+        """Send a single heartbeat (RUNNING or FINISH), best effort."""
         if self._ws is None or not self._bot_id:
             return
         try:
@@ -1603,7 +1603,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.debug("[%s] _send_heartbeat_once failed: %s", self.name, exc)
 
     # ------------------------------------------------------------------
-    # Slow-response notifier (超时未回复提示)
+    # Slow-response notifier (timeout without reply hint)
     # ------------------------------------------------------------------
 
     async def _start_slow_response_notifier(self, chat_id: str) -> None:
@@ -1636,15 +1636,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
             task.cancel()
 
     # ------------------------------------------------------------------
-    # 群查询方法
+    # Group query methods
     # ------------------------------------------------------------------
 
     async def query_group_info(self, group_code: str) -> Optional[dict]:
         """
-        查询群信息（群名、群主、成员数等）。
+        Query group info (group name, owner, member count, etc.).
 
         Args:
-            group_code: 群号
+            group_code: Group code
 
         Returns:
             {
@@ -1654,7 +1654,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
               "member_count": int,
               "max_member": int,
             }
-            或 None（查询失败）
+            or None (query failed)
         """
         if self._ws is None:
             return None
@@ -1664,19 +1664,19 @@ class YuanbaoAdapter(BasePlatformAdapter):
         req_id = decoded["head"]["msg_id"]
         try:
             response = await self._send_biz_request(encoded, req_id=req_id)
-            # response 来自 _handle_frame，对于 RPC Response 返回的是 {"head": head}
-            # 但对于 Push 响应，返回的是 decoded push
-            # 对于群查询这种 RPC，我们需要从 conn_data 中解码
-            # 实际上 _send_biz_request 返回的 response 对于 Response cmd_type 是 {"head": head}
-            # 群查询的响应 data 需要从原始帧中获取
-            # 由于当前 _handle_frame 对 Response 只返回 head，群查询需要改进
-            # 暂时返回 response head 表示成功
+            # response comes from _handle_frame; for RPC Response it returns {"head": head}
+            # but for Push responses, it returns the decoded push
+            # For group query RPCs, we need to decode from conn_data
+            # Actually _send_biz_request returns {"head": head} for Response cmd_type
+            # Group query response data needs to be obtained from the raw frame
+            # Since _handle_frame currently only returns head for Response, group query needs improvement
+            # Temporarily return response head to indicate success
             head = response.get("head", {})
             status = head.get("status", 0)
             if status != 0:
                 logger.warning("[%s] query_group_info failed: status=%d", self.name, status)
                 return None
-            # 如果 response 中有 body/data（来自 biz 层），解码它
+            # If response contains body/data (from biz layer), decode it
             biz_data = response.get("data", b"") or response.get("body", b"")
             if biz_data and isinstance(biz_data, bytes):
                 return decode_query_group_info_rsp(biz_data)
@@ -1692,12 +1692,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self, group_code: str, offset: int = 0, limit: int = 200
     ) -> Optional[dict]:
         """
-        查询群成员列表。
+        Query group member list.
 
         Args:
-            group_code: 群号
-            offset: 分页偏移
-            limit: 分页大小
+            group_code: Group code
+            offset: Pagination offset
+            limit: Page size
 
         Returns:
             {
@@ -1705,7 +1705,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
               "next_offset": int,
               "is_complete": bool,
             }
-            或 None（查询失败）
+            or None (query failed)
         """
         if self._ws is None:
             return None
@@ -1737,18 +1737,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     def _push_to_inbound(self, conn_data: bytes) -> None:
         """
-        将推送帧转换为 MessageEvent 并分发给 AI 处理。
+        Convert push frame to MessageEvent and dispatch to AI for processing.
 
-        conn_data 在元宝场景下只有两种形态：
-          - JSON 字符串：callback_command 格式的入站消息（主流）
-          - Protobuf 二进制：InboundMessagePush
+        conn_data in Yuanbao scenario has only two forms:
+          - JSON string: callback_command format inbound message (mainstream)
+          - Protobuf binary: InboundMessagePush
 
-        先试 JSON，失败再当 protobuf 解。JSON 优先是为了避免把 JSON 的 ASCII
-        bytes 喂给 protobuf 解析器解出"看似合法"的垃圾字段。
+        Try JSON first, fall back to protobuf on failure. JSON-first avoids feeding JSON ASCII
+        bytes to the protobuf parser which may produce "seemingly valid" garbage fields.
 
-        注：元宝下发入站消息的 callback_command 常为 "C2C.CallbackAfterSendMsg" /
-        "Group.CallbackAfterSendMsg"——"AfterSendMsg" 字面误导，实际就是入站消息
-        （非 bot 发送回显），不要过滤。
+        Note: Yuanbao's inbound message callback_command is usually "C2C.CallbackAfterSendMsg" /
+        "Group.CallbackAfterSendMsg" — "AfterSendMsg" is misleading; it's actually an inbound message
+        (not a bot send echo); do not filter it.
         """
         push = None
         decoded_via = ""  # "json" | "protobuf"
@@ -1820,7 +1820,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_type = "dm"
             chat_name = sender_nickname or from_account
 
-        # ---- 平台层访问控制过滤 ----
+        # ---- Platform-level access control filter ----
         if chat_type == "dm":
             if not self._is_dm_allowed(from_account):
                 logger.debug(
@@ -1845,11 +1845,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
-        # Bot owner 白名单命令快速路径。
-        # - owner 命中：跳过 @Bot 检测，把 raw_text 置为纯净命令文本
-        #   （去掉 AT 前缀），让下游 event.get_command() 能正确识别
-        # - 非 owner 命中：发送拒绝提示后 return
-        # - 未命中：走正常消息分派
+        # Bot owner allowlisted command fast path.
+        # - Owner match: skip @Bot detection, set raw_text to clean command text
+        #   (strip AT prefix) so downstream event.get_command() can recognize correctly
+        # - Non-owner match: send rejection message and return
+        # - No match: proceed with normal message dispatch
         matched_cmd, cmd_line, is_owner = self._detect_owner_command(
             push=push,
             msg_body=msg_body,
@@ -1859,14 +1859,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
         )
         if matched_cmd and not is_owner:
             self._track_task(asyncio.create_task(
-                self.send(chat_id, f"⚠️ {matched_cmd} 仅限创建者并且在私聊模式下使用哦~"),
+                self.send(chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
                 name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
             ))
             return
         owner_command: Optional[str] = None
         if matched_cmd and is_owner and cmd_line:
             owner_command = matched_cmd
-            raw_text = cmd_line  # 用纯净命令文本覆盖，去掉 AT 前缀
+            raw_text = cmd_line  # Override with clean command text, strip AT prefix
 
         source = self.build_source(
             chat_id=chat_id,
@@ -1882,7 +1882,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         )
 
         # ---- Group chat: observe non-@bot messages, reply only on @Bot ----
-        # Owner 命令跳过 @Bot 检测（不要求 owner @Bot）。
+        # Owner commands skip @Bot detection (owner doesn't need to @Bot).
         if chat_type == "group" and not owner_command and not self._is_at_bot(msg_body):
             self._observe_group_message(source, sender_nickname or from_account, raw_text)
             logger.info(
@@ -1921,15 +1921,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     def _extract_text(self, msg_body: list) -> str:
         """
-        从 MsgBody 提取纯文本内容。
-        - TIMTextElem      → 提取 text 字段
-        - TIMImageElem     → "[图片]"
-        - TIMFileElem      → "[文件: {filename}]"
-        - TIMSoundElem     → "[语音]"
-        - TIMVideoFileElem → "[视频]"
-        - TIMFaceElem      → "[表情: {name}]" 或 "[表情]"
-        - TIMCustomElem    → 尝试提取 data 字段，否则 "[自定义消息]"
-        - 多个 elem 用空格拼接
+        Extract plain text content from MsgBody.
+        - TIMTextElem      → extract text field
+        - TIMImageElem     → "[image]"
+        - TIMFileElem      → "[file: {filename}]"
+        - TIMSoundElem     → "[voice]"
+        - TIMVideoFileElem → "[video]"
+        - TIMFaceElem      → "[emoji: {name}]" or "[emoji]"
+        - TIMCustomElem    → try to extract data field, otherwise "[custom message]"
+        - Multiple elems joined with spaces
         """
         parts: list[str] = []
         for elem in msg_body:
@@ -1941,29 +1941,29 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 if text:
                     parts.append(text)
             elif elem_type == "TIMImageElem":
-                parts.append("[图片]")
+                parts.append("[image]")
             elif elem_type == "TIMFileElem":
                 filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
-                parts.append(f"[文件: {filename}]" if filename else "[文件]")
+                parts.append(f"[file: {filename}]" if filename else "[file]")
             elif elem_type == "TIMSoundElem":
-                parts.append("[语音]")
+                parts.append("[voice]")
             elif elem_type == "TIMVideoFileElem":
-                parts.append("[视频]")
+                parts.append("[video]")
             elif elem_type == "TIMCustomElem":
                 data_val = content.get("data", "")
                 if data_val:
                     try:
                         custom = json.loads(data_val)
                         if isinstance(custom, dict) and custom.get("elem_type") == 1002:
-                            parts.append(custom.get("text", "[提及]"))
+                            parts.append(custom.get("text", "[mention]"))
                         else:
-                            parts.append("[当前消息暂不支持查看]")
+                            parts.append("[unsupported message type]")
                     except (json.JSONDecodeError, TypeError):
                         parts.append(data_val)
                 else:
-                    parts.append("[当前消息暂不支持查看]")
+                    parts.append("[unsupported message type]")
             elif elem_type == "TIMFaceElem":
-                # 贴纸/表情：从 data JSON 中提取 name
+                # Sticker/emoji: extract name from data JSON
                 raw_data = content.get("data", "")
                 face_name = ""
                 if raw_data:
@@ -1972,7 +1972,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                         face_name = (face_data.get("name") or "").strip()
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         pass
-                parts.append(f"[表情: {face_name}]" if face_name else "[表情]")
+                parts.append(f"[emoji: {face_name}]" if face_name else "[emoji]")
             elif elem_type:
                 # Unknown element type — include type as placeholder
                 parts.append(f"[{elem_type}]")
@@ -1986,7 +1986,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         input method) to ASCII slash so commands are recognized correctly.
         """
         text = text.strip()
-        if text.startswith('\uff0f'):  # 全角斜杠
+        if text.startswith('\uff0f'):  # Full-width slash
             text = '/' + text[1:]
         return text
 
@@ -2008,18 +2008,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return MessageType.TEXT
 
     # ------------------------------------------------------------------
-    # DM 主动私聊 + 访问控制
+    # DM active private chat + access control
     # ------------------------------------------------------------------
 
-    DM_MAX_CHARS = 10000  # DM 文本上限
+    DM_MAX_CHARS = 10000  # DM text limit
 
     async def send_dm(self, user_id: str, text: str) -> SendResult:
         """
-        主动发起 C2C 私聊消息。
+        Actively send C2C private chat message.
 
         Args:
-            user_id: 目标用户 ID
-            text: 消息文本（上限 10000 字符）
+            user_id: Target user ID
+            text: Message text (limit 10000 characters)
 
         Returns:
             SendResult
@@ -2027,12 +2027,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if not self._resolve_dm_access(user_id):
             return SendResult(success=False, error="DM access denied for this user")
         if len(text) > self.DM_MAX_CHARS:
-            text = text[:self.DM_MAX_CHARS] + "\n...(已截断)"
+            text = text[:self.DM_MAX_CHARS] + "\n...(truncated)"
         chat_id = f"direct:{user_id}"
         return await self.send(chat_id, text)
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
-        """平台层 DM 入站过滤（open / allowlist / disabled）。"""
+        """Platform-level DM inbound filter (open / allowlist / disabled)."""
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
@@ -2040,7 +2040,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return True
 
     def _is_group_allowed(self, group_code: str) -> bool:
-        """平台层群聊入站过滤（open / allowlist / disabled）。"""
+        """Platform-level group chat inbound filter (open / allowlist / disabled)."""
         if self._group_policy == "disabled":
             return False
         if self._group_policy == "allowlist":
@@ -2048,26 +2048,26 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return True
 
     def _resolve_dm_access(self, user_id: str) -> bool:
-        """主动 DM 发送授权，复用 _is_dm_allowed()。"""
+        """Active DM send authorization, reusing _is_dm_allowed()."""
         return self._is_dm_allowed(user_id)
 
     # ------------------------------------------------------------------
-    # Agent 工具方法（可注册为 AI toolset）
+    # Agent tool methods (can be registered as AI toolset)
     # ------------------------------------------------------------------
 
     async def tool_query_group_info(self, chat_id: str) -> dict:
         """
-        AI 工具: 查询当前群信息。
+        AI tool: Query current group info.
 
-        无需参数（从 session context 提取 group_code）。
-        返回群名、群主、成员数等。
+        No parameters needed (group_code extracted from session context).
+        Returns group name, owner, member count, etc.
         """
         if not chat_id.startswith("group:"):
-            return {"error": "此命令仅在群聊中可用"}
+            return {"error": "This command is only available in group chats"}
         group_code = chat_id[len("group:"):]
         result = await self.query_group_info(group_code)
         if result is None:
-            return {"error": "查询群信息失败"}
+            return {"error": "Failed to query group info"}
         return result
 
     async def tool_query_session_members(
@@ -2077,22 +2077,22 @@ class YuanbaoAdapter(BasePlatformAdapter):
         name: Optional[str] = None,
     ) -> dict:
         """
-        AI 工具: 查询群成员列表。
+        AI tool: Query group member list.
 
         Args:
-            chat_id: 聊天 ID（从 session context 提取）
-            action: 'find'（按名称查找）| 'list_bots'（列出机器人）| 'list_all'（列出全部）
-            name: 当 action='find' 时的搜索关键词
+            chat_id: Chat ID (extracted from session context)
+            action: 'find' (search by name) | 'list_bots' (list bots) | 'list_all' (list all)
+            name: Search keyword when action='find'
 
         Returns:
             {"members": [...], "total": int, "mentionHint": str}
         """
         if not chat_id.startswith("group:"):
-            return {"error": "此命令仅在群聊中可用"}
+            return {"error": "This command is only available in group chats"}
         group_code = chat_id[len("group:"):]
         result = await self.get_group_member_list(group_code)
         if result is None:
-            return {"error": "查询群成员失败"}
+            return {"error": "Failed to query group members"}
 
         members = result.get("members", [])
 
@@ -2105,18 +2105,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 or query in (m.get("user_id", "") or "").lower()
             ]
         elif action == "list_bots":
-            # 机器人通常 role=0 且 user_id 看起来像 bot ID
-            # 这里简单过滤，实际场景可能需要更精确的判断
+            # Bots typically have role=0 and user_id looks like a bot ID
+            # Simple filter here; real scenarios may need more precise detection
             members = [m for m in members if "bot" in (m.get("nickname", "") or "").lower()]
 
-        # 构造 mentionHint
+        # Construct mentionHint
         mention_hint = ""
         if members and len(members) <= 10:
             names = [m.get("name_card") or m.get("nickname") or m.get("user_id", "") for m in members]
-            mention_hint = "可用 @名称 提及: " + ", ".join(names)
+            mention_hint = "Mention with @name: " + ", ".join(names)
 
         return {
-            "members": members[:50],  # 限制返回数量
+            "members": members[:50],  # Limit return count
             "total": len(members),
             "mentionHint": mention_hint,
         }
@@ -2127,14 +2127,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _generate_trace_id() -> str:
-        """生成分布式追踪 ID（32 位 hex）。"""
+        """Generate distributed trace ID (32-char hex)."""
         return uuid.uuid4().hex
 
     @staticmethod
     def _build_traceparent(trace_id: str, span_id: Optional[str] = None) -> str:
         """
-        构造 W3C traceparent 头（简化版）。
-        格式：00-{trace_id}-{span_id}-01
+        Build W3C traceparent header (simplified).
+        Format: 00-{trace_id}-{span_id}-01
         """
         if not span_id:
             span_id = uuid.uuid4().hex[:16]
@@ -2143,27 +2143,27 @@ class YuanbaoAdapter(BasePlatformAdapter):
     @staticmethod
     def _markdown_hint_system_prompt() -> str:
         """
-        Markdown 渲染提示（追加到 system prompt）。
+        Markdown rendering hint (appended to system prompt).
 
-        告诉 AI 元宝平台支持 Markdown 渲染，可以使用：
-        - 代码块（```lang）
-        - 表格（| col | col |）
-        - 加粗/斜体
+        Tell AI that Yuanbao platform supports Markdown rendering, including:
+        - Code blocks (```lang)
+        - Tables (| col | col |)
+        - Bold/italic
         """
         return (
-            "当前平台支持 Markdown 渲染。你可以使用以下格式：\n"
-            "- 代码块：```语言名\\n代码\\n```\n"
-            "- 表格：| 列1 | 列2 |\\n|---|---|\\n| 值1 | 值2 |\n"
-            "- 加粗：**文本** / 斜体：*文本*\n"
-            "请在适当时候使用 Markdown 格式化输出，提升可读性。"
+            "The current platform supports Markdown rendering. You can use the following formats:\n"
+            "- Code blocks: ```language\\ncode\\n```\n"
+            "- Tables: | col1 | col2 |\\n|---|---|\\n| val1 | val2 |\n"
+            "- Bold: **text** / Italic: *text*\n"
+            "Please use Markdown formatting when appropriate to improve readability."
         )
 
     @staticmethod
     def _msg_body_desensitize(msg_body: list) -> list:
         """
-        消息体脱敏（日志用）。
+        Sanitize message body (for logging).
 
-        对 TIMTextElem 截断长文本，对 TIMImageElem 替换 URL。
+        Truncate long text in TIMTextElem, replace URLs in TIMImageElem.
         """
         result = []
         for elem in msg_body:
@@ -2194,17 +2194,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
         file_bytes: Optional[bytes], filename: str, max_size_mb: int = MEDIA_MAX_SIZE_MB
     ) -> Optional[str]:
         """
-        媒体前置校验：发送/上传前检查文件有效性。
+        Media pre-validation: check file validity before sending/uploading.
 
         Returns:
-            错误描述（str）如果校验失败，否则 None。
+            Error description (str) if validation fails, otherwise None.
         """
         if file_bytes is None or len(file_bytes) == 0:
-            return f"空文件: {filename}"
+            return f"Empty file: {filename}"
         max_bytes = max_size_mb * 1024 * 1024
         if len(file_bytes) > max_bytes:
             size_mb = len(file_bytes) / 1024 / 1024
-            return f"文件过大: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
+            return f"File too large: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
         return None
 
     # ------------------------------------------------------------------
@@ -2221,16 +2221,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         """
-        发送图片消息。
+        Send image message.
 
-        流程：
-          1. 下载图片 URL 内容（httpx）
-          2. 调用 genUploadInfo 获取 COS 临时凭证
-          3. PUT 上传到 COS
-          4. 构造 TIMImageElem 消息体，通过 WS 发送
+        Flow:
+          1. Download image URL content (httpx)
+          2. Call genUploadInfo to get COS temporary credentials
+          3. PUT upload to COS
+          4. Build TIMImageElem message body, send via WS
 
-        若 image_url 已是 COS 公网 URL（cos.*myqcloud.com 或 file.myqcloud.com），
-        则跳过重复上传，直接用其构造消息体。
+        If image_url is already a COS public URL (cos.*myqcloud.com or file.myqcloud.com),
+        skip re-uploading and use it directly to build the message body.
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
@@ -2238,7 +2238,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._cancel_slow_response_notifier(chat_id)
 
         try:
-            # 1. 下载图片
+            # 1. Download image
             logger.info("[%s] send_image: downloading %s", self.name, image_url)
             file_bytes, content_type = await media_download_url(image_url, max_size_mb=self.MEDIA_MAX_SIZE_MB)
 
@@ -2254,7 +2254,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             file_uuid = md5_hex(file_bytes)
 
-            # 2. 获取 COS 上传凭证
+            # 2. Get COS upload credentials
             token_data = await self._get_cached_token()
             token: str = token_data.get("token", "")
             bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
@@ -2268,7 +2268,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 route_env=self._route_env,
             )
 
-            # 3. 上传到 COS
+            # 3. Upload to COS
             upload_result = await upload_to_cos(
                 file_bytes=file_bytes,
                 filename=filename,
@@ -2278,7 +2278,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 region=credentials["region"],
             )
 
-            # 4. 构造 TIMImageElem 消息体
+            # 4. Build TIMImageElem message body
             msg_body = build_image_msg_body(
                 url=upload_result["url"],
                 uuid=file_uuid,
@@ -2289,13 +2289,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 mime_type=content_type,
             )
 
-            # 5. 若有 caption，追加文字消息体
+            # 5. If caption exists, append text message body
             if caption:
                 msg_body.append(
                     {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
                 )
 
-            # 6. 发送
+            # 6. Send
             async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
@@ -2322,11 +2322,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         """
-        发送本地图片文件。
+        Send local image file.
 
-        与 send_image() 类似，但接收本地路径而非 URL，直接读取文件字节，
-        跳过 HTTP 下载步骤，直接走 COS 上传 → TIMImageElem 流程。
-        参考 send_document() 的本地文件读取逻辑。
+        Similar to send_image(), but accepts a local path instead of URL, reads file bytes directly,
+        skipping the HTTP download step, going directly to COS upload → TIMImageElem flow.
+        Refer to send_document()'s local file reading logic.
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
@@ -2334,7 +2334,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._cancel_slow_response_notifier(chat_id)
 
         try:
-            # 1. 读取本地文件
+            # 1. Read local file
             if not os.path.isfile(image_path):
                 return SendResult(success=False, error=f"File not found: {image_path}")
 
@@ -2351,7 +2351,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             content_type = guess_mime_type(filename) or "image/jpeg"
             file_uuid = md5_hex(file_bytes)
 
-            # 2. 获取 COS 上传凭证
+            # 2. Get COS upload credentials
             token_data = await self._get_cached_token()
             token: str = token_data.get("token", "")
             bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
@@ -2365,7 +2365,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 route_env=self._route_env,
             )
 
-            # 3. 上传到 COS
+            # 3. Upload to COS
             upload_result = await upload_to_cos(
                 file_bytes=file_bytes,
                 filename=filename,
@@ -2375,7 +2375,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 region=credentials["region"],
             )
 
-            # 4. 构造 TIMImageElem 消息体
+            # 4. Build TIMImageElem message body
             msg_body = build_image_msg_body(
                 url=upload_result["url"],
                 uuid=file_uuid,
@@ -2386,13 +2386,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 mime_type=content_type,
             )
 
-            # 5. 若有 caption，追加文字消息体
+            # 5. If caption exists, append text message body
             if caption:
                 msg_body.append(
                     {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
                 )
 
-            # 6. 发送
+            # 6. Send
             async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
@@ -2419,13 +2419,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         """
-        发送文件消息。
+        Send file message.
 
-        流程：
-          1. 下载文件 URL 内容（httpx）
-          2. 调用 genUploadInfo 获取 COS 临时凭证
-          3. PUT 上传到 COS
-          4. 构造 TIMFileElem 消息体，通过 WS 发送
+        Flow:
+          1. Download file URL content (httpx)
+          2. Call genUploadInfo to get COS temporary credentials
+          3. PUT upload to COS
+          4. Build TIMFileElem message body, send via WS
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
@@ -2433,7 +2433,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._cancel_slow_response_notifier(chat_id)
 
         try:
-            # 1. 下载文件
+            # 1. Download file
             logger.info("[%s] send_file: downloading %s", self.name, file_url)
             file_bytes, content_type = await media_download_url(file_url, max_size_mb=self.MEDIA_MAX_SIZE_MB)
 
@@ -2450,7 +2450,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             file_uuid = md5_hex(file_bytes)
 
-            # 2. 获取 COS 上传凭证
+            # 2. Get COS upload credentials
             token_data = await self._get_cached_token()
             token: str = token_data.get("token", "")
             bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
@@ -2464,7 +2464,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 route_env=self._route_env,
             )
 
-            # 3. 上传到 COS
+            # 3. Upload to COS
             upload_result = await upload_to_cos(
                 file_bytes=file_bytes,
                 filename=filename,
@@ -2474,7 +2474,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 region=credentials["region"],
             )
 
-            # 4. 构造 TIMFileElem 消息体
+            # 4. Build TIMFileElem message body
             msg_body = build_file_msg_body(
                 url=upload_result["url"],
                 filename=filename,
@@ -2482,7 +2482,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 size=upload_result["size"],
             )
 
-            # 5. 发送
+            # 5. Send
             async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
@@ -2508,16 +2508,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         """
-        发送表情包/贴纸（TIMFaceElem）。
+        Send sticker/emoji (TIMFaceElem).
 
-        解析优先级：
-          1. sticker_name 不为空 → 在 STICKER_MAP 中模糊查找，找不到返回错误
-          2. face_index 不为空   → 直接用该 index 构造 TIMFaceElem（无 data）
-          3. 两者均为空          → 随机发送一个内置贴纸
+        Parsing priority:
+          1. sticker_name not empty → fuzzy search in STICKER_MAP, return error if not found
+          2. face_index not empty   → directly use that index to build TIMFaceElem (no data)
+          3. Both empty          → randomly send a built-in sticker
 
-        chat_id 格式与 send() 相同：
-          - C2C:  "direct:{account_id}" 或 "{account_id}"
-          - 群聊: "group:{group_code}"
+        chat_id format same as send():
+          - C2C:  "direct:{account_id}" or "{account_id}"
+          - Group: "group:{group_code}"
         """
         from gateway.platforms.yuanbao_sticker import (
             get_sticker_by_name,
@@ -2573,10 +2573,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         """
-        发送本地文件（文档）消息。
+        Send local file (document) message.
 
-        与 send_file() 类似，但接收本地路径而非 URL。
-        流程：读取本地文件 → COS 上传 → 构造 TIMFileElem → WS 发送
+        Similar to send_file(), but accepts a local path instead of URL.
+        Flow: Read local file → COS upload → Build TIMFileElem → WS send
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
@@ -2584,7 +2584,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._cancel_slow_response_notifier(chat_id)
 
         try:
-            # 1. 读取本地文件
+            # 1. Read local file
             if not os.path.isfile(file_path):
                 return SendResult(success=False, error=f"File not found: {file_path}")
 
@@ -2602,7 +2602,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             content_type = guess_mime_type(filename) or "application/octet-stream"
             file_uuid = md5_hex(file_bytes)
 
-            # 2. 获取 COS 上传凭证
+            # 2. Get COS upload credentials
             token_data = await self._get_cached_token()
             token: str = token_data.get("token", "")
             bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
@@ -2616,7 +2616,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 route_env=self._route_env,
             )
 
-            # 3. 上传到 COS
+            # 3. Upload to COS
             upload_result = await upload_to_cos(
                 file_bytes=file_bytes,
                 filename=filename,
@@ -2626,7 +2626,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 region=credentials["region"],
             )
 
-            # 4. 构造 TIMFileElem 消息体
+            # 4. Build TIMFileElem message body
             msg_body = build_file_msg_body(
                 url=upload_result["url"],
                 filename=filename,
@@ -2634,13 +2634,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 size=upload_result["size"],
             )
 
-            # 5. 若有 caption，追加文字消息体
+            # 5. If caption exists, append text message body
             if caption:
                 msg_body.append(
                     {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
                 )
 
-            # 6. 发送
+            # 6. Send
             async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
@@ -2658,7 +2658,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def _send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
-        """发送任意 MsgBody 的 C2C 消息。"""
+        """Send C2C message with arbitrary MsgBody."""
         req_id = f"c2c_{next_seq_no()}"
         encoded = encode_send_c2c_message(
             to_account=to_account,
@@ -2680,7 +2680,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         msg_body: list,
         reply_to: Optional[str] = None,
     ) -> dict:
-        """发送任意 MsgBody 的群聊消息。"""
+        """Send group message with arbitrary MsgBody."""
         req_id = f"grp_{next_seq_no()}"
         encoded = encode_send_group_message(
             group_code=group_code,
@@ -2699,7 +2699,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def _get_cached_token(self) -> dict:
         """
-        获取当前有效的签票 token（走模块级缓存）。
+        Get the current valid sign token (using module-level cache).
         """
         return await get_sign_token(
             self._app_key, self._app_secret, self._api_domain,
@@ -2845,16 +2845,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
 
 # ============================================================
-# 模块级辅助函数（JSON 推送解析，对齐 TS 的 decodeFromContent）
+# Module-level helper functions (JSON push parsing, aligned with TS decodeFromContent)
 # ============================================================
 
 def _parse_json_push(raw_json: dict) -> dict | None:
     """
-    将 JSON 格式的推送（来自 rawData 或 DirectedPush.content）转换为
-    与 decode_inbound_push 相同结构的 dict。
+    Convert JSON-format push (from rawData or DirectedPush.content) to
+    a dict with the same structure as decode_inbound_push.
 
-    支持标准回调格式（callback_command + from_account + msg_body）
-    以及旧格式字段（GroupId, MsgSeq, MsgKey, MsgBody 等）。
+    Supports standard callback format (callback_command + from_account + msg_body)
+    and legacy format fields (GroupId, MsgSeq, MsgKey, MsgBody, etc.).
     """
     if not raw_json:
         return None
@@ -2899,8 +2899,8 @@ def _parse_json_push(raw_json: dict) -> dict | None:
 
 def _convert_json_msg_body(raw_body: list) -> list:
     """
-    将原始 JSON msg_body 数组标准化为 [{"msg_type": str, "msg_content": dict}] 格式。
-    兼容大驼峰（MsgType/MsgContent）和小蛇形（msg_type/msg_content）两种命名。
+    Normalize raw JSON msg_body array to [{"msg_type": str, "msg_content": dict}] format.
+    Compatible with both PascalCase (MsgType/MsgContent) and snake_case (msg_type/msg_content) naming.
     """
     result = []
     for item in raw_body or []:
@@ -2918,21 +2918,21 @@ def _convert_json_msg_body(raw_body: list) -> list:
 
 
 # ============================================================
-# Markdown 分块工具函数（原 yuanbao_markdown.py）
+# Markdown chunking utility functions (originally yuanbao_markdown.py)
 # ============================================================
 
 def has_unclosed_fence(text: str) -> bool:
     """
-    检测文本中是否有未闭合的代码块围栏。
+    Detect whether the text has unclosed code block fences.
 
-    逐行扫描，遇到以 ``` 开头的行时切换 in/out 状态。
-    奇数次切换说明存在未闭合的围栏。
+    Scan line by line, toggling in/out state when encountering a line starting with ```.
+    An odd number of toggles indicates an unclosed fence.
 
     Args:
-        text: 待检测的 Markdown 文本
+        text: Markdown text to check
 
     Returns:
-        若文本以未闭合围栏结尾则返回 True，否则返回 False
+        Returns True if the text ends with an unclosed fence, otherwise False
     """
     in_fence = False
     for line in text.split('\n'):
@@ -2943,13 +2943,13 @@ def has_unclosed_fence(text: str) -> bool:
 
 def ends_with_table_row(text: str) -> bool:
     """
-    检测文本是否以表格行结尾（最后一个非空行以 | 开头且以 | 结尾）。
+    Detect whether the text ends with a table row (last non-empty line starts and ends with |).
 
     Args:
-        text: 待检测的文本
+        text: Text to check
 
     Returns:
-        若最后一个非空行是表格行则返回 True
+        Returns True if the last non-empty line is a table row
     """
     trimmed = text.rstrip()
     if not trimmed:
@@ -2960,32 +2960,32 @@ def ends_with_table_row(text: str) -> bool:
 
 def split_at_paragraph_boundary(text: str, max_chars: int) -> tuple[str, str]:
     """
-    在不超过 max_chars 的前提下，找到最近的段落边界切割点，返回 (前段, 后段)。
+    Find the nearest paragraph boundary split point within max_chars, return (head, tail).
 
-    切割优先级：
-    1. 空行（段落边界）
-    2. 句号/问号/感叹号（中英文）后的换行
-    3. 最后一个换行
-    4. 强制在 max_chars 处切割
+    Split priority:
+    1. Blank line (paragraph boundary)
+    2. Newline after period/question mark/exclamation mark (Chinese and English)
+    3. Last newline
+    4. Force split at max_chars
 
     Args:
-        text: 待切割文本
-        max_chars: 最大字符数上限
+        text: Text to split
+        max_chars: Maximum character count limit
 
     Returns:
-        (head, tail) 元组，head 是切割前段，tail 是切割后段，满足 head + tail == text
+        (head, tail) tuple, head is the front part, tail is the back part, satisfying head + tail == text
     """
     if len(text) <= max_chars:
         return text, ''
 
     window = text[:max_chars]
 
-    # 1. 优先找最后一个空行（\n\n）作为段落边界
+    # 1. Prefer the last blank line (\n\n) as paragraph boundary
     pos = window.rfind('\n\n')
     if pos > 0:
         return text[:pos + 2], text[pos + 2:]
 
-    # 2. 其次找最后一个句子结束符后的换行
+    # 2. Then find the last newline after a sentence-ending punctuation
     sentence_end_re = re.compile(r'[。！？.!?]\n')
     best_pos = -1
     for m in sentence_end_re.finditer(window):
@@ -2993,41 +2993,41 @@ def split_at_paragraph_boundary(text: str, max_chars: int) -> tuple[str, str]:
     if best_pos > 0:
         return text[:best_pos], text[best_pos:]
 
-    # 3. 退而求其次：找最后一个换行
+    # 3. Fallback: find the last newline
     pos = window.rfind('\n')
     if pos > 0:
         return text[:pos + 1], text[pos + 1:]
 
-    # 4. 实在没有合法切割点，强制在 max_chars 处切割
+    # 4. No valid split point found, force split at max_chars
     return text[:max_chars], text[max_chars:]
 
 
 def _is_fence_atom(text: str) -> bool:
-    """判断原子块是否是代码块（以 ``` 开头）。"""
+    """Determine whether an atomic block is a code block (starts with ```)."""
     return text.lstrip().startswith('```')
 
 
 def _is_table_atom(text: str) -> bool:
-    """判断原子块是否是表格（第一行以 | 开头）。"""
+    """Determine whether an atomic block is a table (first line starts with |)."""
     first_line = text.split('\n')[0].strip()
     return first_line.startswith('|') and first_line.endswith('|')
 
 
 def _split_into_atoms(text: str) -> list[str]:
     """
-    将文本拆分为"原子块"列表，每个原子块是不可分割的逻辑单元：
+    Split text into a list of "atomic blocks", each being an indivisible logical unit:
 
-    - 代码块（fence）：从 ``` 开到对应 ``` 关闭的整段（含首尾 fence 行）
-    - 表格：连续的 |...| 行组成的整段
-    - 普通段落：以空行分隔的普通文本段
+    - Code block (fence): from opening ``` to closing ``` (including fence lines)
+    - Table: consecutive |...| lines forming a whole segment
+    - Normal paragraph: plain text segments separated by blank lines
 
-    空行作为分隔符，不加入任何原子块。
+    Blank lines serve as separators and are not included in any atomic block.
 
     Args:
-        text: 待拆分的 Markdown 文本
+        text: Markdown text to split
 
     Returns:
-        原子块字符串列表（均非空）
+        List of atomic block strings (all non-empty)
     """
     lines = text.split('\n')
     atoms: list[str] = []
@@ -3074,20 +3074,20 @@ def _split_into_atoms(text: str) -> list[str]:
 
 def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
     """
-    将 Markdown 文本按 max_chars 切割为多个片段。
+    Split Markdown text into multiple chunks by max_chars.
 
-    保证：
-    - 每个片段 <= max_chars 字符（除非单个代码块/表格本身超过限制）
-    - 代码块（```...```）不在中间被切断
-    - 表格行不在中间被切断（表格作为原子块整体输出）
-    - 在段落边界切割（空行、句号后等）
+    Guarantees:
+    - Each chunk <= max_chars characters (unless a single code block/table itself exceeds the limit)
+    - Code blocks (```...```) are not split in the middle
+    - Table rows are not split in the middle (tables output as atomic blocks)
+    - Split at paragraph boundaries (blank lines, after periods, etc.)
 
     Args:
-        text: 待切割的 Markdown 文本
-        max_chars: 每片段最大字符数，默认 4000
+        text: Markdown text to split
+        max_chars: Max characters per chunk, default 4000
 
     Returns:
-        切割后的文本片段列表（非空）
+        List of text chunks after splitting (non-empty)
     """
     if not text:
         return []
@@ -3095,10 +3095,10 @@ def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
-    # Phase 1: 提取原子块
+    # Phase 1: Extract atomic blocks
     atoms = _split_into_atoms(text)
 
-    # Phase 2: 贪心合并
+    # Phase 2: Greedy merge
     chunks: list[str] = []
     indivisible_set: set[int] = set()
     current_parts: list[str] = []
@@ -3130,7 +3130,7 @@ def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
 
     _flush_parts()
 
-    # Phase 3: 后处理 — 对仍超长的 chunk 做段落边界切割
+    # Phase 3: Post-processing — split still-oversized chunks at paragraph boundaries
     result: list[str] = []
     for idx, chunk in enumerate(chunks):
         if len(chunk) <= max_chars:
@@ -3160,28 +3160,28 @@ def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
 
 def _infer_block_separator(prev_chunk: str, next_chunk: str) -> str:
     """
-    推断两个切割片段之间应使用的分隔符。
+    Infer the separator to use between two split chunks.
 
-    规则（对齐 TS markdown-stream.ts）：
-    - 前段以代码块围栏结尾 或 后段以围栏开头 → 单换行 '\\n'
-    - 前段以表格行结尾 且 后段以表格行开头 → 单换行 '\\n'（续表）
-    - 否则 → 双换行 '\\n\\n'（段落分隔）
+    Rules (aligned with TS markdown-stream.ts):
+    - Previous chunk ends with code fence or next chunk starts with fence → single newline '\\n'
+    - Previous chunk ends with table row and next chunk starts with table row → single newline '\\n' (continued table)
+    - Otherwise → double newline '\\n\\n' (paragraph separator)
 
     Args:
-        prev_chunk: 前一个片段
-        next_chunk: 后一个片段
+        prev_chunk: Previous chunk
+        next_chunk: Next chunk
 
     Returns:
-        '\\n' 或 '\\n\\n'
+        '\\n' or '\\n\\n'
     """
     prev_trimmed = prev_chunk.rstrip()
     next_trimmed = next_chunk.lstrip()
 
-    # 前段以围栏结尾 或 后段以围栏开头
+    # Previous chunk ends with fence or next chunk starts with fence
     if prev_trimmed.endswith('```') or next_trimmed.startswith('```'):
         return '\n'
 
-    # 表格续行
+    # Table continuation
     if ends_with_table_row(prev_chunk):
         first_line = next_trimmed.split('\n')[0].strip() if next_trimmed else ''
         if first_line.startswith('|') and first_line.endswith('|'):
@@ -3192,21 +3192,21 @@ def _infer_block_separator(prev_chunk: str, next_chunk: str) -> str:
 
 def _merge_block_streaming_fences(chunks: list[str]) -> list[str]:
     """
-    流式片段围栏感知合并。
+    Stream-aware fence-conscious chunk merging.
 
-    当流式输出产生的多个片段在围栏中间被截断时，
-    尝试合并相邻片段使围栏完整。
+    When streaming output produces multiple chunks truncated in the middle of a fence,
+    attempt to merge adjacent chunks to complete the fence.
 
-    规则：
-    - 若第 i 个片段有未闭合围栏，且第 i+1 个片段以 ``` 开头，
-      则将 i+1 合并到 i（直到围栏闭合或没有更多片段）。
-    - 合并时使用 _infer_block_separator 推断分隔符。
+    Rules:
+    - If chunk i has an unclosed fence and chunk i+1 starts with ```,
+        merge i+1 into i (until the fence is closed or no more chunks).
+    - Use _infer_block_separator to infer the separator during merging.
 
     Args:
-        chunks: 原始片段列表
+        chunks: Original chunk list
 
     Returns:
-        合并后的片段列表（长度 <= 原始长度）
+        Merged chunk list (length <= original length)
     """
     if not chunks:
         return []
@@ -3215,7 +3215,7 @@ def _merge_block_streaming_fences(chunks: list[str]) -> list[str]:
     i = 0
     while i < len(chunks):
         current = chunks[i]
-        # 如果当前片段有未闭合围栏，尝试合并后续片段
+        # If current chunk has unclosed fence, try merging subsequent chunks
         while has_unclosed_fence(current) and i + 1 < len(chunks):
             sep = _infer_block_separator(current, chunks[i + 1])
             current = current + sep + chunks[i + 1]
@@ -3228,16 +3228,16 @@ def _merge_block_streaming_fences(chunks: list[str]) -> list[str]:
 
 def _strip_outer_markdown_fence(text: str) -> str:
     """
-    剥除外层 Markdown 围栏。
+    Strip outer Markdown fence.
 
-    当 AI 回复整段被 ```markdown\\n...\\n``` 包裹时，去掉外层围栏，
-    保留内容。仅当首行是 ```markdown（大小写不敏感）且末行是 ``` 时才剥除。
+    When AI reply is entirely wrapped in ```markdown\\n...\\n```, remove the outer fence,
+    keeping the content. Only strip when the first line is ```markdown (case-insensitive) and the last line is ```.
 
     Args:
-        text: 待处理文本
+        text: Text to process
 
     Returns:
-        剥除外层围栏后的文本（如果不匹配则返回原文）
+        Text with outer fence stripped (returns original if no match)
     """
     if not text:
         return text
@@ -3249,33 +3249,33 @@ def _strip_outer_markdown_fence(text: str) -> str:
     first_line = lines[0].strip()
     last_line = lines[-1].strip()
 
-    # 首行必须是 ```markdown（可选语言标记 md/markdown）
+    # First line must be ```markdown (optional language tag md/markdown)
     if not re.match(r'^```(?:markdown|md)?\s*$', first_line, re.IGNORECASE):
         return text
 
-    # 末行必须是纯 ```
+    # Last line must be plain ```
     if last_line != '```':
         return text
 
-    # 剥除首末行
+    # Strip first and last lines
     inner = '\n'.join(lines[1:-1])
     return inner
 
 
 def _sanitize_markdown_table(text: str) -> str:
     """
-    表格输出净化。
+    Table output sanitization.
 
-    处理 AI 生成的 Markdown 表格中常见的格式问题：
-    1. 去除表格行前后的多余空格
-    2. 确保分隔行（|---|---|）格式正确
-    3. 去除空的表格行
+    Handle common formatting issues in AI-generated Markdown tables:
+    1. Remove extra whitespace before/after table rows
+    2. Ensure separator rows (|---|---|) are correctly formatted
+    3. Remove empty table rows
 
     Args:
-        text: 包含表格的 Markdown 文本
+        text: Markdown text containing tables
 
     Returns:
-        净化后的文本
+        Sanitized text
     """
     if '|' not in text:
         return text
@@ -3286,9 +3286,9 @@ def _sanitize_markdown_table(text: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        # 表格行处理
+        # Table row processing
         if stripped.startswith('|') and stripped.endswith('|'):
-            # 分隔行标准化：| --- | --- | → |---|---|
+            # Separator row normalization: | --- | --- | → |---|---|
             if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)+\|$', stripped):
                 cells = stripped.split('|')
                 normalized = '|'.join(
@@ -3297,7 +3297,7 @@ def _sanitize_markdown_table(text: str) -> str:
                 )
                 result_lines.append(normalized)
             elif stripped == '||' or stripped.replace('|', '').strip() == '':
-                # 空表格行 → 跳过
+                # Empty table row → skip
                 continue
             else:
                 result_lines.append(stripped)
@@ -3308,23 +3308,23 @@ def _sanitize_markdown_table(text: str) -> str:
 
 
 # ============================================================
-# 签票 API（原 yuanbao_api.py）
+# Sign-ticket API (originally yuanbao_api.py)
 # ============================================================
 
 SIGN_TOKEN_PATH = "/api/v5/robotLogic/sign-token"
 
-#: 可重试的业务错误码
+#: Retryable business error codes
 RETRYABLE_SIGN_CODE = 10099
 SIGN_MAX_RETRIES = 3
 SIGN_RETRY_DELAY_S = 1.0
 
-#: 提前刷新裕量（秒），过期前 60 秒即视为即将过期
+#: Early refresh margin (seconds), treat as expiring 60 seconds before actual expiry
 CACHE_REFRESH_MARGIN_S = 60
 
-#: HTTP 超时（秒）
+#: HTTP timeout (seconds)
 HTTP_TIMEOUT_S = 10.0
 
-# 模块级缓存
+# Module-level cache
 # key: app_key
 # value: {"token": str, "bot_id": str, "expire_ts": float (unix timestamp)}
 _token_cache: dict[str, dict[str, Any]] = {}
@@ -3349,7 +3349,7 @@ def _get_refresh_lock(app_key: str) -> asyncio.Lock:
 
 def _compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str) -> str:
     """
-    计算签名（与 TypeScript 原版对齐）。
+    Compute signature (aligned with TypeScript original).
     plain     = nonce + timestamp + app_key + app_secret
     signature = HMAC-SHA256(key=app_secret, msg=plain).hexdigest()
     """
@@ -3359,15 +3359,15 @@ def _compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str
 
 def _build_timestamp() -> str:
     """
-    构造北京时间 ISO-8601 时间戳（与 TypeScript 原版对齐）。
-    格式：2006-01-02T15:04:05+08:00（无毫秒）
+    Build Beijing time ISO-8601 timestamp (aligned with TypeScript original).
+    Format: 2006-01-02T15:04:05+08:00 (no milliseconds)
     """
     bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
     return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
 def _is_cache_valid(entry: dict[str, Any]) -> bool:
-    """判断缓存是否有效（未过期且留有裕量）。"""
+    """Determine whether the cache is valid (not expired and has margin)."""
     return entry["expire_ts"] - time.time() > CACHE_REFRESH_MARGIN_S
 
 
@@ -3378,7 +3378,7 @@ async def _do_fetch_sign_token(
     route_env: str = "",
 ) -> dict[str, Any]:
     """
-    发起签票 HTTP 请求，支持自动重试（最多 SIGN_MAX_RETRIES 次）。
+    Send sign-ticket HTTP request with auto-retry (up to SIGN_MAX_RETRIES times).
     """
     url = f"{api_domain.rstrip('/')}{SIGN_TOKEN_PATH}"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
@@ -3453,9 +3453,9 @@ async def get_sign_token(
     route_env: str = "",
 ) -> dict[str, Any]:
     """
-    获取 WS 鉴权 token（带缓存）。
+    Get WS auth token (with cache).
 
-    缓存命中时直接返回，不重复请求；距过期前 60 秒视为即将过期，触发刷新。
+    Return directly on cache hit without re-requesting; treat as expiring 60 seconds before actual expiry, triggering refresh.
     """
     cached = _token_cache.get(app_key)
     if cached and _is_cache_valid(cached):
@@ -3492,7 +3492,7 @@ async def force_refresh_sign_token(
     route_env: str = "",
 ) -> dict[str, Any]:
     """
-    强制刷新 token（清除缓存后重新签票）。
+    Force refresh token (clear cache and re-sign).
     """
     logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
     async with _get_refresh_lock(app_key):
@@ -3536,13 +3536,13 @@ async def send_yuanbao_direct(
     """
     last_result: Optional[SendResult] = None
 
-    # 1. 发送文本
+    # 1. Send text
     if message.strip():
         last_result = await adapter.send(chat_id, message)
         if not last_result.success:
             return {"error": f"Yuanbao send failed: {last_result.error}"}
 
-    # 2. 遍历 media_files，按扩展名分发
+    # 2. Iterate media_files, dispatch by file extension
     for media_path, _is_voice in media_files or []:
         ext = Path(media_path).suffix.lower()
         if ext in _YUANBAO_IMAGE_EXTS:
