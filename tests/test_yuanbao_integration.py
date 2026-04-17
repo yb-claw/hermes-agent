@@ -204,9 +204,9 @@ class TestProtoRoundTrip:
 
 class TestMarkdownChunking:
     def test_chunks_are_sent_separately(self):
-        from gateway.platforms.yuanbao import chunk_markdown_text
+        from gateway.platforms.yuanbao import MarkdownProcessor
         long_text = "paragraph\n\n" * 100
-        chunks = chunk_markdown_text(long_text, 200)
+        chunks = MarkdownProcessor.chunk_markdown_text(long_text, 200)
         assert len(chunks) > 1
         for c in chunks:
             # 段落原子块允许轻微超限，仅验证不崩溃
@@ -214,9 +214,9 @@ class TestMarkdownChunking:
             assert len(c) > 0
 
     def test_chunk_short_text_no_split(self):
-        from gateway.platforms.yuanbao import chunk_markdown_text
+        from gateway.platforms.yuanbao import MarkdownProcessor
         text = "hello world"
-        chunks = chunk_markdown_text(text, 3000)
+        chunks = MarkdownProcessor.chunk_markdown_text(text, 3000)
         assert chunks == [text]
 
 
@@ -226,9 +226,29 @@ class TestMarkdownChunking:
 
 class TestSignToken:
     def test_import_ok(self):
-        from gateway.platforms.yuanbao import get_sign_token, force_refresh_sign_token
-        assert callable(get_sign_token)
-        assert callable(force_refresh_sign_token)
+        from gateway.platforms.yuanbao import SignManager
+        assert callable(SignManager.get_token)
+        assert callable(SignManager.force_refresh)
+
+
+# ===========================================================
+# 6b. ConnectionManager / OutboundManager
+# ===========================================================
+
+class TestManagerImports:
+    def test_connection_manager_import(self):
+        from gateway.platforms.yuanbao import ConnectionManager
+        assert ConnectionManager is not None
+
+    def test_outbound_manager_import(self):
+        from gateway.platforms.yuanbao import OutboundManager
+        assert OutboundManager is not None
+
+    def test_adapter_has_managers(self):
+        adapter = YuanbaoAdapter(make_config())
+        from gateway.platforms.yuanbao import ConnectionManager, OutboundManager
+        assert isinstance(adapter._connection, ConnectionManager)
+        assert isinstance(adapter._outbound, OutboundManager)
 
 
 # ===========================================================
@@ -290,21 +310,21 @@ class TestP0ReconnectGuard:
 
     def test_reconnecting_flag_initialized(self):
         adapter = YuanbaoAdapter(make_config())
-        assert hasattr(adapter, '_reconnecting')
-        assert adapter._reconnecting is False
+        assert hasattr(adapter._connection, '_reconnecting')
+        assert adapter._connection._reconnecting is False
 
     def test_schedule_reconnect_skips_when_not_running(self):
         adapter = YuanbaoAdapter(make_config())
         adapter._running = False
-        adapter._reconnecting = False
-        adapter._schedule_reconnect()
+        adapter._connection._reconnecting = False
+        adapter._connection.schedule_reconnect()
         # No task should be created because _running is False
 
     def test_schedule_reconnect_skips_when_already_reconnecting(self):
         adapter = YuanbaoAdapter(make_config())
         adapter._running = True
-        adapter._reconnecting = True
-        adapter._schedule_reconnect()
+        adapter._connection._reconnecting = True
+        adapter._connection.schedule_reconnect()
         # No new task should be created because already reconnecting
 
 
@@ -323,40 +343,40 @@ class TestP0ChatLockEviction:
 
     def test_chat_locks_is_ordered_dict(self):
         adapter = YuanbaoAdapter(make_config())
-        assert isinstance(adapter._chat_locks, collections.OrderedDict)
+        assert isinstance(adapter._outbound._chat_locks, collections.OrderedDict)
 
     def test_eviction_skips_locked(self):
         """When eviction is needed, locked entries are skipped."""
         adapter = YuanbaoAdapter(make_config())
-        from gateway.platforms.yuanbao import _CHAT_DICT_MAX_SIZE
+        from gateway.platforms.yuanbao import OutboundManager
 
         # Fill to capacity with unlocked locks
-        for i in range(_CHAT_DICT_MAX_SIZE):
-            adapter._chat_locks[f"chat_{i}"] = asyncio.Lock()
+        for i in range(OutboundManager.CHAT_DICT_MAX_SIZE):
+            adapter._outbound._chat_locks[f"chat_{i}"] = asyncio.Lock()
 
         # Lock the oldest entry
-        oldest_key = next(iter(adapter._chat_locks))
-        oldest_lock = adapter._chat_locks[oldest_key]
+        oldest_key = next(iter(adapter._outbound._chat_locks))
+        oldest_lock = adapter._outbound._chat_locks[oldest_key]
         # Simulate a held lock by acquiring it in a non-async way (set _locked)
         # asyncio.Lock is not held until actually acquired; so we test the
         # method logic by acquiring the first lock manually.
         # For a sync test, we check that _get_chat_lock doesn't crash.
         new_lock = adapter._get_chat_lock("new_chat")
-        assert "new_chat" in adapter._chat_locks
+        assert "new_chat" in adapter._outbound._chat_locks
         assert isinstance(new_lock, asyncio.Lock)
         # The oldest unlocked entry should have been evicted
-        assert len(adapter._chat_locks) == _CHAT_DICT_MAX_SIZE
+        assert len(adapter._outbound._chat_locks) == OutboundManager.CHAT_DICT_MAX_SIZE
 
     def test_move_to_end_on_access(self):
         """Accessing an existing key moves it to the end (MRU)."""
         adapter = YuanbaoAdapter(make_config())
-        adapter._chat_locks["a"] = asyncio.Lock()
-        adapter._chat_locks["b"] = asyncio.Lock()
-        adapter._chat_locks["c"] = asyncio.Lock()
+        adapter._outbound._chat_locks["a"] = asyncio.Lock()
+        adapter._outbound._chat_locks["b"] = asyncio.Lock()
+        adapter._outbound._chat_locks["c"] = asyncio.Lock()
 
         # Access "a" — should move to end
         adapter._get_chat_lock("a")
-        keys = list(adapter._chat_locks.keys())
+        keys = list(adapter._outbound._chat_locks.keys())
         assert keys[-1] == "a"
         assert keys[0] == "b"
 

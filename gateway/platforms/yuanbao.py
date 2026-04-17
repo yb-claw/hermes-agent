@@ -31,7 +31,8 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from abc import ABC, abstractmethod
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 import sys
 
@@ -111,18 +112,8 @@ _BOT_VERSION = f"hermes-agent/{_HERMES_VERSION}"
 _OPERATION_SYSTEM = sys.platform
 
 # ---------------------------------------------------------------------------
-# Module-level active adapter singleton.
-# Set by YuanbaoAdapter.connect(), cleared by disconnect().
-# Consumers (cron delivery, send_message tool) import get_active_adapter()
-# to obtain the running instance without going through yuanbao_tools.
+# Module-level constants
 # ---------------------------------------------------------------------------
-_active_adapter: Optional["YuanbaoAdapter"] = None
-
-
-def get_active_adapter() -> Optional["YuanbaoAdapter"]:
-    """Return the currently connected YuanbaoAdapter, or None."""
-    return _active_adapter
-
 
 DEFAULT_WS_GATEWAY_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection"
 DEFAULT_API_DOMAIN = "https://bot.yuanbao.tencent.com"
@@ -143,54 +134,1911 @@ HEARTBEAT_TIMEOUT_THRESHOLD = 2
 AUTH_FAILED_CODES = {4001, 4002, 4003}      # permanent auth failure, re-sign token
 AUTH_RETRYABLE_CODES = {4010, 4011, 4099}   # transient, can retry with same token
 
-# Maximum number of distinct chat IDs tracked in _chat_locks.
-# Oldest entry is evicted when the limit is reached to prevent unbounded growth.
-_CHAT_DICT_MAX_SIZE = 1000
-
 # Reply Heartbeat configuration
 REPLY_HEARTBEAT_INTERVAL_S = 2.0   # Send RUNNING every 2 seconds
 REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # Auto-stop after 30 seconds of inactivity
 
 # Reply-to reference configuration
 REPLY_REF_TTL_S = 300.0            # Reference dedup TTL (5 minutes)
-_REPLY_REF_MAX_ENTRIES = 500       # Max capacity of reference dedup dict
 
 # Slow-response hint: push a waiting message when agent produces no data for this duration (seconds)
 SLOW_RESPONSE_TIMEOUT_S = 120.0
 SLOW_RESPONSE_MESSAGE = "The task is a bit complex, working hard on it, please wait patiently..."
 
-# Placeholder message filter (skip these pure placeholders when no actual media content)
-_SKIPPABLE_PLACEHOLDERS = frozenset({
-    "[image]", "[图片]", "[file]", "[文件]",
-    "[video]", "[视频]", "[voice]", "[语音]",
-})
+
+# ============================================================
+# Region: Inbound Pipeline Engine & Context
+# ============================================================
+
+from dataclasses import dataclass, field as dc_field
 
 
-def _strip_cron_wrapper_for_yuanbao(content: str) -> str:
-    """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output."""
-    if not content.startswith("Cronjob Response: "):
-        return content
+@dataclass
+class InboundContext:
+    """Mutable context flowing through the inbound middleware pipeline.
 
-    divider = "\n-------------\n\n"
-    footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
-    divider_pos = content.find(divider)
-    footer_pos = content.rfind(footer_prefix)
-    if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
-        return content
+    Each middleware reads/writes fields on this context.  The pipeline
+    engine passes it to every middleware in registration order.
+    """
 
-    header = content[:divider_pos]
-    if "\n(job_id: " not in header:
-        return content
+    adapter: Any  # YuanbaoAdapter (forward-ref avoids circular import)
+    conn_data: bytes = b""
 
-    body_start = divider_pos + len(divider)
-    body = content[body_start:footer_pos].strip()
-    return body or content
+    # Populated by DecodeMiddleware
+    push: Optional[dict] = None
+    decoded_via: str = ""  # "json" | "protobuf"
+
+    # Extracted from push by FieldExtractMiddleware
+    from_account: str = ""
+    group_code: str = ""
+    group_name: str = ""
+    sender_nickname: str = ""
+    msg_body: list = dc_field(default_factory=list)
+    msg_id: str = ""
+    cloud_custom_data: str = ""
+
+    # Derived by ChatRoutingMiddleware
+    chat_id: str = ""
+    chat_type: str = ""  # "dm" | "group"
+    chat_name: str = ""
+
+    # Populated by ContentExtractMiddleware
+    raw_text: str = ""
+    media_refs: list = dc_field(default_factory=list)
+
+    # Owner command detection
+    owner_command: Optional[str] = None
+
+    # Source built by BuildSourceMiddleware
+    source: Optional[Any] = None  # SessionSource
+
+    # Final event fields (populated by DispatchMiddleware)
+    msg_type: Optional[Any] = None  # MessageType
+
+
+class InboundMiddleware(ABC):
+    """Abstract base class for all inbound pipeline middlewares.
+
+    Subclasses must:
+      - Set ``name`` as a class-level attribute (used for pipeline registration
+        and dynamic insertion/removal).
+      - Implement ``async handle(ctx, next_fn)`` containing the middleware logic.
+
+    Convention:
+      - Call ``await next_fn()`` to pass control to the next middleware.
+      - Return without calling ``next_fn`` to **stop** the pipeline.
+    """
+
+    name: str = ""  # Override in each subclass
+
+    @abstractmethod
+    async def handle(self, ctx: InboundContext, next_fn: Callable) -> None:
+        """Process *ctx* and optionally call *next_fn* to continue the pipeline."""
+
+    async def __call__(self, ctx: InboundContext, next_fn: Callable) -> None:
+        """Allow middleware instances to be called directly (duck-typing compat)."""
+        return await self.handle(ctx, next_fn)
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__} name={self.name!r}>"
+
+
+class InboundPipeline:
+    """Onion-model middleware pipeline engine for inbound message processing.
+
+    Inspired by OpenClaw's MessagePipeline (extensions/yuanbao/src/business/
+    pipeline/engine.ts).  Supports named middlewares, conditional guards
+    (``when``), and ``use_before`` / ``use_after`` / ``remove`` for dynamic
+    composition.
+
+    Accepts both ``InboundMiddleware`` instances (OOP style) and plain
+    ``async def(ctx, next_fn)`` callables (functional style) for flexibility.
+    """
+
+    def __init__(self) -> None:
+        self._middlewares: list = []  # list of (name, handler, when_fn | None)
+
+    # -- Internal helpers --------------------------------------------------
+
+    @staticmethod
+    def _normalize(name_or_mw, handler=None):
+        """Normalize (name, handler) or (InboundMiddleware,) into (name, callable)."""
+        if isinstance(name_or_mw, InboundMiddleware):
+            return name_or_mw.name, name_or_mw
+        # Functional style: name is a str, handler is a callable
+        return name_or_mw, handler
+
+    # -- Registration API --------------------------------------------------
+
+    def use(self, name_or_mw, handler=None, when=None) -> "InboundPipeline":
+        """Append a middleware to the end of the pipeline.
+
+        Accepts either:
+          - ``pipeline.use(SomeMiddleware())``  — OOP style
+          - ``pipeline.use("name", some_fn)``   — functional style
+        """
+        name, h = self._normalize(name_or_mw, handler)
+        self._middlewares.append((name, h, when))
+        return self
+
+    def use_before(self, target: str, name_or_mw, handler=None, when=None) -> "InboundPipeline":
+        """Insert a middleware before *target* (by name).  Appends if not found."""
+        name, h = self._normalize(name_or_mw, handler)
+        idx = next((i for i, (n, _, _) in enumerate(self._middlewares) if n == target), None)
+        entry = (name, h, when)
+        if idx is None:
+            self._middlewares.append(entry)
+        else:
+            self._middlewares.insert(idx, entry)
+        return self
+
+    def use_after(self, target: str, name_or_mw, handler=None, when=None) -> "InboundPipeline":
+        """Insert a middleware after *target* (by name).  Appends if not found."""
+        name, h = self._normalize(name_or_mw, handler)
+        idx = next((i for i, (n, _, _) in enumerate(self._middlewares) if n == target), None)
+        entry = (name, h, when)
+        if idx is None:
+            self._middlewares.append(entry)
+        else:
+            self._middlewares.insert(idx + 1, entry)
+        return self
+
+    def remove(self, name: str) -> "InboundPipeline":
+        """Remove a middleware by name."""
+        self._middlewares = [(n, h, w) for n, h, w in self._middlewares if n != name]
+        return self
+
+    @property
+    def middleware_names(self) -> list:
+        """Return ordered list of registered middleware names (for testing)."""
+        return [n for n, _, _ in self._middlewares]
+
+    # -- Execution ---------------------------------------------------------
+
+    async def execute(self, ctx: InboundContext) -> None:
+        """Run all middlewares in order.  Each middleware receives ``(ctx, next_fn)``."""
+        chain = self._middlewares
+        index = 0
+
+        async def next_fn() -> None:
+            nonlocal index
+            while index < len(chain):
+                name, handler, when_fn = chain[index]
+                index += 1
+                # Conditional guard: skip when returns False
+                if when_fn is not None and not when_fn(ctx):
+                    continue
+                try:
+                    await handler(ctx, next_fn)
+                except Exception:
+                    logger.error("[InboundPipeline] middleware [%s] error", name, exc_info=True)
+                    raise
+                return
+            # End of chain — nothing more to do
+
+        await next_fn()
+
+
+# ============================================================
+# Region: Inbound Middlewares (OOP)
+# ============================================================
+
+class DecodeMiddleware(InboundMiddleware):
+    """Decode conn_data from JSON or Protobuf into ctx.push.
+
+    Encapsulates JSON push parsing (aligned with TS decodeFromContent)
+    and Protobuf decoding via ``decode_inbound_push``.
+    """
+
+    name = "decode"
+
+    # -- JSON push parsing -------------------------------------------------
+
+    @staticmethod
+    def convert_json_msg_body(raw_body: list) -> list:
+        """Normalize raw JSON msg_body array to [{"msg_type": str, "msg_content": dict}].
+
+        Compatible with both PascalCase (MsgType/MsgContent) and
+        snake_case (msg_type/msg_content) naming.
+        """
+        result = []
+        for item in raw_body or []:
+            if not isinstance(item, dict):
+                continue
+            msg_type = item.get("msg_type") or item.get("MsgType", "")
+            msg_content = item.get("msg_content") or item.get("MsgContent", {})
+            if isinstance(msg_content, str):
+                try:
+                    msg_content = json.loads(msg_content)
+                except Exception:
+                    msg_content = {"text": msg_content}
+            result.append({"msg_type": msg_type, "msg_content": msg_content or {}})
+        return result
+
+    @staticmethod
+    def parse_json_push(raw_json: dict) -> dict | None:
+        """Convert JSON-format push to a dict with the same structure as
+        ``decode_inbound_push``.
+
+        Supports standard callback format (callback_command + from_account +
+        msg_body) and legacy format fields (GroupId, MsgSeq, MsgKey, MsgBody,
+        etc.).
+        """
+        if not raw_json:
+            return None
+
+        # Tencent IM callback format uses PascalCase (From_Account, To_Account, MsgBody).
+        # Internal format uses snake_case (from_account, to_account, msg_body).
+        # Support both.
+        from_account = (
+            raw_json.get("from_account", "")
+            or raw_json.get("From_Account", "")
+        )
+        group_code = (
+            raw_json.get("group_code", "")
+            or raw_json.get("GroupId", "")
+            or raw_json.get("group_id", "")
+        )
+        msg_body_raw = (
+            raw_json.get("msg_body", [])
+            or raw_json.get("MsgBody", [])
+        )
+        msg_body = DecodeMiddleware.convert_json_msg_body(msg_body_raw)
+
+        # Allow a push with from_account even if msg_body is empty
+        # (e.g. callback notifications)
+        if not from_account and not msg_body:
+            return None
+
+        return {
+            "callback_command": raw_json.get("callback_command", ""),
+            "from_account": from_account,
+            "to_account": raw_json.get("to_account", "") or raw_json.get("To_Account", ""),
+            "sender_nickname": raw_json.get("sender_nickname", "") or raw_json.get("nick_name", ""),
+            "group_code": group_code,
+            "group_name": raw_json.get("group_name", ""),
+            "msg_seq": raw_json.get("msg_seq", 0) or raw_json.get("MsgSeq", 0),
+            "msg_id": raw_json.get("msg_id", "") or raw_json.get("msg_key", "") or raw_json.get("MsgKey", ""),
+            "msg_body": msg_body,
+            "cloud_custom_data": raw_json.get("cloud_custom_data", "") or raw_json.get("CloudCustomData", ""),
+            "bot_owner_id": raw_json.get("bot_owner_id", "") or raw_json.get("botOwnerId", ""),
+            "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
+        }
+
+    # -- Pipeline handler --------------------------------------------------
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        if not ctx.conn_data:
+            return  # Stop pipeline — nothing to decode
+
+        # Try JSON first (mainstream callback_command format)
+        try:
+            conn_json = json.loads(ctx.conn_data.decode("utf-8"))
+        except Exception:
+            conn_json = None
+
+        if isinstance(conn_json, dict):
+            logger.info(
+                "[%s] conn_data is JSON: fields=%s len=%d",
+                ctx.adapter.name, list(conn_json.keys()), len(ctx.conn_data),
+            )
+            ctx.push = self.parse_json_push(conn_json) or None
+            if ctx.push:
+                ctx.decoded_via = "json"
+        else:
+            try:
+                ctx.push = decode_inbound_push(ctx.conn_data) or None
+            except Exception:
+                ctx.push = None
+            if ctx.push:
+                ctx.decoded_via = "protobuf"
+                logger.info(
+                    "[%s] conn_data is Protobuf (InboundMessagePush): len=%d",
+                    ctx.adapter.name, len(ctx.conn_data),
+                )
+
+        if not ctx.push:
+            logger.info(
+                "[%s] Push decoded but no valid message. conn_data hex(first64)=%s",
+                ctx.adapter.name,
+                ctx.conn_data.hex()[:128] if ctx.conn_data else "(empty)",
+            )
+            return  # Stop pipeline
+
+        logger.info(
+            "[%s] Push decoded (via=%s): from=%s group=%s msg_id=%s msg_types=%s",
+            ctx.adapter.name, ctx.decoded_via,
+            ctx.push.get("from_account", ""),
+            ctx.push.get("group_code", ""),
+            ctx.push.get("msg_id", ""),
+            [e.get("msg_type", "") for e in ctx.push.get("msg_body", [])],
+        )
+        logger.debug("[%s] Push payload: %s", ctx.adapter.name, ctx.push)
+
+        await next_fn()
+
+
+class ExtractFieldsMiddleware(InboundMiddleware):
+    """Extract common fields from ctx.push into ctx attributes."""
+
+    name = "extract-fields"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        push = ctx.push
+        ctx.from_account = push.get("from_account", "")
+        ctx.group_code = push.get("group_code", "")
+        ctx.group_name = push.get("group_name", "")
+        ctx.sender_nickname = push.get("sender_nickname", "")
+        ctx.msg_body = push.get("msg_body", [])
+        ctx.msg_id = push.get("msg_id", "")
+        ctx.cloud_custom_data = push.get("cloud_custom_data", "")
+        await next_fn()
+
+
+class DedupMiddleware(InboundMiddleware):
+    """Inbound message deduplication."""
+
+    name = "dedup"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        if ctx.msg_id and ctx.adapter._dedup.is_duplicate(ctx.msg_id):
+            logger.debug("[%s] Duplicate message ignored: msg_id=%s", ctx.adapter.name, ctx.msg_id)
+            return  # Stop pipeline
+        await next_fn()
+
+
+class SkipSelfMiddleware(InboundMiddleware):
+    """Filter out bot's own messages."""
+
+    name = "skip-self"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        if YuanbaoAdapter._is_self_reference(ctx.from_account, ctx.adapter._bot_id):
+            logger.debug("[%s] Ignoring self-sent message from %s", ctx.adapter.name, ctx.from_account)
+            return  # Stop pipeline
+        await next_fn()
+
+
+class ChatRoutingMiddleware(InboundMiddleware):
+    """Determine chat_id, chat_type, chat_name from push fields."""
+
+    name = "chat-routing"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        if ctx.group_code:
+            ctx.chat_id = f"group:{ctx.group_code}"
+            ctx.chat_type = "group"
+            ctx.chat_name = ctx.group_name or ctx.group_code
+        else:
+            ctx.chat_id = f"direct:{ctx.from_account}"
+            ctx.chat_type = "dm"
+            ctx.chat_name = ctx.sender_nickname or ctx.from_account
+        await next_fn()
+
+
+class AccessGuardMiddleware(InboundMiddleware):
+    """Platform-level DM/Group access control filter."""
+
+    name = "access-guard"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        if ctx.chat_type == "dm":
+            if not adapter._is_dm_allowed(ctx.from_account):
+                logger.debug(
+                    "[%s] DM from %s blocked by dm_policy=%s",
+                    adapter.name, ctx.from_account, adapter._dm_policy,
+                )
+                return  # Stop pipeline
+        elif ctx.chat_type == "group":
+            if not adapter._is_group_allowed(ctx.group_code):
+                logger.debug(
+                    "[%s] Group %s blocked by group_policy=%s",
+                    adapter.name, ctx.group_code, adapter._group_policy,
+                )
+                return  # Stop pipeline
+        await next_fn()
+
+
+class ExtractContentMiddleware(InboundMiddleware):
+    """Extract raw text and media refs from msg_body."""
+
+    name = "extract-content"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        ctx.raw_text = adapter._rewrite_slash_command(adapter._extract_text(ctx.msg_body))
+        ctx.media_refs = adapter._extract_inbound_media_refs(ctx.msg_body)
+        await next_fn()
+
+
+class PlaceholderFilterMiddleware(InboundMiddleware):
+    """Skip pure placeholder messages (e.g. '[image]' with no media)."""
+
+    name = "placeholder-filter"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        if YuanbaoAdapter._is_skippable_placeholder(ctx.raw_text, len(ctx.media_refs)):
+            logger.debug("[%s] Skipping placeholder message: %r", ctx.adapter.name, ctx.raw_text)
+            return  # Stop pipeline
+        await next_fn()
+
+
+class OwnerCommandMiddleware(InboundMiddleware):
+    """Detect bot-owner slash commands in group chat."""
+
+    name = "owner-command"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        matched_cmd, cmd_line, is_owner = adapter._detect_owner_command(
+            push=ctx.push,
+            msg_body=ctx.msg_body,
+            chat_type=ctx.chat_type,
+            chat_id=ctx.chat_id,
+            from_account=ctx.from_account,
+        )
+        if matched_cmd and not is_owner:
+            # Non-owner tried an owner-only command — reject and stop
+            adapter._track_task(asyncio.create_task(
+                adapter.send(ctx.chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
+                name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
+            ))
+            return  # Stop pipeline
+
+        if matched_cmd and is_owner and cmd_line:
+            ctx.owner_command = matched_cmd
+            ctx.raw_text = cmd_line  # Override with clean command text
+        await next_fn()
+
+
+class BuildSourceMiddleware(InboundMiddleware):
+    """Build SessionSource from context fields."""
+
+    name = "build-source"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        ctx.source = adapter.build_source(
+            chat_id=ctx.chat_id,
+            chat_type=ctx.chat_type,
+            chat_name=ctx.chat_name,
+            user_id=ctx.from_account or None,
+            user_name=ctx.sender_nickname or ctx.from_account,
+            thread_id="main" if ctx.chat_type == "group" else None,
+        )
+        await next_fn()
+
+
+class GroupAtGuardMiddleware(InboundMiddleware):
+    """In group chat, observe non-@bot messages; only reply on @Bot.
+
+    Owner commands skip @Bot detection (owner doesn't need to @Bot).
+    """
+
+    name = "group-at-guard"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        if ctx.chat_type == "group" and not ctx.owner_command and not adapter._is_at_bot(ctx.msg_body):
+            adapter._observe_group_message(
+                ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
+            )
+            logger.info(
+                "[%s] Group message observed (no @bot): chat=%s from=%s",
+                adapter.name, ctx.chat_id, ctx.from_account,
+            )
+            return  # Stop pipeline — message observed but not dispatched
+        await next_fn()
+
+
+class DispatchMiddleware(InboundMiddleware):
+    """Classify message type, resolve media, build event, dispatch to AI."""
+
+    name = "dispatch"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        ctx.msg_type = adapter._classify_message_type(ctx.raw_text, ctx.msg_body)
+
+        async def _dispatch_inbound_event() -> None:
+            media_urls, media_types = await adapter._resolve_inbound_media_urls(ctx.media_refs)
+            if adapter._is_skippable_placeholder(ctx.raw_text, len(media_urls)):
+                logger.debug("[%s] Skip placeholder after media download: %r", adapter.name, ctx.raw_text)
+                return
+            reply_to_message_id, reply_to_text = adapter._extract_quote_context(ctx.cloud_custom_data)
+            event = MessageEvent(
+                text=ctx.raw_text,
+                message_type=ctx.msg_type,
+                source=ctx.source,
+                message_id=ctx.msg_id or None,
+                raw_message=ctx.push,
+                media_urls=media_urls,
+                media_types=media_types,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
+            )
+            await adapter.handle_message(event)
+
+        task = asyncio.create_task(
+            _dispatch_inbound_event(),
+            name=f"yuanbao-inbound-{ctx.msg_id or 'unknown'}",
+        )
+        adapter._inbound_tasks.add(task)
+        task.add_done_callback(adapter._inbound_tasks.discard)
+
+        await next_fn()
+
+
+class InboundPipelineBuilder:
+    """Factory for building InboundPipeline instances.
+
+    Separates pipeline assembly (business knowledge) from the pipeline engine
+    (InboundPipeline) so the engine stays generic and reusable.
+    """
+
+    # Default middleware sequence for Yuanbao inbound message processing.
+    _DEFAULT_MIDDLEWARES: list[type] = [
+        DecodeMiddleware,
+        ExtractFieldsMiddleware,
+        DedupMiddleware,
+        SkipSelfMiddleware,
+        ChatRoutingMiddleware,
+        AccessGuardMiddleware,
+        ExtractContentMiddleware,
+        PlaceholderFilterMiddleware,
+        OwnerCommandMiddleware,
+        BuildSourceMiddleware,
+        GroupAtGuardMiddleware,
+        DispatchMiddleware,
+    ]
+
+    @classmethod
+    def build(cls) -> InboundPipeline:
+        """Build the default inbound message processing pipeline."""
+        pipeline = InboundPipeline()
+        for mw_cls in cls._DEFAULT_MIDDLEWARES:
+            pipeline.use(mw_cls())
+        return pipeline
+
+
+# ============================================================
+# ConnectionManager — WebSocket lifecycle (open / close / heartbeat / reconnect)
+# ============================================================
+
+class ConnectionManager:
+    """Manages the WebSocket connection lifecycle for YuanbaoAdapter.
+
+    Responsibilities:
+      - Opening and closing the WebSocket
+      - AUTH_BIND handshake
+      - Heartbeat (ping/pong) loop
+      - Receive loop (frame dispatch)
+      - Reconnect with exponential backoff
+    """
+
+    def __init__(self, adapter: "YuanbaoAdapter") -> None:
+        self._adapter = adapter
+        self._ws = None  # websockets connection
+        self._connect_id: Optional[str] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._recv_task: Optional[asyncio.Task] = None
+        self._pending_acks: Dict[str, asyncio.Future] = {}
+        self._pending_pong: Optional[asyncio.Future] = None
+        self._consecutive_hb_timeouts: int = 0
+        self._reconnect_attempts: int = 0
+        self._reconnecting: bool = False
+
+    # -- Properties --------------------------------------------------------
+
+    @property
+    def ws(self):
+        return self._ws
+
+    @property
+    def connect_id(self) -> Optional[str]:
+        return self._connect_id
+
+    @property
+    def reconnect_attempts(self) -> int:
+        return self._reconnect_attempts
+
+    @property
+    def is_connected(self) -> bool:
+        if self._ws is None:
+            return False
+        open_attr = getattr(self._ws, "open", None)
+        if open_attr is True:
+            return True
+        if callable(open_attr):
+            try:
+                return bool(open_attr())
+            except Exception:
+                return False
+        return False
+
+    # -- Open / Close ------------------------------------------------------
+
+    async def open(self) -> bool:
+        """Open WebSocket connection: sign-token → WS connect → AUTH_BIND → start loops.
+
+        Returns True on success, False on failure.
+        """
+        a = self._adapter
+
+        if not WEBSOCKETS_AVAILABLE:
+            msg = "Yuanbao startup failed: 'websockets' package not installed"
+            a._set_fatal_error("yuanbao_missing_dependency", msg, retryable=True)
+            logger.warning("[%s] %s. Run: pip install websockets", a.name, msg)
+            return False
+
+        if not a._app_key or not a._app_secret:
+            msg = (
+                "Yuanbao startup failed: "
+                "YUANBAO_APP_ID and YUANBAO_APP_SECRET are required"
+            )
+            a._set_fatal_error("yuanbao_missing_credentials", msg, retryable=False)
+            logger.error("[%s] %s", a.name, msg)
+            return False
+
+        # Idempotency guard
+        if self._ws is not None:
+            try:
+                open_attr = getattr(self._ws, "open", None)
+                if open_attr is True or (callable(open_attr) and open_attr()):
+                    logger.debug("[%s] Already connected, skipping connect()", a.name)
+                    return True
+            except Exception:
+                pass
+
+        # Acquire platform-scoped lock to prevent duplicate connections
+        if not a._acquire_platform_lock(
+            'yuanbao-app-key', a._app_key, 'Yuanbao app key'
+        ):
+            return False
+
+        try:
+            # Step 1: Get sign token
+            logger.info("[%s] Fetching sign token from %s", a.name, a._api_domain)
+            token_data = await SignManager.get_token(
+                a._app_key, a._app_secret, a._api_domain,
+                route_env=a._route_env,
+            )
+
+            # Update bot_id if returned by sign-token API
+            if token_data.get("bot_id"):
+                a._bot_id = str(token_data["bot_id"])
+
+            # Step 2: Open WebSocket connection (disable built-in ping/pong)
+            logger.info("[%s] Connecting to %s", a.name, a._ws_url)
+            self._ws = await asyncio.wait_for(
+                websockets.connect(  # type: ignore[attr-defined]
+                    a._ws_url,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    close_timeout=5,
+                ),
+                timeout=CONNECT_TIMEOUT_SECONDS,
+            )
+
+            # Step 3: Authenticate (AUTH_BIND + wait for BIND_ACK)
+            authed = await self._authenticate(token_data)
+            if not authed:
+                await self._cleanup_ws()
+                return False
+
+            # Step 4: Start background tasks
+            self._reconnect_attempts = 0
+            a._mark_connected()
+            a._loop = asyncio.get_running_loop()
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
+            )
+            self._recv_task = asyncio.create_task(
+                self._receive_loop(), name=f"yuanbao-recv-{self._connect_id}"
+            )
+            logger.info(
+                "[%s] Connected. connectId=%s botId=%s",
+                a.name, self._connect_id, a._bot_id,
+            )
+
+            YuanbaoAdapter.set_active(a)
+
+            return True
+
+        except asyncio.TimeoutError:
+            logger.error("[%s] Connection timed out", a.name)
+            await self._cleanup_ws()
+            a._release_platform_lock()
+            return False
+        except Exception as exc:
+            logger.error("[%s] connect() failed: %s", a.name, exc, exc_info=True)
+            await self._cleanup_ws()
+            a._release_platform_lock()
+            return False
+
+    async def close(self) -> None:
+        """Cancel background tasks, fail pending futures, and close the WebSocket."""
+        a = self._adapter
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
+        if self._recv_task:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+            self._recv_task = None
+
+        # Fail any pending ACK futures
+        disc_exc = RuntimeError("YuanbaoAdapter disconnected")
+        for fut in self._pending_acks.values():
+            if not fut.done():
+                fut.set_exception(disc_exc)
+        self._pending_acks.clear()
+
+        # Clear refresh locks to avoid stale locks from a previous event loop
+        SignManager.clear_locks()
+
+        await self._cleanup_ws()
+
+    # -- Authentication ----------------------------------------------------
+
+    async def _authenticate(self, token_data: dict) -> bool:
+        """Send AUTH_BIND and read frames until BIND_ACK is received.
+
+        Returns True on success, False on failure/timeout.
+        """
+        a = self._adapter
+        if self._ws is None:
+            return False
+
+        token = token_data.get("token", "")
+        uid = a._bot_id or token_data.get("bot_id", "")
+        source = token_data.get("source") or "bot"
+        route_env = a._route_env or token_data.get("route_env", "") or ""
+
+        msg_id = str(uuid.uuid4())
+
+        auth_bytes = encode_auth_bind(
+            biz_id="ybBot",
+            uid=uid,
+            source=source,
+            token=token,
+            msg_id=msg_id,
+            app_version=_APP_VERSION,
+            operation_system=_OPERATION_SYSTEM,
+            bot_version=_BOT_VERSION,
+            route_env=route_env,
+        )
+        await self._ws.send(auth_bytes)
+        logger.debug("[%s] AUTH_BIND sent (msg_id=%s uid=%s)", a.name, msg_id, uid)
+
+        try:
+            _loop = asyncio.get_running_loop()
+            deadline = _loop.time() + AUTH_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - _loop.time()
+                if remaining <= 0:
+                    logger.error("[%s] AUTH_BIND timeout waiting for BIND_ACK", a.name)
+                    return False
+
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+                if not isinstance(raw, (bytes, bytearray)):
+                    continue
+
+                try:
+                    msg = decode_conn_msg(bytes(raw))
+                except Exception:
+                    continue
+
+                head = msg.get("head", {})
+                cmd_type = head.get("cmd_type", -1)
+                cmd = head.get("cmd", "")
+
+                if cmd_type == CMD_TYPE["Response"] and cmd == "auth-bind":
+                    connect_id = self._extract_connect_id(msg)
+                    if connect_id:
+                        self._connect_id = connect_id
+                        logger.info("[%s] BIND_ACK received: connectId=%s", a.name, connect_id)
+                        return True
+                    else:
+                        logger.error("[%s] BIND_ACK missing connectId", a.name)
+                        return False
+
+        except asyncio.TimeoutError:
+            logger.error("[%s] AUTH_BIND timeout", a.name)
+            return False
+        except Exception as exc:
+            logger.error("[%s] AUTH_BIND error: %s", a.name, exc, exc_info=True)
+            return False
+
+    def _extract_connect_id(self, decoded_msg: dict) -> Optional[str]:
+        """Extract connectId from decoded BIND_ACK message."""
+        data: bytes = decoded_msg.get("data", b"")
+        if not data:
+            return None
+        try:
+            fdict = _fields_to_dict(_parse_fields(data))
+            code = _get_varint(fdict, 1)
+            if code != 0:
+                message = _get_string(fdict, 2)
+                logger.error(
+                    "[%s] AuthBindRsp error: code=%d message=%r",
+                    self._adapter.name, code, message,
+                )
+                return None
+            connect_id = _get_string(fdict, 3)
+            return connect_id if connect_id else None
+        except Exception as exc:
+            logger.warning("[%s] Failed to extract connectId: %s", self._adapter.name, exc)
+            return None
+
+    # -- Heartbeat ---------------------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        """Send HEARTBEAT (ping) every 30s; trigger reconnect after threshold misses."""
+        a = self._adapter
+        try:
+            while a._running:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                if self._ws is None:
+                    continue
+                try:
+                    msg_id = str(uuid.uuid4())
+                    ping_bytes = encode_ping(msg_id)
+                    loop = asyncio.get_running_loop()
+                    pong_future: asyncio.Future = loop.create_future()
+                    self._pending_pong = pong_future
+                    self._pending_acks[msg_id] = pong_future
+                    await self._ws.send(ping_bytes)
+                    logger.debug("[%s] PING sent (msg_id=%s)", a.name, msg_id)
+                    try:
+                        await asyncio.wait_for(pong_future, timeout=10.0)
+                        self._consecutive_hb_timeouts = 0
+                    except asyncio.TimeoutError:
+                        self._pending_acks.pop(msg_id, None)
+                        self._consecutive_hb_timeouts += 1
+                        logger.warning(
+                            "[%s] PONG timeout (%d/%d)",
+                            a.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD,
+                        )
+                        if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
+                            logger.warning("[%s] Heartbeat threshold exceeded, triggering reconnect", a.name)
+                            self.schedule_reconnect()
+                            return
+                    finally:
+                        self._pending_acks.pop(msg_id, None)
+                        self._pending_pong = None
+                except Exception as exc:
+                    logger.debug("[%s] Heartbeat send failed: %s", a.name, exc)
+        except asyncio.CancelledError:
+            pass
+
+    # -- Receive loop ------------------------------------------------------
+
+    async def _receive_loop(self) -> None:
+        """Read WS frames and dispatch by cmd_type."""
+        a = self._adapter
+        try:
+            async for raw in self._ws:  # type: ignore[union-attr]
+                if not isinstance(raw, (bytes, bytearray)):
+                    continue
+                await self._handle_frame(bytes(raw))
+        except asyncio.CancelledError:
+            pass
+        except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
+            close_code = getattr(close_exc, 'code', None)
+            logger.warning(
+                "[%s] WebSocket connection closed: code=%s reason=%s",
+                a.name, close_code, getattr(close_exc, 'reason', ''),
+            )
+            if close_code and close_code in NO_RECONNECT_CLOSE_CODES:
+                logger.error(
+                    "[%s] Close code %d is non-recoverable, NOT reconnecting",
+                    a.name, close_code,
+                )
+                a._mark_disconnected()
+            else:
+                self.schedule_reconnect()
+        except Exception as exc:
+            logger.warning("[%s] receive_loop exited: %s", a.name, exc)
+            self.schedule_reconnect()
+
+    async def _handle_frame(self, raw: bytes) -> None:
+        """Handle a single WebSocket frame."""
+        a = self._adapter
+        try:
+            msg = decode_conn_msg(raw)
+        except Exception as exc:
+            logger.debug("[%s] Failed to decode frame: %s", a.name, exc)
+            return
+
+        head = msg.get("head", {})
+        cmd_type = head.get("cmd_type", -1)
+        cmd = head.get("cmd", "")
+        msg_id = head.get("msg_id", "")
+        need_ack = head.get("need_ack", False)
+        data: bytes = msg.get("data", b"")
+
+        # HEARTBEAT_ACK
+        if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
+            logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", a.name, msg_id)
+            if self._pending_pong is not None and not self._pending_pong.done():
+                self._pending_pong.set_result(True)
+            elif msg_id and msg_id in self._pending_acks:
+                fut = self._pending_acks.pop(msg_id)
+                if not fut.done():
+                    fut.set_result(True)
+            return
+
+        # Response to an outbound RPC call
+        if cmd_type == CMD_TYPE["Response"]:
+            if msg_id and msg_id in self._pending_acks:
+                fut = self._pending_acks.pop(msg_id)
+                if not fut.done():
+                    result = {"head": head}
+                    if data:
+                        result["data"] = data
+                    fut.set_result(result)
+            else:
+                logger.debug(
+                    "[%s] Unmatched Response: cmd=%s msg_id=%s",
+                    a.name, cmd, msg_id,
+                )
+            return
+
+        # Server-initiated Push
+        if cmd_type == CMD_TYPE["Push"]:
+            logger.info("[%s] Push received: cmd=%s msg_id=%s data_len=%d", a.name, cmd, msg_id, len(data))
+            if need_ack and self._ws is not None:
+                try:
+                    ack_bytes = encode_push_ack(head)
+                    await self._ws.send(ack_bytes)
+                except Exception as ack_exc:
+                    logger.debug("[%s] Failed to send PushAck: %s", a.name, ack_exc)
+
+            if msg_id and msg_id in self._pending_acks:
+                fut = self._pending_acks.pop(msg_id)
+                if not fut.done():
+                    try:
+                        decoded = decode_inbound_push(data) if data else {"head": head}
+                        fut.set_result(decoded)
+                    except Exception as exc:
+                        fut.set_exception(exc)
+                return
+
+            # Genuine inbound message — dispatch to AI
+            if data:
+                logger.info(
+                    "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
+                    a.name, cmd, len(data),
+                )
+                a._push_to_inbound(data)
+            return
+
+        logger.debug(
+            "[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s",
+            a.name, cmd_type, cmd, msg_id,
+        )
+
+    # -- Send business request ---------------------------------------------
+
+    async def send_biz_request(
+        self,
+        encoded_conn_msg: bytes,
+        req_id: str,
+        timeout: float = DEFAULT_SEND_TIMEOUT,
+    ) -> dict:
+        """Send a business-layer request and wait for the response.
+
+        1. Register a Future in pending_acks[req_id]
+        2. Send encoded_conn_msg (bytes) to WS
+        3. asyncio.wait_for(future, timeout)
+        4. Clean up pending_acks on timeout/exception
+        """
+        if self._ws is None:
+            raise RuntimeError("Not connected")
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending_acks[req_id] = future
+        try:
+            await self._ws.send(encoded_conn_msg)
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            raise
+        except Exception:
+            raise
+        finally:
+            self._pending_acks.pop(req_id, None)
+
+    # -- Reconnect ---------------------------------------------------------
+
+    def schedule_reconnect(self) -> None:
+        """Schedule a reconnect only if running and not already reconnecting."""
+        if self._adapter._running and not self._reconnecting:
+            asyncio.create_task(self._reconnect_with_backoff())
+
+    async def _reconnect_with_backoff(self) -> bool:
+        """Reconnect with exponential backoff (1s, 2s, 4s, … up to 60s)."""
+        if self._reconnecting:
+            logger.debug("[%s] Reconnect already in progress, skipping", self._adapter.name)
+            return False
+        self._reconnecting = True
+        try:
+            return await self._do_reconnect()
+        finally:
+            self._reconnecting = False
+
+    async def _do_reconnect(self) -> bool:
+        """Internal reconnect loop, called under the _reconnecting guard."""
+        a = self._adapter
+        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            self._reconnect_attempts = attempt + 1
+            wait = min(2 ** attempt, 60)
+            logger.info(
+                "[%s] Reconnect attempt %d/%d in %ds",
+                a.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait,
+            )
+            await asyncio.sleep(wait)
+
+            await self._cleanup_ws()
+
+            try:
+                token_data = await SignManager.force_refresh(
+                    a._app_key, a._app_secret, a._api_domain,
+                    route_env=a._route_env,
+                )
+                if token_data.get("bot_id"):
+                    a._bot_id = str(token_data["bot_id"])
+
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(  # type: ignore[attr-defined]
+                        a._ws_url,
+                        ping_interval=None,
+                        ping_timeout=None,
+                        close_timeout=5,
+                    ),
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                )
+
+                authed = await self._authenticate(token_data)
+                if not authed:
+                    logger.warning("[%s] Re-auth failed on attempt %d", a.name, attempt + 1)
+                    await self._cleanup_ws()
+                    continue
+
+                self._reconnect_attempts = 0
+                self._consecutive_hb_timeouts = 0
+                a._mark_connected()
+
+                if self._heartbeat_task and not self._heartbeat_task.done():
+                    self._heartbeat_task.cancel()
+                self._heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(),
+                    name=f"yuanbao-heartbeat-{self._connect_id}",
+                )
+
+                if self._recv_task and not self._recv_task.done():
+                    self._recv_task.cancel()
+                self._recv_task = asyncio.create_task(
+                    self._receive_loop(),
+                    name=f"yuanbao-recv-{self._connect_id}",
+                )
+
+                logger.info(
+                    "[%s] Reconnected on attempt %d. connectId=%s",
+                    a.name, attempt + 1, self._connect_id,
+                )
+                return True
+
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Reconnect attempt %d timed out", a.name, attempt + 1)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Reconnect attempt %d failed: %s", a.name, attempt + 1, exc
+                )
+
+        logger.error(
+            "[%s] Giving up after %d reconnect attempts", a.name, MAX_RECONNECT_ATTEMPTS
+        )
+        a._mark_disconnected()
+        return False
+
+    async def _cleanup_ws(self) -> None:
+        """Close and clear the WebSocket connection."""
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+# MediaSendHandler — strategy pattern for media message sending
+# ============================================================
+
+class MediaSendHandler(ABC):
+    """Abstract base class for media send strategies.
+
+    Subclasses implement:
+      - acquire_file(): how to obtain file bytes (download URL / read local)
+      - build_msg_body(): how to build TIMxxxElem from upload result
+
+    The shared flow (check ws → cancel notifier → validate → COS upload
+    → lock → dispatch) is handled by the base handle() template method.
+    """
+
+    @abstractmethod
+    async def acquire_file(
+        self, adapter: "YuanbaoAdapter", **kwargs: Any,
+    ) -> Tuple[bytes, str, str]:
+        """Return (file_bytes, filename, content_type).
+
+        Raises:
+            ValueError: when file cannot be acquired (not found, empty, etc.)
+        """
+
+    @abstractmethod
+    def build_msg_body(self, upload_result: dict, **kwargs: Any) -> list:
+        """Build platform-specific MsgBody list from COS upload result."""
+
+    def needs_cos_upload(self) -> bool:
+        """Override to return False for non-COS media (e.g. sticker)."""
+        return True
+
+    async def handle(
+        self,
+        adapter: "YuanbaoAdapter",
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        caption: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "SendResult":
+        """Template method: shared media send flow."""
+        conn = adapter._connection
+        outbound = adapter._outbound
+
+        if conn.ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        outbound.cancel_slow_response_notifier(chat_id)
+
+        try:
+            # 1. Acquire file bytes
+            file_bytes, filename, content_type = await self.acquire_file(
+                adapter, **kwargs,
+            )
+
+            # 2. Validate
+            validation_err = adapter._validate_media_before_queue(
+                file_bytes, filename, adapter.MEDIA_MAX_SIZE_MB,
+            )
+            if validation_err:
+                return SendResult(success=False, error=validation_err)
+
+            if self.needs_cos_upload():
+                file_uuid = md5_hex(file_bytes)
+
+                # 3. Get COS upload credentials
+                token_data = await adapter._get_cached_token()
+                token: str = token_data.get("token", "")
+                bot_id: str = (
+                    token_data.get("bot_id", "") or adapter._bot_id or ""
+                )
+
+                credentials = await get_cos_credentials(
+                    app_key=adapter._app_key,
+                    api_domain=adapter._api_domain,
+                    token=token,
+                    filename=filename,
+                    bot_id=bot_id,
+                    route_env=adapter._route_env,
+                )
+
+                # 4. Upload to COS
+                upload_result = await upload_to_cos(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    content_type=content_type,
+                    credentials=credentials,
+                    bucket=credentials["bucketName"],
+                    region=credentials["region"],
+                )
+
+                # 5. Build MsgBody
+                msg_body = self.build_msg_body(
+                    upload_result,
+                    file_uuid=file_uuid,
+                    filename=filename,
+                    content_type=content_type,
+                    **kwargs,
+                )
+            else:
+                # Non-COS media (e.g. sticker): build MsgBody directly
+                msg_body = self.build_msg_body({}, **kwargs)
+
+            # 6. Append caption if provided
+            if caption:
+                msg_body.append(
+                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}},
+                )
+
+            # 7. Lock + dispatch
+            return await outbound.dispatch_msg_body(chat_id, msg_body, reply_to)
+
+        except ValueError as ve:
+            return SendResult(success=False, error=str(ve))
+        except Exception as exc:
+            handler_name = type(self).__name__
+            logger.error(
+                "[%s] %s.handle() failed: %s",
+                adapter.name, handler_name, exc, exc_info=True,
+            )
+            return SendResult(success=False, error=str(exc))
+
+
+class ImageUrlHandler(MediaSendHandler):
+    """Strategy: send image from a URL (download → COS → TIMImageElem)."""
+
+    async def acquire_file(self, adapter, **kwargs):
+        image_url: str = kwargs["image_url"]
+        logger.info("[%s] ImageUrlHandler: downloading %s", adapter.name, image_url)
+        file_bytes, content_type = await media_download_url(
+            image_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
+        )
+        if not content_type or content_type == "application/octet-stream":
+            path_part = image_url.split("?")[0]
+            content_type = guess_mime_type(path_part) or "image/jpeg"
+        filename = os.path.basename(image_url.split("?")[0]) or "image.jpg"
+        return file_bytes, filename, content_type
+
+    def build_msg_body(self, upload_result, **kwargs):
+        return build_image_msg_body(
+            url=upload_result["url"],
+            uuid=kwargs["file_uuid"],
+            filename=kwargs["filename"],
+            size=upload_result["size"],
+            width=upload_result.get("width", 0),
+            height=upload_result.get("height", 0),
+            mime_type=kwargs["content_type"],
+        )
+
+
+class ImageFileHandler(MediaSendHandler):
+    """Strategy: send image from a local file path (read → COS → TIMImageElem)."""
+
+    async def acquire_file(self, adapter, **kwargs):
+        image_path: str = kwargs["image_path"]
+        if not os.path.isfile(image_path):
+            raise ValueError(f"File not found: {image_path}")
+        logger.info("[%s] ImageFileHandler: reading %s", adapter.name, image_path)
+        with open(image_path, "rb") as f:
+            file_bytes = f.read()
+        filename = os.path.basename(image_path) or "image.jpg"
+        content_type = guess_mime_type(filename) or "image/jpeg"
+        return file_bytes, filename, content_type
+
+    def build_msg_body(self, upload_result, **kwargs):
+        return build_image_msg_body(
+            url=upload_result["url"],
+            uuid=kwargs["file_uuid"],
+            filename=kwargs["filename"],
+            size=upload_result["size"],
+            width=upload_result.get("width", 0),
+            height=upload_result.get("height", 0),
+            mime_type=kwargs["content_type"],
+        )
+
+
+class FileUrlHandler(MediaSendHandler):
+    """Strategy: send file from a URL (download → COS → TIMFileElem)."""
+
+    async def acquire_file(self, adapter, **kwargs):
+        file_url: str = kwargs["file_url"]
+        logger.info("[%s] FileUrlHandler: downloading %s", adapter.name, file_url)
+        file_bytes, content_type = await media_download_url(
+            file_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
+        )
+        filename = kwargs.get("filename")
+        if not filename:
+            path_part = file_url.split("?")[0]
+            filename = os.path.basename(path_part) or "file"
+        if not content_type or content_type == "application/octet-stream":
+            content_type = guess_mime_type(filename) or "application/octet-stream"
+        return file_bytes, filename, content_type
+
+    def build_msg_body(self, upload_result, **kwargs):
+        return build_file_msg_body(
+            url=upload_result["url"],
+            filename=kwargs["filename"],
+            uuid=kwargs["file_uuid"],
+            size=upload_result["size"],
+        )
+
+
+class DocumentHandler(MediaSendHandler):
+    """Strategy: send local file/document (read → COS → TIMFileElem)."""
+
+    async def acquire_file(self, adapter, **kwargs):
+        file_path: str = kwargs["file_path"]
+        if not os.path.isfile(file_path):
+            raise ValueError(f"File not found: {file_path}")
+        logger.info("[%s] DocumentHandler: reading %s", adapter.name, file_path)
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        filename = kwargs.get("filename") or os.path.basename(file_path) or "document"
+        content_type = guess_mime_type(filename) or "application/octet-stream"
+        return file_bytes, filename, content_type
+
+    def build_msg_body(self, upload_result, **kwargs):
+        return build_file_msg_body(
+            url=upload_result["url"],
+            filename=kwargs["filename"],
+            uuid=kwargs["file_uuid"],
+            size=upload_result["size"],
+        )
+
+
+class StickerHandler(MediaSendHandler):
+    """Strategy: send sticker/emoji (TIMFaceElem, no COS upload needed)."""
+
+    def needs_cos_upload(self) -> bool:
+        return False
+
+    async def acquire_file(self, adapter, **kwargs):
+        # Sticker does not need file bytes; return dummy values
+        return b"", "sticker", "application/octet-stream"
+
+    def build_msg_body(self, upload_result, **kwargs):
+        from gateway.platforms.yuanbao_sticker import (
+            get_sticker_by_name,
+            get_random_sticker,
+            build_face_msg_body,
+            build_sticker_msg_body,
+        )
+        sticker_name = kwargs.get("sticker_name")
+        face_index = kwargs.get("face_index")
+
+        if sticker_name is not None:
+            sticker = get_sticker_by_name(sticker_name)
+            if sticker is None:
+                raise ValueError(f"Sticker not found: {sticker_name!r}")
+            return build_sticker_msg_body(sticker)
+        elif face_index is not None:
+            return build_face_msg_body(face_index=face_index)
+        else:
+            sticker = get_random_sticker()
+            return build_sticker_msg_body(sticker)
+
+
+# ============================================================
+# OutboundManager — outbound message sending (text / media / heartbeat)
+# ============================================================
+
+class OutboundManager:
+    """Manages all outbound message sending for YuanbaoAdapter.
+
+    Responsibilities:
+      - Per-chat-id lock management (serial send ordering)
+      - Text chunk sending with retry
+      - C2C / Group message encoding and dispatch
+      - Reply heartbeat (RUNNING / FINISH) signals
+      - Slow-response notifier
+      - Media send helpers (image, file, sticker, document)
+      - Direct send helper (text + media, used by send_message tool)
+    """
+
+    IMAGE_EXTS: ClassVar[frozenset] = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
+    CHAT_DICT_MAX_SIZE: ClassVar[int] = 1000  # Max distinct chat IDs in _chat_locks
+
+    # -- Cron wrapper stripping ---------------------------------------------
+
+    @staticmethod
+    def strip_cron_wrapper(content: str) -> str:
+        """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output."""
+        if not content.startswith("Cronjob Response: "):
+            return content
+
+        divider = "\n-------------\n\n"
+        footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+        divider_pos = content.find(divider)
+        footer_pos = content.rfind(footer_prefix)
+        if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+            return content
+
+        header = content[:divider_pos]
+        if "\n(job_id: " not in header:
+            return content
+
+        body_start = divider_pos + len(divider)
+        body = content[body_start:footer_pos].strip()
+        return body or content
+
+    def __init__(self, adapter: "YuanbaoAdapter") -> None:
+        self._adapter = adapter
+        self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
+
+        # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
+        self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
+        self._reply_hb_last_active: Dict[str, float] = {}
+
+        # Slow-response notifier: chat_id -> asyncio.Task
+        self._slow_response_tasks: Dict[str, asyncio.Task] = {}
+
+        # Media send handlers (strategy pattern)
+        self._media_handlers: Dict[str, MediaSendHandler] = {
+            "image_url": ImageUrlHandler(),
+            "image_file": ImageFileHandler(),
+            "file_url": FileUrlHandler(),
+            "document": DocumentHandler(),
+            "sticker": StickerHandler(),
+        }
+
+    # -- Media handler registry ---------------------------------------------
+
+    def register_handler(self, name: str, handler: MediaSendHandler) -> None:
+        """Register (or replace) a named media send handler."""
+        self._media_handlers[name] = handler
+
+    async def send_media(
+        self,
+        chat_id: str,
+        handler_name: str,
+        reply_to: Optional[str] = None,
+        caption: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "SendResult":
+        """Dispatch media send to the named handler strategy."""
+        handler = self._media_handlers.get(handler_name)
+        if handler is None:
+            return SendResult(
+                success=False,
+                error=f"Unknown media handler: {handler_name!r}",
+            )
+        return await handler.handle(
+            self._adapter, chat_id,
+            reply_to=reply_to, caption=caption, **kwargs,
+        )
+
+    async def dispatch_msg_body(
+        self,
+        chat_id: str,
+        msg_body: list,
+        reply_to: Optional[str] = None,
+    ) -> "SendResult":
+        """Lock + dispatch an arbitrary MsgBody to C2C or group."""
+        lock = self.get_chat_lock(chat_id)
+        async with lock:
+            if chat_id.startswith("group:"):
+                group_code = chat_id[len("group:"):]
+                result = await self.send_group_msg_body(group_code, msg_body, reply_to)
+            else:
+                to_account = chat_id.removeprefix("direct:")
+                result = await self.send_c2c_msg_body(to_account, msg_body)
+
+        if result.get("success"):
+            return SendResult(success=True, message_id=result.get("msg_key"))
+        return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+    # -- Chat lock ---------------------------------------------------------
+
+    def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return (or create) a per-chat-id lock with safe LRU eviction."""
+        if chat_id in self._chat_locks:
+            self._chat_locks.move_to_end(chat_id)
+            return self._chat_locks[chat_id]
+        if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
+            evicted = False
+            for key in list(self._chat_locks):
+                if not self._chat_locks[key].locked():
+                    self._chat_locks.pop(key)
+                    evicted = True
+                    break
+            if not evicted:
+                self._chat_locks.pop(next(iter(self._chat_locks)))
+        self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
+
+    # -- Text send ---------------------------------------------------------
+
+    async def send_text(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+    ) -> "SendResult":
+        """Send text message with auto-chunking and per-chat-id ordering guarantee."""
+        a = self._adapter
+        conn = a._connection
+        if conn.ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        self.cancel_slow_response_notifier(chat_id)
+
+        lock = self.get_chat_lock(chat_id)
+        async with lock:
+            content_to_send = self.strip_cron_wrapper(content)
+            chunks = a.truncate_message(content_to_send, a.MAX_TEXT_CHUNK)
+            logger.info(
+                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
+                a.name, len(content_to_send), a.MAX_TEXT_CHUNK,
+                len(chunks), [len(c) for c in chunks],
+            )
+            for i, chunk in enumerate(chunks):
+                r_to = reply_to if i == 0 else None
+                result = await self.send_text_chunk(chat_id, chunk, r_to)
+                if not result.success:
+                    return result
+
+        # Send FINISH heartbeat after message delivery
+        try:
+            await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+        except Exception:
+            pass
+        return SendResult(success=True)
+
+    async def send_text_chunk(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        retry: int = 3,
+    ) -> "SendResult":
+        """Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s)."""
+        a = self._adapter
+        last_error: str = "Unknown error"
+        for attempt in range(retry):
+            try:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    raw = await self.send_group_message(group_code, text, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    raw = await self.send_c2c_message(to_account, text)
+
+                if raw.get("success"):
+                    return SendResult(success=True, message_id=raw.get("msg_key"))
+
+                last_error = raw.get("error", "Unknown error")
+                logger.warning(
+                    "[%s] send_text_chunk attempt %d/%d failed: %s",
+                    a.name, attempt + 1, retry, last_error,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "[%s] send_text_chunk attempt %d/%d exception: %s",
+                    a.name, attempt + 1, retry, last_error,
+                )
+
+            if attempt < retry - 1:
+                await asyncio.sleep(2 ** attempt)
+
+        logger.error(
+            "[%s] send_text_chunk max retries (%d) exceeded. Last error: %s",
+            a.name, retry, last_error,
+        )
+        return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
+
+    # -- C2C / Group message -----------------------------------------------
+
+    async def send_c2c_message(self, to_account: str, text: str) -> dict:
+        """Send C2C text message, return {success: bool, msg_key: str}."""
+        a = self._adapter
+        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+        req_id = f"c2c_{next_seq_no()}"
+        encoded = encode_send_c2c_message(
+            to_account=to_account,
+            msg_body=msg_body,
+            from_account=a._bot_id or "",
+            msg_id=req_id,
+        )
+        try:
+            response = await a._connection.send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def send_group_message(
+        self,
+        group_code: str,
+        text: str,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """Send group text message, auto-converting @nickname to TIMCustomElem."""
+        a = self._adapter
+        msg_body = a._build_msg_body_with_mentions(text, group_code)
+        req_id = f"grp_{next_seq_no()}"
+        encoded = encode_send_group_message(
+            group_code=group_code,
+            msg_body=msg_body,
+            from_account=a._bot_id or "",
+            msg_id=req_id,
+            ref_msg_id=reply_to or "",
+        )
+        try:
+            response = await a._connection.send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
+        """Send C2C message with arbitrary MsgBody."""
+        a = self._adapter
+        req_id = f"c2c_{next_seq_no()}"
+        encoded = encode_send_c2c_message(
+            to_account=to_account,
+            msg_body=msg_body,
+            from_account=a._bot_id or "",
+            msg_id=req_id,
+        )
+        try:
+            response = await a._connection.send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timeout after 30.0s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def send_group_msg_body(
+        self,
+        group_code: str,
+        msg_body: list,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """Send group message with arbitrary MsgBody."""
+        a = self._adapter
+        req_id = f"grp_{next_seq_no()}"
+        encoded = encode_send_group_message(
+            group_code=group_code,
+            msg_body=msg_body,
+            from_account=a._bot_id or "",
+            msg_id=req_id,
+            ref_msg_id=reply_to or "",
+        )
+        try:
+            response = await a._connection.send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timeout after 30.0s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    # -- Heartbeat signals -------------------------------------------------
+
+    async def send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
+        """Send a single heartbeat (RUNNING or FINISH), best effort."""
+        a = self._adapter
+        conn = a._connection
+        if conn.ws is None or not a._bot_id:
+            return
+        try:
+            if chat_id.startswith("group:"):
+                group_code = chat_id[len("group:"):]
+                encoded = encode_send_group_heartbeat(
+                    from_account=a._bot_id,
+                    group_code=group_code,
+                    heartbeat=heartbeat_val,
+                )
+            else:
+                to_account = chat_id.removeprefix("direct:")
+                encoded = encode_send_private_heartbeat(
+                    from_account=a._bot_id,
+                    to_account=to_account,
+                    heartbeat=heartbeat_val,
+                )
+            await conn.ws.send(encoded)
+            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
+            logger.debug(
+                "[%s] Reply heartbeat %s sent: chat=%s",
+                a.name, status_name, chat_id,
+            )
+        except Exception as exc:
+            logger.debug("[%s] send_heartbeat_once failed: %s", a.name, exc)
+
+    # -- Reply heartbeat state machine -------------------------------------
+
+    async def start_reply_heartbeat(self, chat_id: str) -> None:
+        """Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s)."""
+        a = self._adapter
+        conn = a._connection
+        if conn.ws is None or not a._bot_id:
+            return
+
+        existing = self._reply_heartbeat_tasks.get(chat_id)
+        if existing and not existing.done():
+            self._reply_hb_last_active[chat_id] = time.time()
+            return
+
+        self._reply_hb_last_active[chat_id] = time.time()
+
+        task = asyncio.create_task(
+            self._reply_heartbeat_worker(chat_id),
+            name=f"yuanbao-reply-hb-{chat_id}",
+        )
+        self._reply_heartbeat_tasks[chat_id] = task
+
+    async def _reply_heartbeat_worker(self, chat_id: str) -> None:
+        """Background coroutine: send RUNNING heartbeat every 2s.
+        30s without renewal → send FINISH and exit.
+        """
+        try:
+            await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
+
+            while True:
+                await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
+
+                last_active = self._reply_hb_last_active.get(chat_id, 0)
+                if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
+                    break
+
+                conn = self._adapter._connection
+                if conn.ws is None:
+                    break
+
+                await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
+
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            cancelled = False
+        else:
+            cancelled = False
+        finally:
+            if not cancelled:
+                try:
+                    await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+                except Exception:
+                    pass
+            self._reply_heartbeat_tasks.pop(chat_id, None)
+            self._reply_hb_last_active.pop(chat_id, None)
+
+    async def stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
+        """Stop Reply Heartbeat and optionally send FINISH."""
+        task = self._reply_heartbeat_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if send_finish:
+            try:
+                await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+            except Exception:
+                pass
+
+    # -- Slow-response notifier --------------------------------------------
+
+    async def start_slow_response_notifier(self, chat_id: str) -> None:
+        """Start a delayed task that notifies the user when the agent is slow."""
+        self.cancel_slow_response_notifier(chat_id)
+        task = asyncio.create_task(
+            self._slow_response_notifier(chat_id),
+            name=f"yuanbao-slow-resp-{chat_id}",
+        )
+        self._slow_response_tasks[chat_id] = task
+
+    async def _slow_response_notifier(self, chat_id: str) -> None:
+        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
+        try:
+            await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
+            logger.info(
+                "[%s] Agent response exceeded %ds for %s, sending wait notice",
+                self._adapter.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
+            )
+            await self.send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("[%s] Slow-response notifier failed: %s", self._adapter.name, exc)
+
+    def cancel_slow_response_notifier(self, chat_id: str) -> None:
+        """Cancel the pending slow-response notifier for *chat_id*, if any."""
+        task = self._slow_response_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    # -- Cleanup on disconnect ---------------------------------------------
+
+    async def close(self) -> None:
+        """Cancel all reply heartbeat and slow-response tasks."""
+        for task in list(self._reply_heartbeat_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._reply_heartbeat_tasks.clear()
+
+        for task in list(self._slow_response_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._slow_response_tasks.clear()
+
+    # -- Direct send (text + media, used by send_message tool) -------------
+
+    async def send_direct(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: Optional[List[Tuple[str, bool]]] = None,
+    ) -> Dict[str, Any]:
+        """Send text + media via Yuanbao (used by the ``send_message`` tool).
+
+        Unlike Weixin which creates a fresh adapter per call, Yuanbao reuses
+        the running gateway adapter (persistent WebSocket).  Logic mirrors
+        send_weixin_direct: send text first, then iterate media_files by
+        extension.
+        """
+        a = self._adapter
+        last_result: Optional["SendResult"] = None
+
+        # 1. Send text
+        if message.strip():
+            last_result = await a.send(chat_id, message)
+            if not last_result.success:
+                return {"error": f"Yuanbao send failed: {last_result.error}"}
+
+        # 2. Iterate media_files, dispatch by file extension
+        for media_path, _is_voice in media_files or []:
+            ext = Path(media_path).suffix.lower()
+            if ext in self.IMAGE_EXTS:
+                last_result = await a.send_image_file(chat_id, media_path)
+            else:
+                last_result = await a.send_document(chat_id, media_path)
+
+            if not last_result.success:
+                return {"error": f"Yuanbao media send failed: {last_result.error}"}
+
+        if last_result is None:
+            return {"error": "No deliverable text or media remained after processing"}
+
+        return {
+            "success": True,
+            "platform": "yuanbao",
+            "chat_id": chat_id,
+            "message_id": last_result.message_id if last_result else None,
+        }
+
 
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
+    REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
+    SKIPPABLE_PLACEHOLDERS: ClassVar[frozenset] = frozenset({
+        "[image]", "[图片]", "[file]", "[文件]",
+        "[video]", "[视频]", "[voice]", "[语音]",
+    })
+
+    # -- Active instance registry (class-level singleton) -------------------
+
+    _active_instance: ClassVar[Optional["YuanbaoAdapter"]] = None
+
+    @classmethod
+    def get_active(cls) -> Optional["YuanbaoAdapter"]:
+        """Return the currently connected YuanbaoAdapter, or None."""
+        return cls._active_instance
+
+    @classmethod
+    def set_active(cls, adapter: Optional["YuanbaoAdapter"]) -> None:
+        """Register (or clear) the active adapter instance."""
+        cls._active_instance = adapter
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
@@ -203,34 +2051,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._api_domain: str = (config.yuanbao_api_domain or DEFAULT_API_DOMAIN).rstrip("/")
         self._route_env: str = (config.yuanbao_route_env or "").strip()
 
-        # Runtime state
-        self._ws = None                          # websockets connection
-        self._connect_id: Optional[str] = None  # received from BIND_ACK
-        self._pending_acks: Dict[str, asyncio.Future] = {}  # req_id (str) -> Future
-        self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
-
-        # Background tasks
-        self._heartbeat_task: Optional[asyncio.Task] = None
-        self._recv_task: Optional[asyncio.Task] = None
+        # Core managers (UML composition)
+        self._connection: ConnectionManager = ConnectionManager(self)
+        self._outbound: OutboundManager = OutboundManager(self)
 
         # Inbound dispatch tasks — tracked so disconnect() can cancel them
         self._inbound_tasks: set[asyncio.Task] = set()
-
-        # Reconnection state
-        self._reconnect_attempts: int = 0
-        self._reconnecting: bool = False         # guards against concurrent reconnects
-        self._consecutive_hb_timeouts: int = 0  # heartbeat timeout counter
-        self._pending_pong: Optional[asyncio.Future] = None  # current in-flight ping future
-        self._reconnect_in_progress: bool = False  # guards against concurrent reconnect tasks
 
         # Set of background tasks — prevent GC from collecting fire-and-forget tasks
         self._background_tasks: set[asyncio.Task] = set()
 
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
-
-        # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
-        self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
 
         # Member cache: group_code -> [{"user_id":..., "nickname":..., ...}, ...]
         # Populated by get_group_member_list(), used by @mention resolution.
@@ -242,13 +2074,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # Only the first outbound message carries refMsgId for a given inbound msg.
         self._reply_ref_used: Dict[str, float] = {}
-
-        # Slow-response notifier: chat_id -> asyncio.Task
-        # Fires a "please wait" message if the agent takes > SLOW_RESPONSE_TIMEOUT_S
-        self._slow_response_tasks: Dict[str, asyncio.Task] = {}
-
-        # Reply Heartbeat last-active timestamps: chat_id -> unix timestamp
-        self._reply_hb_last_active: Dict[str, float] = {}
 
         # replyToMode config: 'off' | 'first' | 'all' (default: 'first')
         self._reply_to_mode: str = (
@@ -281,6 +2106,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
         )
         self._group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
 
+        # Inbound message processing pipeline (middleware pattern)
+        self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
+
     # ------------------------------------------------------------------
     # Task tracking helper
     # ------------------------------------------------------------------
@@ -296,152 +2124,24 @@ class YuanbaoAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
+        """Connect to Yuanbao WS gateway and authenticate.
+
+        Delegates to ConnectionManager.open().
         """
-        Connect to Yuanbao WS gateway and authenticate.
-
-        Flow:
-          1. Get sign token via HTTP API
-          2. Open WebSocket connection (websockets library, no built-in ping)
-          3. Send AUTH_BIND, wait for BIND_ACK, extract connectId
-          4. Start heartbeat task and receive task
-        """
-        if not WEBSOCKETS_AVAILABLE:
-            msg = "Yuanbao startup failed: 'websockets' package not installed"
-            self._set_fatal_error("yuanbao_missing_dependency", msg, retryable=True)
-            logger.warning("[%s] %s. Run: pip install websockets", self.name, msg)
-            return False
-
-        if not self._app_key or not self._app_secret:
-            msg = (
-                "Yuanbao startup failed: "
-                "YUANBAO_APP_ID and YUANBAO_APP_SECRET are required"
-            )
-            self._set_fatal_error("yuanbao_missing_credentials", msg, retryable=False)
-            logger.error("[%s] %s", self.name, msg)
-            return False
-
-        # Idempotency guard
-        if self._ws is not None:
-            try:
-                # websockets >= 10 uses .open; fallback attribute check
-                is_open = getattr(self._ws, "open", None)
-                if is_open is True or (callable(is_open) and is_open()):
-                    logger.debug("[%s] Already connected, skipping connect()", self.name)
-                    return True
-            except Exception:
-                pass
-
-        # Acquire platform-scoped lock to prevent duplicate connections
-        if not self._acquire_platform_lock(
-            'yuanbao-app-key', self._app_key, 'Yuanbao app key'
-        ):
-            return False
-
-        try:
-            # Step 1: Get sign token
-            logger.info("[%s] Fetching sign token from %s", self.name, self._api_domain)
-            token_data = await get_sign_token(
-                self._app_key, self._app_secret, self._api_domain,
-                route_env=self._route_env,
-            )
-
-            # Update bot_id if returned by sign-token API
-            if token_data.get("bot_id"):
-                self._bot_id = str(token_data["bot_id"])
-
-            # Step 2: Open WebSocket connection (disable built-in ping/pong)
-            logger.info("[%s] Connecting to %s", self.name, self._ws_url)
-            self._ws = await asyncio.wait_for(
-                websockets.connect(  # type: ignore[attr-defined]
-                    self._ws_url,
-                    ping_interval=None,   # we manage heartbeat ourselves
-                    ping_timeout=None,
-                    close_timeout=5,
-                ),
-                timeout=CONNECT_TIMEOUT_SECONDS,
-            )
-
-            # Step 3: Authenticate (AUTH_BIND + wait for BIND_ACK)
-            authed = await self._authenticate(token_data)
-            if not authed:
-                await self._cleanup_ws()
-                return False
-
-            # Step 4: Start background tasks
-            self._reconnect_attempts = 0
-            self._mark_connected()
-            self._loop = asyncio.get_running_loop()
-            self._heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
-            )
-            self._recv_task = asyncio.create_task(
-                self._receive_loop(), name=f"yuanbao-recv-{self._connect_id}"
-            )
-            logger.info(
-                "[%s] Connected. connectId=%s botId=%s",
-                self.name, self._connect_id, self._bot_id,
-            )
-
-            global _active_adapter
-            _active_adapter = self
-
-            return True
-
-        except asyncio.TimeoutError:
-            logger.error("[%s] Connection timed out", self.name)
-            await self._cleanup_ws()
-            self._release_platform_lock()
-            return False
-        except Exception as exc:
-            logger.error("[%s] connect() failed: %s", self.name, exc, exc_info=True)
-            await self._cleanup_ws()
-            self._release_platform_lock()
-            return False
+        return await self._connection.open()
 
     async def disconnect(self) -> None:
         """Cancel background tasks and close the WebSocket connection."""
-        global _active_adapter
-        if _active_adapter is self:
-            _active_adapter = None
+        if YuanbaoAdapter._active_instance is self:
+            YuanbaoAdapter.set_active(None)
 
         self._running = False
         self._mark_disconnected()
         self._release_platform_lock()
 
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
-        if self._recv_task:
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
-            self._recv_task = None
-
-        # Fail any pending ACK futures
-        disc_exc = RuntimeError("YuanbaoAdapter disconnected")
-        for fut in self._pending_acks.values():
-            if not fut.done():
-                fut.set_exception(disc_exc)
-        self._pending_acks.clear()
-
-        # Cancel all reply heartbeat tasks
-        for task in list(self._reply_heartbeat_tasks.values()):
-            if not task.done():
-                task.cancel()
-        self._reply_heartbeat_tasks.clear()
-
-        # Cancel all slow-response notifiers
-        for task in list(self._slow_response_tasks.values()):
-            if not task.done():
-                task.cancel()
-        self._slow_response_tasks.clear()
+        # Delegate to managers
+        await self._connection.close()
+        await self._outbound.close()
 
         # Cancel all in-flight inbound dispatch tasks
         for task in list(self._inbound_tasks):
@@ -449,31 +2149,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 task.cancel()
         self._inbound_tasks.clear()
 
-        # Clear module-level refresh locks to avoid stale locks from a previous event loop
-        _refresh_locks.clear()
-
-        await self._cleanup_ws()
         logger.info("[%s] Disconnected", self.name)
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Return (or create) a per-chat-id lock with safe LRU eviction."""
-        if chat_id in self._chat_locks:
-            # Move to end (most-recently-used) so LRU eviction targets idle keys
-            self._chat_locks.move_to_end(chat_id)
-            return self._chat_locks[chat_id]
-        if len(self._chat_locks) >= _CHAT_DICT_MAX_SIZE:
-            # Evict the oldest *unlocked* entry to avoid breaking in-flight sends
-            evicted = False
-            for key in list(self._chat_locks):
-                if not self._chat_locks[key].locked():
-                    self._chat_locks.pop(key)
-                    evicted = True
-                    break
-            if not evicted:
-                # All locks are held — pop the oldest anyway as a last resort
-                self._chat_locks.pop(next(iter(self._chat_locks)))
-        self._chat_locks[chat_id] = asyncio.Lock()
-        return self._chat_locks[chat_id]
+        return self._outbound.get_chat_lock(chat_id)
 
     def _should_attach_reply_ref(self, inbound_msg_id: str) -> bool:
         """
@@ -496,7 +2176,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         now = time.time()
 
         # Clean up expired entries
-        if len(self._reply_ref_used) > _REPLY_REF_MAX_ENTRIES:
+        if len(self._reply_ref_used) > self.REPLY_REF_MAX_ENTRIES:
             expired = [k for k, ts in self._reply_ref_used.items() if now - ts > REPLY_REF_TTL_S]
             for k in expired:
                 self._reply_ref_used.pop(k, None)
@@ -521,7 +2201,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if media_count > 0:
             return False
         stripped = text.strip()
-        return stripped in _SKIPPABLE_PLACEHOLDERS
+        return stripped in YuanbaoAdapter.SKIPPABLE_PLACEHOLDERS
 
     @staticmethod
     def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
@@ -692,7 +2372,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
                 if resp.status_code == 401 and attempt == 0:
                     # Force refresh token once on expiry and retry
-                    token_data = await force_refresh_sign_token(self._app_key, self._app_secret, self._api_domain)
+                    token_data = await SignManager.force_refresh(self._app_key, self._app_secret, self._api_domain)
                     token = str(token_data.get("token") or "").strip()
                     source = str(token_data.get("source") or source or "web").strip() or "web"
                     bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
@@ -744,7 +2424,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             parts = BasePlatformAdapter.truncate_message(text, max_length, len_fn)
             return [_INDICATOR_RE.sub('', p) for p in parts]
 
-        atoms = _split_into_atoms(content)
+        atoms = MarkdownProcessor.split_into_atoms(content)
 
         chunks: List[str] = []
         current_parts: List[str] = []
@@ -770,7 +2450,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 sep_len = 0
 
             if not current_parts and atom_len > max_length:
-                if _is_table_atom(atom):
+                if MarkdownProcessor.is_table_atom(atom):
                     chunks.append(atom)
                     continue
                 chunks.extend(_base_split_no_indicator(atom))
@@ -802,44 +2482,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """
-        Send text message with auto-chunking and per-chat-id ordering guarantee.
-
-        chat_id format:
-          - C2C:  "direct:{account_id}" or plain "{account_id}" (no prefix)
-          - Group: "group:{group_code}"
-
-        Enhanced logic:
-          1. Acquire or create a lock for the chat_id to ensure serial sending per chat_id
-          2. Call truncate_message() for chunking (preserving code fence integrity)
-          3. Send each chunk via _send_text_chunk() (with retry); stop immediately on any failure
-        """
-        if self._ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        self._cancel_slow_response_notifier(chat_id)
-
-        lock = self._get_chat_lock(chat_id)
-        async with lock:
-            content_to_send = _strip_cron_wrapper_for_yuanbao(content)
-            chunks = self.truncate_message(content_to_send, self.MAX_TEXT_CHUNK)
-            logger.info(
-                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
-                self.name, len(content_to_send), self.MAX_TEXT_CHUNK,
-                len(chunks), [len(c) for c in chunks],
-            )
-            for i, chunk in enumerate(chunks):
-                r_to = reply_to if i == 0 else None
-                result = await self._send_text_chunk(chat_id, chunk, r_to)
-                if not result.success:
-                    return result
-
-        # Send FINISH heartbeat after message delivery to ensure ordering: RUNNING → message arrives → FINISH
-        try:
-            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-        except Exception:
-            pass
-        return SendResult(success=True)
+        """Send text message with auto-chunking. Delegates to OutboundManager."""
+        return await self._outbound.send_text(chat_id, content, reply_to)
 
     async def _send_text_chunk(
         self,
@@ -848,64 +2492,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         retry: int = 3,
     ) -> SendResult:
-        """
-        Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s).
-
-        - Retry up to `retry` times
-        - Wait 2^attempt seconds after each failure (0→1s, 1→2s, 2→4s)
-        - Return the final result
-        """
-        last_error: str = "Unknown error"
-        for attempt in range(retry):
-            try:
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    raw = await self._send_group_message(group_code, text, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    raw = await self._send_c2c_message(to_account, text)
-
-                if raw.get("success"):
-                    return SendResult(success=True, message_id=raw.get("msg_key"))
-
-                last_error = raw.get("error", "Unknown error")
-                logger.warning(
-                    "[%s] _send_text_chunk attempt %d/%d failed: %s",
-                    self.name, attempt + 1, retry, last_error,
-                )
-            except Exception as exc:
-                last_error = str(exc)
-                logger.warning(
-                    "[%s] _send_text_chunk attempt %d/%d exception: %s",
-                    self.name, attempt + 1, retry, last_error,
-                )
-
-            if attempt < retry - 1:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
-
-        logger.error(
-            "[%s] _send_text_chunk max retries (%d) exceeded. Last error: %s",
-            self.name, retry, last_error,
-        )
-        return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
+        """Send a single text chunk with retry. Delegates to OutboundManager."""
+        return await self._outbound.send_text_chunk(chat_id, text, reply_to, retry)
 
     async def _send_c2c_message(self, to_account: str, text: str) -> dict:
-        """Send C2C text message, return {success: bool, msg_key: str}."""
-        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
-        req_id = f"c2c_{next_seq_no()}"
-        encoded = encode_send_c2c_message(
-            to_account=to_account,
-            msg_body=msg_body,
-            from_account=self._bot_id or "",
-            msg_id=req_id,
-        )
-        try:
-            response = await self._send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        """Send C2C text message. Delegates to OutboundManager."""
+        return await self._outbound.send_c2c_message(to_account, text)
 
     # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
     _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
@@ -963,23 +2555,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         text: str,
         reply_to: Optional[str] = None,
     ) -> dict:
-        """Send group text message, auto-converting @nickname to TIMCustomElem."""
-        msg_body = self._build_msg_body_with_mentions(text, group_code)
-        req_id = f"grp_{next_seq_no()}"
-        encoded = encode_send_group_message(
-            group_code=group_code,
-            msg_body=msg_body,
-            from_account=self._bot_id or "",
-            msg_id=req_id,
-            ref_msg_id=reply_to or "",
-        )
-        try:
-            response = await self._send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        """Send group text message. Delegates to OutboundManager."""
+        return await self._outbound.send_group_message(group_code, text, reply_to)
 
     async def _send_biz_request(
         self,
@@ -987,30 +2564,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         req_id: str,
         timeout: float = DEFAULT_SEND_TIMEOUT,
     ) -> dict:
-        """
-        Send a business-layer request and wait for the response.
-
-        1. Register a Future in self._pending_acks[req_id]
-        2. Send encoded_conn_msg (bytes) to WS
-        3. asyncio.wait_for(future, timeout)
-        4. Clean up pending_acks on timeout/exception
-        """
-        if self._ws is None:
-            raise RuntimeError("Not connected")
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._pending_acks[req_id] = future
-        try:
-            await self._ws.send(encoded_conn_msg)
-            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
-            return result
-        except asyncio.TimeoutError:
-            raise
-        except Exception as exc:
-            raise
-        finally:
-            self._pending_acks.pop(req_id, None)
+        """Send a business-layer request. Delegates to ConnectionManager."""
+        return await self._connection.send_biz_request(encoded_conn_msg, req_id, timeout)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic chat metadata derived from the chat_id prefix.
@@ -1028,283 +2583,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
-
-    async def _authenticate(self, token_data: dict) -> bool:
-        """
-        Send AUTH_BIND and read frames until BIND_ACK is received.
-
-        Because _receive_loop is a placeholder (T05), we read frames directly
-        here until we get the BIND_ACK response, then hand off to the loop.
-
-        Returns True on success, False on failure/timeout.
-        """
-        if self._ws is None:
-            return False
-
-        token = token_data.get("token", "")
-        uid = self._bot_id or token_data.get("bot_id", "")
-        source = token_data.get("source") or "bot"  # use API-returned source; default to 'bot' (not 'web') to receive inbound pushes
-        route_env = self._route_env or token_data.get("route_env", "") or ""
-
-        msg_id = str(uuid.uuid4())
-
-        # Build and send AUTH_BIND
-        auth_bytes = encode_auth_bind(
-            biz_id="ybBot",
-            uid=uid,
-            source=source,
-            token=token,
-            msg_id=msg_id,
-            app_version=_APP_VERSION,
-            operation_system=_OPERATION_SYSTEM,
-            bot_version=_BOT_VERSION,
-            route_env=route_env,
-        )
-        await self._ws.send(auth_bytes)
-        logger.debug("[%s] AUTH_BIND sent (msg_id=%s uid=%s)", self.name, msg_id, uid)
-
-        # Read frames synchronously until BIND_ACK (cmd_type=Response, cmd=auth-bind)
-        try:
-            _loop = asyncio.get_running_loop()
-            deadline = _loop.time() + AUTH_TIMEOUT_SECONDS
-            while True:
-                remaining = deadline - _loop.time()
-                if remaining <= 0:
-                    logger.error("[%s] AUTH_BIND timeout waiting for BIND_ACK", self.name)
-                    return False
-
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
-                if not isinstance(raw, (bytes, bytearray)):
-                    continue
-
-                try:
-                    msg = decode_conn_msg(bytes(raw))
-                except Exception as dec_exc:
-                    logger.debug("[%s] Failed to decode frame during auth: %s", self.name, dec_exc)
-                    continue
-
-                head = msg.get("head", {})
-                cmd_type = head.get("cmd_type", -1)
-                cmd = head.get("cmd", "")
-
-                # BIND_ACK: Response to auth-bind
-                if cmd_type == CMD_TYPE["Response"] and cmd == "auth-bind":
-                    status = head.get("status", 0)
-                    if status != 0:
-                        logger.error(
-                            "[%s] BIND_ACK error: status=%d", self.name, status
-                        )
-                        return False
-
-                    # Extract connectId from BIND_ACK payload
-                    connect_id = self._extract_connect_id(msg)
-                    self._connect_id = connect_id
-                    logger.info("[%s] BIND_ACK received. connectId=%s", self.name, connect_id)
-                    return True
-
-                # Ignore other frames (e.g. Ping responses) during auth
-                logger.debug(
-                    "[%s] Ignoring frame during auth: cmd_type=%d cmd=%s",
-                    self.name, cmd_type, cmd,
-                )
-
-        except asyncio.TimeoutError:
-            logger.error("[%s] Timeout waiting for BIND_ACK", self.name)
-            return False
-        except Exception as exc:
-            logger.error("[%s] Error during authentication: %s", self.name, exc, exc_info=True)
-            return False
-
-    def _extract_connect_id(self, decoded_msg: dict) -> Optional[str]:
-        """
-        Extract connectId from decoded BIND_ACK message.
-
-        The BIND_ACK data payload is an AuthBindRsp protobuf message.
-        AuthBindRsp fields (from conn.json):
-          field 1: code      (int32)
-          field 2: message   (string)
-          field 3: connectId (string)  <-- this is what we need
-        """
-        data: bytes = decoded_msg.get("data", b"")
-        if not data:
-            return None
-        try:
-            fdict = _fields_to_dict(_parse_fields(data))
-            code = _get_varint(fdict, 1)
-            if code != 0:
-                message = _get_string(fdict, 2)
-                logger.error(
-                    "[%s] AuthBindRsp error: code=%d message=%r",
-                    self.name, code, message,
-                )
-                return None
-            # connectId is field 3 (not field 1)
-            connect_id = _get_string(fdict, 3)
-            return connect_id if connect_id else None
-        except Exception as exc:
-            logger.warning("[%s] Failed to extract connectId: %s", self.name, exc)
-            return None
-
-    async def _heartbeat_loop(self) -> None:
-        """
-        Send HEARTBEAT (ping) every 30 seconds while connected.
-        Tracks consecutive missed pongs; triggers reconnect after HEARTBEAT_TIMEOUT_THRESHOLD.
-        """
-        try:
-            while self._running:
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-                if self._ws is None:
-                    continue
-                try:
-                    msg_id = str(uuid.uuid4())
-                    ping_bytes = encode_ping(msg_id)
-                    # Use a dedicated future for pong — server may not echo msg_id back
-                    loop = asyncio.get_running_loop()
-                    pong_future: asyncio.Future = loop.create_future()
-                    self._pending_pong = pong_future
-                    # Also register by msg_id as a fallback (in case server does echo it)
-                    self._pending_acks[msg_id] = pong_future
-                    await self._ws.send(ping_bytes)
-                    logger.debug("[%s] PING sent (msg_id=%s)", self.name, msg_id)
-                    try:
-                        await asyncio.wait_for(pong_future, timeout=10.0)
-                        self._consecutive_hb_timeouts = 0
-                    except asyncio.TimeoutError:
-                        self._pending_acks.pop(msg_id, None)
-                        self._consecutive_hb_timeouts += 1
-                        logger.warning(
-                            "[%s] PONG timeout (%d/%d)",
-                            self.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD,
-                        )
-                        if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
-                            logger.warning("[%s] Heartbeat threshold exceeded, triggering reconnect", self.name)
-                            self._schedule_reconnect()
-                            return
-                    finally:
-                        self._pending_acks.pop(msg_id, None)
-                        self._pending_pong = None
-                except Exception as exc:
-                    logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
-        except asyncio.CancelledError:
-            pass  # Normal shutdown
-
-    async def _receive_loop(self) -> None:
-        """
-        Receive loop:
-        1. Read WS frame (raw bytes)
-        2. Decode via decode_conn_msg()
-        3. Dispatch by cmd_type:
-           - Response + "ping"      : HEARTBEAT_ACK, log only
-           - Response (other)       : RPC response, resolve pending_acks
-           - Push (cmd_type=2)     : Server push, determine if inbound message or RPC response
-           - Other                  : Ignore or log
-        4. Send PushAck for every Push with need_ack=True
-        5. Trigger _reconnect_with_backoff() on WS disconnect (ConnectionClosed)
-        """
-        try:
-            async for raw in self._ws:  # type: ignore[union-attr]
-                if not isinstance(raw, (bytes, bytearray)):
-                    continue
-                await self._handle_frame(bytes(raw))
-        except asyncio.CancelledError:
-            pass
-        except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
-            close_code = getattr(close_exc, 'code', None)
-            logger.warning(
-                "[%s] WebSocket connection closed: code=%s reason=%s",
-                self.name, close_code, getattr(close_exc, 'reason', ''),
-            )
-            if close_code and close_code in NO_RECONNECT_CLOSE_CODES:
-                logger.error(
-                    "[%s] Close code %d is non-recoverable, NOT reconnecting",
-                    self.name, close_code,
-                )
-                self._mark_disconnected()
-            else:
-                self._schedule_reconnect()
-        except Exception as exc:
-            logger.warning("[%s] receive_loop exited: %s", self.name, exc)
-            self._schedule_reconnect()
-
-    async def _handle_frame(self, raw: bytes) -> None:
-        """Handle a single WebSocket frame."""
-        try:
-            msg = decode_conn_msg(raw)
-        except Exception as exc:
-            logger.debug("[%s] Failed to decode frame: %s", self.name, exc)
-            return
-
-        head = msg.get("head", {})
-        cmd_type = head.get("cmd_type", -1)
-        cmd = head.get("cmd", "")
-        msg_id = head.get("msg_id", "")
-        need_ack = head.get("need_ack", False)
-        data: bytes = msg.get("data", b"")
-
-        # HEARTBEAT_ACK: Response to our ping — resolve the pending pong_future.
-        # The server may not echo back the msg_id, so we use _pending_pong as the
-        # primary signal and fall back to msg_id lookup for forward-compatibility.
-        if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
-            logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", self.name, msg_id)
-            if self._pending_pong is not None and not self._pending_pong.done():
-                self._pending_pong.set_result(True)
-            elif msg_id and msg_id in self._pending_acks:
-                fut = self._pending_acks.pop(msg_id)
-                if not fut.done():
-                    fut.set_result(True)
-            return
-
-        # Response to an outbound RPC call (e.g. send-message, query_group_info)
-        if cmd_type == CMD_TYPE["Response"]:
-            if msg_id and msg_id in self._pending_acks:
-                fut = self._pending_acks.pop(msg_id)
-                if not fut.done():
-                    result = {"head": head}
-                    if data:
-                        result["data"] = data
-                    fut.set_result(result)
-            else:
-                logger.debug(
-                    "[%s] Unmatched Response: cmd=%s msg_id=%s",
-                    self.name, cmd, msg_id,
-                )
-            return
-
-        # Server-initiated Push
-        if cmd_type == CMD_TYPE["Push"]:
-            logger.info("[%s] Push received: cmd=%s msg_id=%s data_len=%d", self.name, cmd, msg_id, len(data))
-            # Send PushAck if required
-            if need_ack and self._ws is not None:
-                try:
-                    ack_bytes = encode_push_ack(head)
-                    await self._ws.send(ack_bytes)
-                except Exception as ack_exc:
-                    logger.debug("[%s] Failed to send PushAck: %s", self.name, ack_exc)
-
-            # Some push frames echo an outbound msg_id as confirmation
-            if msg_id and msg_id in self._pending_acks:
-                fut = self._pending_acks.pop(msg_id)
-                if not fut.done():
-                    try:
-                        decoded = decode_inbound_push(data) if data else {"head": head}
-                        fut.set_result(decoded)
-                    except Exception as exc:
-                        fut.set_exception(exc)
-                return
-
-            # Genuine inbound message — dispatch to AI
-            if data:
-                logger.info(
-                    "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
-                    self.name, cmd, len(data),
-                )
-                self._push_to_inbound(data)
-            return
-
-        logger.debug(
-            "[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s",
-            self.name, cmd_type, cmd, msg_id,
-        )
 
     # ------------------------------------------------------------------
     # Group chat helpers
@@ -1460,180 +2738,35 @@ class YuanbaoAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
-        """
-        Send "typing" status heartbeat (RUNNING), best effort, no exception raised.
-        Called periodically by the base class _keep_typing loop, delegated to the Reply Heartbeat state machine.
-        """
+        """Send "typing" status heartbeat (RUNNING). Delegates to OutboundManager."""
         try:
-            await self._start_reply_heartbeat(chat_id)
+            await self._outbound.start_reply_heartbeat(chat_id)
         except Exception:
             pass
 
     async def stop_typing(self, chat_id: str) -> None:
-        """
-        Stop the RUNNING heartbeat loop without sending FINISH immediately.
+        """Stop the RUNNING heartbeat loop without sending FINISH immediately.
 
         FINISH is sent by send() after actual message delivery to ensure correct ordering:
-        RUNNING... → message arrives → FINISH.
-
-        gateway/run.py's _message_handler calls stop_typing() after getting the agent result
-        but before returning the response text; at this point the message hasn't been sent via WS yet,
-        so we only stop the RUNNING loop here; FINISH is deferred until send() completes.
+        RUNNING... -> message arrives -> FINISH.
         """
         try:
-            await self._stop_reply_heartbeat(chat_id, send_finish=False)
+            await self._outbound.stop_reply_heartbeat(chat_id, send_finish=False)
         except Exception:
             pass
 
     async def _process_message_background(self, event, session_key: str) -> None:
         """Wrap base class processing with a slow-response notifier."""
         chat_id = event.source.chat_id
-        await self._start_slow_response_notifier(chat_id)
+        await self._outbound.start_slow_response_notifier(chat_id)
         try:
             await super()._process_message_background(event, session_key)
         finally:
-            self._cancel_slow_response_notifier(chat_id)
-
-    async def _start_reply_heartbeat(self, chat_id: str) -> None:
-        """
-        Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s).
-
-        If the chat_id already has an active heartbeat task, only refresh the timestamp (no duplicate start).
-        Auto-stop (send FINISH) after 30 seconds without renewal.
-        """
-        if self._ws is None or not self._bot_id:
-            return
-
-        existing = self._reply_heartbeat_tasks.get(chat_id)
-        if existing and not existing.done():
-            self._reply_hb_last_active[chat_id] = time.time()
-            return
-
-        self._reply_hb_last_active[chat_id] = time.time()
-
-        task = asyncio.create_task(
-            self._reply_heartbeat_worker(chat_id),
-            name=f"yuanbao-reply-hb-{chat_id}",
-        )
-        self._reply_heartbeat_tasks[chat_id] = task
-
-    async def _reply_heartbeat_worker(self, chat_id: str) -> None:
-        """
-        Background coroutine: send RUNNING heartbeat every 2 seconds.
-        30 seconds without renewal → send FINISH and exit.
-        """
-        try:
-            # Send RUNNING immediately
-            await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
-
-            while True:
-                await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
-
-                last_active = self._reply_hb_last_active.get(chat_id, 0)
-                if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
-                    break
-
-                if self._ws is None:
-                    break
-
-                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
-
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception:
-            cancelled = False
-        else:
-            cancelled = False
-        finally:
-            if not cancelled:
-                try:
-                    await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-                except Exception:
-                    pass
-            self._reply_heartbeat_tasks.pop(chat_id, None)
-            self._reply_hb_last_active.pop(chat_id, None)
-
-    async def _stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
-        """
-        Stop Reply Heartbeat and optionally send FINISH.
-
-        Args:
-            send_finish: When True, send FINISH immediately after cancelling the worker;
-                         When False, only cancel the worker; FINISH is the caller's responsibility.
-        """
-        task = self._reply_heartbeat_tasks.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        if send_finish:
-            try:
-                await self._send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-            except Exception:
-                pass
+            self._outbound.cancel_slow_response_notifier(chat_id)
 
     async def _send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
-        """Send a single heartbeat (RUNNING or FINISH), best effort."""
-        if self._ws is None or not self._bot_id:
-            return
-        try:
-            if chat_id.startswith("group:"):
-                group_code = chat_id[len("group:"):]
-                encoded = encode_send_group_heartbeat(
-                    from_account=self._bot_id,
-                    group_code=group_code,
-                    heartbeat=heartbeat_val,
-                )
-            else:
-                to_account = chat_id.removeprefix("direct:")
-                encoded = encode_send_private_heartbeat(
-                    from_account=self._bot_id,
-                    to_account=to_account,
-                    heartbeat=heartbeat_val,
-                )
-            await self._ws.send(encoded)
-            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
-            logger.debug(
-                "[%s] Reply heartbeat %s sent: chat=%s",
-                self.name, status_name, chat_id,
-            )
-        except Exception as exc:
-            logger.debug("[%s] _send_heartbeat_once failed: %s", self.name, exc)
-
-    # ------------------------------------------------------------------
-    # Slow-response notifier (timeout without reply hint)
-    # ------------------------------------------------------------------
-
-    async def _start_slow_response_notifier(self, chat_id: str) -> None:
-        """Start a delayed task that notifies the user when the agent is slow."""
-        self._cancel_slow_response_notifier(chat_id)
-        task = asyncio.create_task(
-            self._slow_response_notifier(chat_id),
-            name=f"yuanbao-slow-resp-{chat_id}",
-        )
-        self._slow_response_tasks[chat_id] = task
-
-    async def _slow_response_notifier(self, chat_id: str) -> None:
-        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
-        try:
-            await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
-            logger.info(
-                "[%s] Agent response exceeded %ds for %s, sending wait notice",
-                self.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
-            )
-            await self._send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.debug("[%s] Slow-response notifier failed: %s", self.name, exc)
-
-    def _cancel_slow_response_notifier(self, chat_id: str) -> None:
-        """Cancel the pending slow-response notifier for *chat_id*, if any."""
-        task = self._slow_response_tasks.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
+        """Send a single heartbeat. Delegates to OutboundManager."""
+        await self._outbound.send_heartbeat_once(chat_id, heartbeat_val)
 
     # ------------------------------------------------------------------
     # Group query methods
@@ -1656,7 +2789,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             }
             or None (query failed)
         """
-        if self._ws is None:
+        if self._connection.ws is None:
             return None
         encoded = encode_query_group_info(group_code)
         from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
@@ -1707,7 +2840,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             }
             or None (query failed)
         """
-        if self._ws is None:
+        if self._connection.ws is None:
             return None
         encoded = encode_get_group_member_list(group_code, offset=offset, limit=limit)
         from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
@@ -1739,185 +2872,19 @@ class YuanbaoAdapter(BasePlatformAdapter):
         """
         Convert push frame to MessageEvent and dispatch to AI for processing.
 
+        Delegates to the inbound middleware pipeline which processes the message
+        through a series of steps: decode → dedup → filter → access control →
+        content extraction → owner command → @bot guard → dispatch.
+
         conn_data in Yuanbao scenario has only two forms:
           - JSON string: callback_command format inbound message (mainstream)
           - Protobuf binary: InboundMessagePush
-
-        Try JSON first, fall back to protobuf on failure. JSON-first avoids feeding JSON ASCII
-        bytes to the protobuf parser which may produce "seemingly valid" garbage fields.
-
-        Note: Yuanbao's inbound message callback_command is usually "C2C.CallbackAfterSendMsg" /
-        "Group.CallbackAfterSendMsg" — "AfterSendMsg" is misleading; it's actually an inbound message
-        (not a bot send echo); do not filter it.
         """
-        push = None
-        decoded_via = ""  # "json" | "protobuf"
-
-        if conn_data:
-            try:
-                conn_json = json.loads(conn_data.decode("utf-8"))
-            except Exception:
-                conn_json = None
-            if isinstance(conn_json, dict):
-                logger.info(
-                    "[%s] conn_data is JSON: fields=%s len=%d",
-                    self.name, list(conn_json.keys()), len(conn_data),
-                )
-                push = _parse_json_push(conn_json) or None
-                if push:
-                    decoded_via = "json"
-            else:
-                try:
-                    push = decode_inbound_push(conn_data) or None
-                except Exception:
-                    push = None
-                if push:
-                    decoded_via = "protobuf"
-                    logger.info(
-                        "[%s] conn_data is Protobuf (InboundMessagePush): len=%d",
-                        self.name, len(conn_data),
-                    )
-
-        if not push:
-            logger.info("[%s] Push decoded but no valid message. conn_data hex(first64)=%s",
-                self.name, conn_data.hex()[:128] if conn_data else "(empty)")
-            return
-
-        logger.info(
-            "[%s] Push decoded (via=%s): from=%s group=%s msg_id=%s msg_types=%s",
-            self.name, decoded_via,
-            push.get("from_account", ""),
-            push.get("group_code", ""),
-            push.get("msg_id", ""),
-            [e.get("msg_type", "") for e in push.get("msg_body", [])],
-        )
-        logger.debug("[%s] Push payload: %s", self.name, push)
-        from_account: str = push.get("from_account", "")
-        group_code: str = push.get("group_code", "")
-        group_name: str = push.get("group_name", "")
-        sender_nickname: str = push.get("sender_nickname", "")
-        msg_body: list = push.get("msg_body", [])
-        msg_id_field: str = push.get("msg_id", "")
-        cloud_custom_data: str = push.get("cloud_custom_data", "")
-
-        # ---- Inbound dedup ----
-        if msg_id_field and self._dedup.is_duplicate(msg_id_field):
-            logger.debug("[%s] Duplicate message ignored: msg_id=%s", self.name, msg_id_field)
-            return
-
-        # ---- Self-reference filter ----
-        if self._is_self_reference(from_account, self._bot_id):
-            logger.debug("[%s] Ignoring self-sent message from %s", self.name, from_account)
-            return
-
-        # Determine chat type and build chat_id
-        if group_code:
-            chat_id = f"group:{group_code}"
-            chat_type = "group"
-            chat_name = group_name or group_code
-        else:
-            chat_id = f"direct:{from_account}"
-            chat_type = "dm"
-            chat_name = sender_nickname or from_account
-
-        # ---- Platform-level access control filter ----
-        if chat_type == "dm":
-            if not self._is_dm_allowed(from_account):
-                logger.debug(
-                    "[%s] DM from %s blocked by dm_policy=%s",
-                    self.name, from_account, self._dm_policy,
-                )
-                return
-        elif chat_type == "group":
-            if not self._is_group_allowed(group_code):
-                logger.debug(
-                    "[%s] Group %s blocked by group_policy=%s",
-                    self.name, group_code, self._group_policy,
-                )
-                return
-
-        # Extract raw text first (before any history enrichment)
-        raw_text = self._rewrite_slash_command(self._extract_text(msg_body))
-        media_refs = self._extract_inbound_media_refs(msg_body)
-
-        # ---- Placeholder filter ----
-        if self._is_skippable_placeholder(raw_text, len(media_refs)):
-            logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
-            return
-
-        # Bot owner allowlisted command fast path.
-        # - Owner match: skip @Bot detection, set raw_text to clean command text
-        #   (strip AT prefix) so downstream event.get_command() can recognize correctly
-        # - Non-owner match: send rejection message and return
-        # - No match: proceed with normal message dispatch
-        matched_cmd, cmd_line, is_owner = self._detect_owner_command(
-            push=push,
-            msg_body=msg_body,
-            chat_type=chat_type,
-            chat_id=chat_id,
-            from_account=from_account,
-        )
-        if matched_cmd and not is_owner:
-            self._track_task(asyncio.create_task(
-                self.send(chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
-                name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
-            ))
-            return
-        owner_command: Optional[str] = None
-        if matched_cmd and is_owner and cmd_line:
-            owner_command = matched_cmd
-            raw_text = cmd_line  # Override with clean command text, strip AT prefix
-
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_type=chat_type,
-            chat_name=chat_name,
-            user_id=from_account or None,
-            user_name=sender_nickname or from_account,
-            # For group chats, set a synthetic thread_id so
-            # build_session_key treats it like a shared thread —
-            # user_id is kept for auth but excluded from the session
-            # key, matching how Telegram/Feishu handle shared threads.
-            thread_id="main" if chat_type == "group" else None,
-        )
-
-        # ---- Group chat: observe non-@bot messages, reply only on @Bot ----
-        # Owner commands skip @Bot detection (owner doesn't need to @Bot).
-        if chat_type == "group" and not owner_command and not self._is_at_bot(msg_body):
-            self._observe_group_message(source, sender_nickname or from_account, raw_text)
-            logger.info(
-                "[%s] Group message observed (no @bot): chat=%s from=%s",
-                self.name, chat_id, from_account,
-            )
-            return
-
-        msg_type = self._classify_message_type(raw_text, msg_body)
-
-        async def _dispatch_inbound_event() -> None:
-            media_urls, media_types = await self._resolve_inbound_media_urls(media_refs)
-            if self._is_skippable_placeholder(raw_text, len(media_urls)):
-                logger.debug("[%s] Skip placeholder after media download: %r", self.name, raw_text)
-                return
-            reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
-            event = MessageEvent(
-                text=raw_text,
-                message_type=msg_type,
-                source=source,
-                message_id=msg_id_field or None,
-                raw_message=push,
-                media_urls=media_urls,
-                media_types=media_types,
-                reply_to_message_id=reply_to_message_id,
-                reply_to_text=reply_to_text,
-            )
-            await self.handle_message(event)
-
-        task = asyncio.create_task(
-            _dispatch_inbound_event(),
-            name=f"yuanbao-inbound-{msg_id_field or 'unknown'}",
-        )
-        self._inbound_tasks.add(task)
-        task.add_done_callback(self._inbound_tasks.discard)
+        ctx = InboundContext(adapter=self, conn_data=conn_data)
+        self._track_task(asyncio.create_task(
+            self._inbound_pipeline.execute(ctx),
+            name=f"yuanbao-pipeline-{id(conn_data)}",
+        ))
 
     def _extract_text(self, msg_body: list) -> str:
         """
@@ -2142,21 +3109,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _markdown_hint_system_prompt() -> str:
-        """
-        Markdown rendering hint (appended to system prompt).
-
-        Tell AI that Yuanbao platform supports Markdown rendering, including:
-        - Code blocks (```lang)
-        - Tables (| col | col |)
-        - Bold/italic
-        """
-        return (
-            "The current platform supports Markdown rendering. You can use the following formats:\n"
-            "- Code blocks: ```language\\ncode\\n```\n"
-            "- Tables: | col1 | col2 |\\n|---|---|\\n| val1 | val2 |\n"
-            "- Bold: **text** / Italic: *text*\n"
-            "Please use Markdown formatting when appropriate to improve readability."
-        )
+        """Delegate to MarkdownProcessor.markdown_hint_system_prompt()."""
+        return MarkdownProcessor.markdown_hint_system_prompt()
 
     @staticmethod
     def _msg_body_desensitize(msg_body: list) -> list:
@@ -2220,97 +3174,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         **kwargs: Any,
     ) -> SendResult:
-        """
-        Send image message.
-
-        Flow:
-          1. Download image URL content (httpx)
-          2. Call genUploadInfo to get COS temporary credentials
-          3. PUT upload to COS
-          4. Build TIMImageElem message body, send via WS
-
-        If image_url is already a COS public URL (cos.*myqcloud.com or file.myqcloud.com),
-        skip re-uploading and use it directly to build the message body.
-        """
-        if self._ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        self._cancel_slow_response_notifier(chat_id)
-
-        try:
-            # 1. Download image
-            logger.info("[%s] send_image: downloading %s", self.name, image_url)
-            file_bytes, content_type = await media_download_url(image_url, max_size_mb=self.MEDIA_MAX_SIZE_MB)
-
-            if not content_type or content_type == "application/octet-stream":
-                path_part = image_url.split("?")[0]
-                content_type = guess_mime_type(path_part) or "image/jpeg"
-
-            filename = os.path.basename(image_url.split("?")[0]) or "image.jpg"
-
-            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
-            if validation_err:
-                return SendResult(success=False, error=validation_err)
-
-            file_uuid = md5_hex(file_bytes)
-
-            # 2. Get COS upload credentials
-            token_data = await self._get_cached_token()
-            token: str = token_data.get("token", "")
-            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
-
-            credentials = await get_cos_credentials(
-                app_key=self._app_key,
-                api_domain=self._api_domain,
-                token=token,
-                filename=filename,
-                bot_id=bot_id,
-                route_env=self._route_env,
-            )
-
-            # 3. Upload to COS
-            upload_result = await upload_to_cos(
-                file_bytes=file_bytes,
-                filename=filename,
-                content_type=content_type,
-                credentials=credentials,
-                bucket=credentials["bucketName"],
-                region=credentials["region"],
-            )
-
-            # 4. Build TIMImageElem message body
-            msg_body = build_image_msg_body(
-                url=upload_result["url"],
-                uuid=file_uuid,
-                filename=filename,
-                size=upload_result["size"],
-                width=upload_result.get("width", 0),
-                height=upload_result.get("height", 0),
-                mime_type=content_type,
-            )
-
-            # 5. If caption exists, append text message body
-            if caption:
-                msg_body.append(
-                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
-                )
-
-            # 6. Send
-            async with self._get_chat_lock(chat_id):
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    result = await self._send_c2c_msg_body(to_account, msg_body)
-
-            if result.get("success"):
-                return SendResult(success=True, message_id=result.get("msg_key"))
-            return SendResult(success=False, error=result.get("error", "Unknown error"))
-
-        except Exception as exc:
-            logger.error("[%s] send_image() failed: %s", self.name, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
+        """Send image message (URL). Delegates to OutboundManager via ImageUrlHandler."""
+        return await self._outbound.send_media(
+            chat_id, "image_url",
+            reply_to=reply_to, caption=caption, image_url=image_url,
+        )
 
     async def send_image_file(
         self,
@@ -2321,93 +3189,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         **kwargs: Any,
     ) -> SendResult:
-        """
-        Send local image file.
-
-        Similar to send_image(), but accepts a local path instead of URL, reads file bytes directly,
-        skipping the HTTP download step, going directly to COS upload → TIMImageElem flow.
-        Refer to send_document()'s local file reading logic.
-        """
-        if self._ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        self._cancel_slow_response_notifier(chat_id)
-
-        try:
-            # 1. Read local file
-            if not os.path.isfile(image_path):
-                return SendResult(success=False, error=f"File not found: {image_path}")
-
-            logger.info("[%s] send_image_file: reading local file %s", self.name, image_path)
-            with open(image_path, "rb") as f:
-                file_bytes = f.read()
-
-            filename = os.path.basename(image_path) or "image.jpg"
-
-            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
-            if validation_err:
-                return SendResult(success=False, error=validation_err)
-
-            content_type = guess_mime_type(filename) or "image/jpeg"
-            file_uuid = md5_hex(file_bytes)
-
-            # 2. Get COS upload credentials
-            token_data = await self._get_cached_token()
-            token: str = token_data.get("token", "")
-            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
-
-            credentials = await get_cos_credentials(
-                app_key=self._app_key,
-                api_domain=self._api_domain,
-                token=token,
-                filename=filename,
-                bot_id=bot_id,
-                route_env=self._route_env,
-            )
-
-            # 3. Upload to COS
-            upload_result = await upload_to_cos(
-                file_bytes=file_bytes,
-                filename=filename,
-                content_type=content_type,
-                credentials=credentials,
-                bucket=credentials["bucketName"],
-                region=credentials["region"],
-            )
-
-            # 4. Build TIMImageElem message body
-            msg_body = build_image_msg_body(
-                url=upload_result["url"],
-                uuid=file_uuid,
-                filename=filename,
-                size=upload_result["size"],
-                width=upload_result.get("width", 0),
-                height=upload_result.get("height", 0),
-                mime_type=content_type,
-            )
-
-            # 5. If caption exists, append text message body
-            if caption:
-                msg_body.append(
-                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
-                )
-
-            # 6. Send
-            async with self._get_chat_lock(chat_id):
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    result = await self._send_c2c_msg_body(to_account, msg_body)
-
-            if result.get("success"):
-                return SendResult(success=True, message_id=result.get("msg_key"))
-            return SendResult(success=False, error=result.get("error", "Unknown error"))
-
-        except Exception as exc:
-            logger.error("[%s] send_image_file() failed: %s", self.name, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
+        """Send local image file. Delegates to OutboundManager via ImageFileHandler."""
+        return await self._outbound.send_media(
+            chat_id, "image_file",
+            reply_to=reply_to, caption=caption, image_path=image_path,
+        )
 
     async def send_file(
         self,
@@ -2418,86 +3204,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         **kwargs: Any,
     ) -> SendResult:
-        """
-        Send file message.
-
-        Flow:
-          1. Download file URL content (httpx)
-          2. Call genUploadInfo to get COS temporary credentials
-          3. PUT upload to COS
-          4. Build TIMFileElem message body, send via WS
-        """
-        if self._ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        self._cancel_slow_response_notifier(chat_id)
-
-        try:
-            # 1. Download file
-            logger.info("[%s] send_file: downloading %s", self.name, file_url)
-            file_bytes, content_type = await media_download_url(file_url, max_size_mb=self.MEDIA_MAX_SIZE_MB)
-
-            if not filename:
-                path_part = file_url.split("?")[0]
-                filename = os.path.basename(path_part) or "file"
-
-            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
-            if validation_err:
-                return SendResult(success=False, error=validation_err)
-
-            if not content_type or content_type == "application/octet-stream":
-                content_type = guess_mime_type(filename) or "application/octet-stream"
-
-            file_uuid = md5_hex(file_bytes)
-
-            # 2. Get COS upload credentials
-            token_data = await self._get_cached_token()
-            token: str = token_data.get("token", "")
-            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
-
-            credentials = await get_cos_credentials(
-                app_key=self._app_key,
-                api_domain=self._api_domain,
-                token=token,
-                filename=filename,
-                bot_id=bot_id,
-                route_env=self._route_env,
-            )
-
-            # 3. Upload to COS
-            upload_result = await upload_to_cos(
-                file_bytes=file_bytes,
-                filename=filename,
-                content_type=content_type,
-                credentials=credentials,
-                bucket=credentials["bucketName"],
-                region=credentials["region"],
-            )
-
-            # 4. Build TIMFileElem message body
-            msg_body = build_file_msg_body(
-                url=upload_result["url"],
-                filename=filename,
-                uuid=file_uuid,
-                size=upload_result["size"],
-            )
-
-            # 5. Send
-            async with self._get_chat_lock(chat_id):
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    result = await self._send_c2c_msg_body(to_account, msg_body)
-
-            if result.get("success"):
-                return SendResult(success=True, message_id=result.get("msg_key"))
-            return SendResult(success=False, error=result.get("error", "Unknown error"))
-
-        except Exception as exc:
-            logger.error("[%s] send_file() failed: %s", self.name, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
+        """Send file message (URL). Delegates to OutboundManager via FileUrlHandler."""
+        return await self._outbound.send_media(
+            chat_id, "file_url",
+            reply_to=reply_to, file_url=file_url, filename=filename,
+        )
 
     async def send_sticker(
         self,
@@ -2507,60 +3218,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs: Any,
     ) -> SendResult:
-        """
-        Send sticker/emoji (TIMFaceElem).
-
-        Parsing priority:
-          1. sticker_name not empty → fuzzy search in STICKER_MAP, return error if not found
-          2. face_index not empty   → directly use that index to build TIMFaceElem (no data)
-          3. Both empty          → randomly send a built-in sticker
-
-        chat_id format same as send():
-          - C2C:  "direct:{account_id}" or "{account_id}"
-          - Group: "group:{group_code}"
-        """
-        from gateway.platforms.yuanbao_sticker import (
-            get_sticker_by_name,
-            get_random_sticker,
-            build_face_msg_body,
-            build_sticker_msg_body,
+        """Send sticker/emoji. Delegates to OutboundManager via StickerHandler."""
+        return await self._outbound.send_media(
+            chat_id, "sticker",
+            reply_to=reply_to,
+            sticker_name=sticker_name, face_index=face_index,
         )
-
-        if self._ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        self._cancel_slow_response_notifier(chat_id)
-
-        try:
-            if sticker_name is not None:
-                sticker = get_sticker_by_name(sticker_name)
-                if sticker is None:
-                    return SendResult(
-                        success=False,
-                        error=f"Sticker not found: {sticker_name!r}",
-                    )
-                msg_body = build_sticker_msg_body(sticker)
-            elif face_index is not None:
-                msg_body = build_face_msg_body(face_index=face_index)
-            else:
-                sticker = get_random_sticker()
-                msg_body = build_sticker_msg_body(sticker)
-
-            async with self._get_chat_lock(chat_id):
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    result = await self._send_c2c_msg_body(to_account, msg_body)
-
-            if result.get("success"):
-                return SendResult(success=True, message_id=result.get("msg_key"))
-            return SendResult(success=False, error=result.get("error", "Unknown error"))
-
-        except Exception as exc:
-            logger.error("[%s] send_sticker() failed: %s", self.name, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
 
     async def send_document(
         self,
@@ -2572,269 +3235,28 @@ class YuanbaoAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         **kwargs: Any,
     ) -> SendResult:
-        """
-        Send local file (document) message.
-
-        Similar to send_file(), but accepts a local path instead of URL.
-        Flow: Read local file → COS upload → Build TIMFileElem → WS send
-        """
-        if self._ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        self._cancel_slow_response_notifier(chat_id)
-
-        try:
-            # 1. Read local file
-            if not os.path.isfile(file_path):
-                return SendResult(success=False, error=f"File not found: {file_path}")
-
-            logger.info("[%s] send_document: reading local file %s", self.name, file_path)
-            with open(file_path, "rb") as f:
-                file_bytes = f.read()
-
-            if not filename:
-                filename = os.path.basename(file_path) or "document"
-
-            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
-            if validation_err:
-                return SendResult(success=False, error=validation_err)
-
-            content_type = guess_mime_type(filename) or "application/octet-stream"
-            file_uuid = md5_hex(file_bytes)
-
-            # 2. Get COS upload credentials
-            token_data = await self._get_cached_token()
-            token: str = token_data.get("token", "")
-            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
-
-            credentials = await get_cos_credentials(
-                app_key=self._app_key,
-                api_domain=self._api_domain,
-                token=token,
-                filename=filename,
-                bot_id=bot_id,
-                route_env=self._route_env,
-            )
-
-            # 3. Upload to COS
-            upload_result = await upload_to_cos(
-                file_bytes=file_bytes,
-                filename=filename,
-                content_type=content_type,
-                credentials=credentials,
-                bucket=credentials["bucketName"],
-                region=credentials["region"],
-            )
-
-            # 4. Build TIMFileElem message body
-            msg_body = build_file_msg_body(
-                url=upload_result["url"],
-                filename=filename,
-                uuid=file_uuid,
-                size=upload_result["size"],
-            )
-
-            # 5. If caption exists, append text message body
-            if caption:
-                msg_body.append(
-                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
-                )
-
-            # 6. Send
-            async with self._get_chat_lock(chat_id):
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    result = await self._send_c2c_msg_body(to_account, msg_body)
-
-            if result.get("success"):
-                return SendResult(success=True, message_id=result.get("msg_key"))
-            return SendResult(success=False, error=result.get("error", "Unknown error"))
-
-        except Exception as exc:
-            logger.error("[%s] send_document() failed: %s", self.name, exc, exc_info=True)
-            return SendResult(success=False, error=str(exc))
-
-    async def _send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
-        """Send C2C message with arbitrary MsgBody."""
-        req_id = f"c2c_{next_seq_no()}"
-        encoded = encode_send_c2c_message(
-            to_account=to_account,
-            msg_body=msg_body,
-            from_account=self._bot_id or "",
-            msg_id=req_id,
+        """Send local file (document). Delegates to OutboundManager via DocumentHandler."""
+        return await self._outbound.send_media(
+            chat_id, "document",
+            reply_to=reply_to, caption=caption,
+            file_path=file_path, filename=filename,
         )
-        try:
-            response = await self._send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "Request timeout after 30.0s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-    async def _send_group_msg_body(
-        self,
-        group_code: str,
-        msg_body: list,
-        reply_to: Optional[str] = None,
-    ) -> dict:
-        """Send group message with arbitrary MsgBody."""
-        req_id = f"grp_{next_seq_no()}"
-        encoded = encode_send_group_message(
-            group_code=group_code,
-            msg_body=msg_body,
-            from_account=self._bot_id or "",
-            msg_id=req_id,
-            ref_msg_id=reply_to or "",
-        )
-        try:
-            response = await self._send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "Request timeout after 30.0s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
 
     async def _get_cached_token(self) -> dict:
-        """
-        Get the current valid sign token (using module-level cache).
-        """
-        return await get_sign_token(
+        """Get the current valid sign token (using module-level cache)."""
+        return await SignManager.get_token(
             self._app_key, self._app_secret, self._api_domain,
             route_env=self._route_env,
         )
 
-    def _schedule_reconnect(self) -> None:
-        """Schedule a reconnect only if running and not already reconnecting."""
-        if self._running and not self._reconnecting:
-            asyncio.create_task(self._reconnect_with_backoff())
-
-    async def _reconnect_with_backoff(self) -> bool:
-        """
-        Reconnect with exponential backoff.
-
-        Waits 1s, 2s, 4s, … up to 60s between attempts.
-        On each attempt, force-refreshes the sign token (old token may be expired).
-        Returns True on successful reconnect, False after max attempts.
-        """
-        if self._reconnecting:
-            logger.debug("[%s] Reconnect already in progress, skipping", self.name)
-            return False
-        self._reconnecting = True
-        try:
-            return await self._do_reconnect()
-        finally:
-            self._reconnecting = False
-
-    async def _do_reconnect(self) -> bool:
-        """Internal reconnect loop, called under the _reconnecting guard."""
-        for attempt in range(MAX_RECONNECT_ATTEMPTS):
-            self._reconnect_attempts = attempt + 1
-            wait = min(2 ** attempt, 60)
-            logger.info(
-                "[%s] Reconnect attempt %d/%d in %ds",
-                self.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait,
-            )
-            await asyncio.sleep(wait)
-
-            # Clean up existing connection before re-trying
-            await self._cleanup_ws()
-
-            try:
-                # Force-refresh token to avoid using a stale one
-                token_data = await force_refresh_sign_token(
-                    self._app_key, self._app_secret, self._api_domain,
-                    route_env=self._route_env,
-                )
-                if token_data.get("bot_id"):
-                    self._bot_id = str(token_data["bot_id"])
-
-                self._ws = await asyncio.wait_for(
-                    websockets.connect(  # type: ignore[attr-defined]
-                        self._ws_url,
-                        ping_interval=None,
-                        ping_timeout=None,
-                        close_timeout=5,
-                    ),
-                    timeout=CONNECT_TIMEOUT_SECONDS,
-                )
-
-                authed = await self._authenticate(token_data)
-                if not authed:
-                    logger.warning("[%s] Re-auth failed on attempt %d", self.name, attempt + 1)
-                    await self._cleanup_ws()
-                    continue
-
-                # Restart background tasks
-                self._reconnect_attempts = 0
-                self._consecutive_hb_timeouts = 0
-                self._mark_connected()
-
-                if self._heartbeat_task and not self._heartbeat_task.done():
-                    self._heartbeat_task.cancel()
-                self._heartbeat_task = asyncio.create_task(
-                    self._heartbeat_loop(),
-                    name=f"yuanbao-heartbeat-{self._connect_id}",
-                )
-
-                if self._recv_task and not self._recv_task.done():
-                    self._recv_task.cancel()
-                self._recv_task = asyncio.create_task(
-                    self._receive_loop(),
-                    name=f"yuanbao-recv-{self._connect_id}",
-                )
-
-                logger.info(
-                    "[%s] Reconnected on attempt %d. connectId=%s",
-                    self.name, attempt + 1, self._connect_id,
-                )
-                return True
-
-            except asyncio.TimeoutError:
-                logger.warning("[%s] Reconnect attempt %d timed out", self.name, attempt + 1)
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Reconnect attempt %d failed: %s", self.name, attempt + 1, exc
-                )
-
-        logger.error(
-            "[%s] Giving up after %d reconnect attempts", self.name, MAX_RECONNECT_ATTEMPTS
-        )
-        self._mark_disconnected()
-        return False
-
-    async def _cleanup_ws(self) -> None:
-        """Close and clear the WebSocket connection."""
-        ws = self._ws
-        self._ws = None
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-
     def get_status(self) -> dict:
         """Return a snapshot of the current connection status."""
-        ws = self._ws
-        connected = False
-        if ws is not None:
-            # websockets >= 10 exposes .open as a bool property
-            open_attr = getattr(ws, "open", None)
-            if open_attr is True:
-                connected = True
-            elif callable(open_attr):
-                try:
-                    connected = bool(open_attr())
-                except Exception:
-                    connected = False
-
+        conn = self._connection
         return {
-            "connected": connected,
+            "connected": conn.is_connected,
             "bot_id": self._bot_id,
-            "connect_id": self._connect_id,
-            "reconnect_attempts": self._reconnect_attempts,
+            "connect_id": conn.connect_id,
+            "reconnect_attempts": conn.reconnect_attempts,
             "ws_url": self._ws_url,
         }
 
@@ -2844,681 +3266,687 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return self._seq
 
 
-# ============================================================
-# Module-level helper functions (JSON push parsing, aligned with TS decodeFromContent)
-# ============================================================
 
-def _parse_json_push(raw_json: dict) -> dict | None:
-    """
-    Convert JSON-format push (from rawData or DirectedPush.content) to
-    a dict with the same structure as decode_inbound_push.
-
-    Supports standard callback format (callback_command + from_account + msg_body)
-    and legacy format fields (GroupId, MsgSeq, MsgKey, MsgBody, etc.).
-    """
-    if not raw_json:
-        return None
-
-    # Tencent IM callback format uses PascalCase (From_Account, To_Account, MsgBody).
-    # Internal format uses snake_case (from_account, to_account, msg_body).
-    # Support both.
-    from_account = (
-        raw_json.get("from_account", "")
-        or raw_json.get("From_Account", "")
-    )
-    group_code = (
-        raw_json.get("group_code", "")
-        or raw_json.get("GroupId", "")
-        or raw_json.get("group_id", "")
-    )
-    msg_body_raw = (
-        raw_json.get("msg_body", [])
-        or raw_json.get("MsgBody", [])
-    )
-    msg_body = _convert_json_msg_body(msg_body_raw)
-
-    # Allow a push with from_account even if msg_body is empty (e.g. callback notifications)
-    if not from_account and not msg_body:
-        return None
-
-    return {
-        "callback_command": raw_json.get("callback_command", ""),
-        "from_account": from_account,
-        "to_account": raw_json.get("to_account", "") or raw_json.get("To_Account", ""),
-        "sender_nickname": raw_json.get("sender_nickname", "") or raw_json.get("nick_name", ""),
-        "group_code": group_code,
-        "group_name": raw_json.get("group_name", ""),
-        "msg_seq": raw_json.get("msg_seq", 0) or raw_json.get("MsgSeq", 0),
-        "msg_id": raw_json.get("msg_id", "") or raw_json.get("msg_key", "") or raw_json.get("MsgKey", ""),
-        "msg_body": msg_body,
-        "cloud_custom_data": raw_json.get("cloud_custom_data", "") or raw_json.get("CloudCustomData", ""),
-        "bot_owner_id": raw_json.get("bot_owner_id", "") or raw_json.get("botOwnerId", ""),
-        "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
-    }
-
-
-def _convert_json_msg_body(raw_body: list) -> list:
-    """
-    Normalize raw JSON msg_body array to [{"msg_type": str, "msg_content": dict}] format.
-    Compatible with both PascalCase (MsgType/MsgContent) and snake_case (msg_type/msg_content) naming.
-    """
-    result = []
-    for item in raw_body or []:
-        if not isinstance(item, dict):
-            continue
-        msg_type = item.get("msg_type") or item.get("MsgType", "")
-        msg_content = item.get("msg_content") or item.get("MsgContent", {})
-        if isinstance(msg_content, str):
-            try:
-                msg_content = json.loads(msg_content)
-            except Exception:
-                msg_content = {"text": msg_content}
-        result.append({"msg_type": msg_type, "msg_content": msg_content or {}})
-    return result
 
 
 # ============================================================
-# Markdown chunking utility functions (originally yuanbao_markdown.py)
+# Markdown processing (originally yuanbao_markdown.py)
 # ============================================================
 
-def has_unclosed_fence(text: str) -> bool:
+
+class MarkdownProcessor:
+    """Encapsulates all Markdown-related utilities for the Yuanbao platform.
+
+    Provides static methods for:
+    - Fence detection and streaming merge
+    - Table row detection and sanitization
+    - Paragraph-boundary splitting
+    - Atomic-block extraction and chunk splitting
+    - Outer markdown fence stripping
+    - Markdown hint prompt generation
     """
-    Detect whether the text has unclosed code block fences.
 
-    Scan line by line, toggling in/out state when encountering a line starting with ```.
-    An odd number of toggles indicates an unclosed fence.
+    # -- Fence detection ---------------------------------------------------
 
-    Args:
-        text: Markdown text to check
+    @staticmethod
+    def has_unclosed_fence(text: str) -> bool:
+        """
+        Detect whether the text has unclosed code block fences.
 
-    Returns:
-        Returns True if the text ends with an unclosed fence, otherwise False
-    """
-    in_fence = False
-    for line in text.split('\n'):
-        if line.startswith('```'):
-            in_fence = not in_fence
-    return in_fence
+        Scan line by line, toggling in/out state when encountering a line starting with ```.
+        An odd number of toggles indicates an unclosed fence.
 
+        Args:
+            text: Markdown text to check
 
-def ends_with_table_row(text: str) -> bool:
-    """
-    Detect whether the text ends with a table row (last non-empty line starts and ends with |).
+        Returns:
+            Returns True if the text ends with an unclosed fence, otherwise False
+        """
+        in_fence = False
+        for line in text.split('\n'):
+            if line.startswith('```'):
+                in_fence = not in_fence
+        return in_fence
 
-    Args:
-        text: Text to check
+    # -- Table detection ---------------------------------------------------
 
-    Returns:
-        Returns True if the last non-empty line is a table row
-    """
-    trimmed = text.rstrip()
-    if not trimmed:
-        return False
-    last_line = trimmed.split('\n')[-1].strip()
-    return last_line.startswith('|') and last_line.endswith('|')
+    @staticmethod
+    def ends_with_table_row(text: str) -> bool:
+        """
+        Detect whether the text ends with a table row (last non-empty line starts and ends with |).
 
+        Args:
+            text: Text to check
 
-def split_at_paragraph_boundary(text: str, max_chars: int) -> tuple[str, str]:
-    """
-    Find the nearest paragraph boundary split point within max_chars, return (head, tail).
+        Returns:
+            Returns True if the last non-empty line is a table row
+        """
+        trimmed = text.rstrip()
+        if not trimmed:
+            return False
+        last_line = trimmed.split('\n')[-1].strip()
+        return last_line.startswith('|') and last_line.endswith('|')
 
-    Split priority:
-    1. Blank line (paragraph boundary)
-    2. Newline after period/question mark/exclamation mark (Chinese and English)
-    3. Last newline
-    4. Force split at max_chars
+    # -- Paragraph boundary splitting --------------------------------------
 
-    Args:
-        text: Text to split
-        max_chars: Maximum character count limit
+    @staticmethod
+    def split_at_paragraph_boundary(text: str, max_chars: int) -> tuple[str, str]:
+        """
+        Find the nearest paragraph boundary split point within max_chars, return (head, tail).
 
-    Returns:
-        (head, tail) tuple, head is the front part, tail is the back part, satisfying head + tail == text
-    """
-    if len(text) <= max_chars:
-        return text, ''
+        Split priority:
+        1. Blank line (paragraph boundary)
+        2. Newline after period/question mark/exclamation mark (Chinese and English)
+        3. Last newline
+        4. Force split at max_chars
 
-    window = text[:max_chars]
+        Args:
+            text: Text to split
+            max_chars: Maximum character count limit
 
-    # 1. Prefer the last blank line (\n\n) as paragraph boundary
-    pos = window.rfind('\n\n')
-    if pos > 0:
-        return text[:pos + 2], text[pos + 2:]
+        Returns:
+            (head, tail) tuple, head is the front part, tail is the back part, satisfying head + tail == text
+        """
+        if len(text) <= max_chars:
+            return text, ''
 
-    # 2. Then find the last newline after a sentence-ending punctuation
-    sentence_end_re = re.compile(r'[。！？.!?]\n')
-    best_pos = -1
-    for m in sentence_end_re.finditer(window):
-        best_pos = m.end()
-    if best_pos > 0:
-        return text[:best_pos], text[best_pos:]
+        window = text[:max_chars]
 
-    # 3. Fallback: find the last newline
-    pos = window.rfind('\n')
-    if pos > 0:
-        return text[:pos + 1], text[pos + 1:]
+        # 1. Prefer the last blank line (\n\n) as paragraph boundary
+        pos = window.rfind('\n\n')
+        if pos > 0:
+            return text[:pos + 2], text[pos + 2:]
 
-    # 4. No valid split point found, force split at max_chars
-    return text[:max_chars], text[max_chars:]
+        # 2. Then find the last newline after a sentence-ending punctuation
+        sentence_end_re = re.compile(r'[。！？.!?]\n')
+        best_pos = -1
+        for m in sentence_end_re.finditer(window):
+            best_pos = m.end()
+        if best_pos > 0:
+            return text[:best_pos], text[best_pos:]
 
+        # 3. Fallback: find the last newline
+        pos = window.rfind('\n')
+        if pos > 0:
+            return text[:pos + 1], text[pos + 1:]
 
-def _is_fence_atom(text: str) -> bool:
-    """Determine whether an atomic block is a code block (starts with ```)."""
-    return text.lstrip().startswith('```')
+        # 4. No valid split point found, force split at max_chars
+        return text[:max_chars], text[max_chars:]
 
+    # -- Atomic block helpers (private) ------------------------------------
 
-def _is_table_atom(text: str) -> bool:
-    """Determine whether an atomic block is a table (first line starts with |)."""
-    first_line = text.split('\n')[0].strip()
-    return first_line.startswith('|') and first_line.endswith('|')
+    @staticmethod
+    def is_fence_atom(text: str) -> bool:
+        """Determine whether an atomic block is a code block (starts with ```)."""
+        return text.lstrip().startswith('```')
 
+    @staticmethod
+    def is_table_atom(text: str) -> bool:
+        """Determine whether an atomic block is a table (first line starts with |)."""
+        first_line = text.split('\n')[0].strip()
+        return first_line.startswith('|') and first_line.endswith('|')
 
-def _split_into_atoms(text: str) -> list[str]:
-    """
-    Split text into a list of "atomic blocks", each being an indivisible logical unit:
+    @staticmethod
+    def split_into_atoms(text: str) -> list[str]:
+        """
+        Split text into a list of "atomic blocks", each being an indivisible logical unit:
 
-    - Code block (fence): from opening ``` to closing ``` (including fence lines)
-    - Table: consecutive |...| lines forming a whole segment
-    - Normal paragraph: plain text segments separated by blank lines
+        - Code block (fence): from opening ``` to closing ``` (including fence lines)
+        - Table: consecutive |...| lines forming a whole segment
+        - Normal paragraph: plain text segments separated by blank lines
 
-    Blank lines serve as separators and are not included in any atomic block.
+        Blank lines serve as separators and are not included in any atomic block.
 
-    Args:
-        text: Markdown text to split
+        Args:
+            text: Markdown text to split
 
-    Returns:
-        List of atomic block strings (all non-empty)
-    """
-    lines = text.split('\n')
-    atoms: list[str] = []
+        Returns:
+            List of atomic block strings (all non-empty)
+        """
+        lines = text.split('\n')
+        atoms: list[str] = []
 
-    current_lines: list[str] = []
-    in_fence = False
+        current_lines: list[str] = []
+        in_fence = False
 
-    def _is_table_line(line: str) -> bool:
-        stripped = line.strip()
-        return stripped.startswith('|') and stripped.endswith('|')
+        def _is_table_line(line: str) -> bool:
+            stripped = line.strip()
+            return stripped.startswith('|') and stripped.endswith('|')
 
-    def _flush_current() -> None:
-        if current_lines:
-            atom = '\n'.join(current_lines)
-            if atom.strip():
-                atoms.append(atom)
-            current_lines.clear()
+        def _flush_current() -> None:
+            if current_lines:
+                atom = '\n'.join(current_lines)
+                if atom.strip():
+                    atoms.append(atom)
+                current_lines.clear()
 
-    for line in lines:
-        if in_fence:
-            current_lines.append(line)
-            if line.startswith('```') and len(current_lines) > 1:
-                in_fence = False
+        for line in lines:
+            if in_fence:
+                current_lines.append(line)
+                if line.startswith('```') and len(current_lines) > 1:
+                    in_fence = False
+                    _flush_current()
+            elif line.startswith('```'):
                 _flush_current()
-        elif line.startswith('```'):
-            _flush_current()
-            in_fence = True
-            current_lines.append(line)
-        elif _is_table_line(line):
-            if current_lines and not _is_table_line(current_lines[-1]):
+                in_fence = True
+                current_lines.append(line)
+            elif _is_table_line(line):
+                if current_lines and not _is_table_line(current_lines[-1]):
+                    _flush_current()
+                current_lines.append(line)
+            elif line.strip() == '':
                 _flush_current()
-            current_lines.append(line)
-        elif line.strip() == '':
-            _flush_current()
-        else:
-            if current_lines and _is_table_line(current_lines[-1]):
-                _flush_current()
-            current_lines.append(line)
+            else:
+                if current_lines and _is_table_line(current_lines[-1]):
+                    _flush_current()
+                current_lines.append(line)
 
-    _flush_current()
+        _flush_current()
 
-    return atoms
+        return atoms
 
+    # -- Core: chunk splitting ---------------------------------------------
 
-def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
-    """
-    Split Markdown text into multiple chunks by max_chars.
+    @classmethod
+    def chunk_markdown_text(cls, text: str, max_chars: int = 4000) -> list[str]:
+        """
+        Split Markdown text into multiple chunks by max_chars.
 
-    Guarantees:
-    - Each chunk <= max_chars characters (unless a single code block/table itself exceeds the limit)
-    - Code blocks (```...```) are not split in the middle
-    - Table rows are not split in the middle (tables output as atomic blocks)
-    - Split at paragraph boundaries (blank lines, after periods, etc.)
+        Guarantees:
+        - Each chunk <= max_chars characters (unless a single code block/table itself exceeds the limit)
+        - Code blocks (```...```) are not split in the middle
+        - Table rows are not split in the middle (tables output as atomic blocks)
+        - Split at paragraph boundaries (blank lines, after periods, etc.)
 
-    Args:
-        text: Markdown text to split
-        max_chars: Max characters per chunk, default 4000
+        Args:
+            text: Markdown text to split
+            max_chars: Max characters per chunk, default 4000
 
-    Returns:
-        List of text chunks after splitting (non-empty)
-    """
-    if not text:
-        return []
+        Returns:
+            List of text chunks after splitting (non-empty)
+        """
+        if not text:
+            return []
 
-    if len(text) <= max_chars:
-        return [text]
+        if len(text) <= max_chars:
+            return [text]
 
-    # Phase 1: Extract atomic blocks
-    atoms = _split_into_atoms(text)
+        # Phase 1: Extract atomic blocks
+        atoms = cls.split_into_atoms(text)
 
-    # Phase 2: Greedy merge
-    chunks: list[str] = []
-    indivisible_set: set[int] = set()
-    current_parts: list[str] = []
-    current_len = 0
+        # Phase 2: Greedy merge
+        chunks: list[str] = []
+        indivisible_set: set[int] = set()
+        current_parts: list[str] = []
+        current_len = 0
 
-    def _flush_parts() -> None:
-        if current_parts:
-            chunks.append('\n\n'.join(current_parts))
+        def _flush_parts() -> None:
+            if current_parts:
+                chunks.append('\n\n'.join(current_parts))
 
-    for atom in atoms:
-        atom_len = len(atom)
-        sep_len = 2 * len(current_parts)
-        projected_len = current_len + sep_len + atom_len
+        for atom in atoms:
+            atom_len = len(atom)
+            sep_len = 2 * len(current_parts)
+            projected_len = current_len + sep_len + atom_len
 
-        if projected_len > max_chars and current_parts:
-            _flush_parts()
-            current_parts = []
-            current_len = 0
+            if projected_len > max_chars and current_parts:
+                _flush_parts()
+                current_parts = []
+                current_len = 0
 
-        if (not current_parts
-                and atom_len > max_chars
-                and (_is_fence_atom(atom) or _is_table_atom(atom))):
-            indivisible_set.add(len(chunks))
-            chunks.append(atom)
-            continue
+            if (not current_parts
+                    and atom_len > max_chars
+                and (cls.is_fence_atom(atom) or cls.is_table_atom(atom))):
+                indivisible_set.add(len(chunks))
+                chunks.append(atom)
+                continue
 
-        current_parts.append(atom)
-        current_len += atom_len
+            current_parts.append(atom)
+            current_len += atom_len
 
-    _flush_parts()
+        _flush_parts()
 
-    # Phase 3: Post-processing — split still-oversized chunks at paragraph boundaries
-    result: list[str] = []
-    for idx, chunk in enumerate(chunks):
-        if len(chunk) <= max_chars:
-            result.append(chunk)
-            continue
+        # Phase 3: Post-processing — split still-oversized chunks at paragraph boundaries
+        result: list[str] = []
+        for idx, chunk in enumerate(chunks):
+            if len(chunk) <= max_chars:
+                result.append(chunk)
+                continue
 
-        if idx in indivisible_set:
-            result.append(chunk)
-            continue
+            if idx in indivisible_set:
+                result.append(chunk)
+                continue
 
-        if has_unclosed_fence(chunk):
-            result.append(chunk)
-            continue
+            if cls.has_unclosed_fence(chunk):
+                result.append(chunk)
+                continue
 
-        remaining = chunk
-        while len(remaining) > max_chars:
-            head, remaining = split_at_paragraph_boundary(remaining, max_chars)
-            if not head:
-                head, remaining = remaining[:max_chars], remaining[max_chars:]
-            if head:
-                result.append(head)
-        if remaining:
-            result.append(remaining)
+            remaining = chunk
+            while len(remaining) > max_chars:
+                head, remaining = cls.split_at_paragraph_boundary(remaining, max_chars)
+                if not head:
+                    head, remaining = remaining[:max_chars], remaining[max_chars:]
+                if head:
+                    result.append(head)
+            if remaining:
+                result.append(remaining)
 
-    return [c for c in result if c]
+        return [c for c in result if c]
 
+    # -- Block separator inference -----------------------------------------
 
-def _infer_block_separator(prev_chunk: str, next_chunk: str) -> str:
-    """
-    Infer the separator to use between two split chunks.
+    @classmethod
+    def infer_block_separator(cls, prev_chunk: str, next_chunk: str) -> str:
+        """
+        Infer the separator to use between two split chunks.
 
-    Rules (aligned with TS markdown-stream.ts):
-    - Previous chunk ends with code fence or next chunk starts with fence → single newline '\\n'
-    - Previous chunk ends with table row and next chunk starts with table row → single newline '\\n' (continued table)
-    - Otherwise → double newline '\\n\\n' (paragraph separator)
+        Rules (aligned with TS markdown-stream.ts):
+        - Previous chunk ends with code fence or next chunk starts with fence → single newline '\\n'
+        - Previous chunk ends with table row and next chunk starts with table row → single newline '\\n' (continued table)
+        - Otherwise → double newline '\\n\\n' (paragraph separator)
 
-    Args:
-        prev_chunk: Previous chunk
-        next_chunk: Next chunk
+        Args:
+            prev_chunk: Previous chunk
+            next_chunk: Next chunk
 
-    Returns:
-        '\\n' or '\\n\\n'
-    """
-    prev_trimmed = prev_chunk.rstrip()
-    next_trimmed = next_chunk.lstrip()
+        Returns:
+            '\\n' or '\\n\\n'
+        """
+        prev_trimmed = prev_chunk.rstrip()
+        next_trimmed = next_chunk.lstrip()
 
-    # Previous chunk ends with fence or next chunk starts with fence
-    if prev_trimmed.endswith('```') or next_trimmed.startswith('```'):
-        return '\n'
-
-    # Table continuation
-    if ends_with_table_row(prev_chunk):
-        first_line = next_trimmed.split('\n')[0].strip() if next_trimmed else ''
-        if first_line.startswith('|') and first_line.endswith('|'):
+        # Previous chunk ends with fence or next chunk starts with fence
+        if prev_trimmed.endswith('```') or next_trimmed.startswith('```'):
             return '\n'
 
-    return '\n\n'
+        # Table continuation
+        if cls.ends_with_table_row(prev_chunk):
+            first_line = next_trimmed.split('\n')[0].strip() if next_trimmed else ''
+            if first_line.startswith('|') and first_line.endswith('|'):
+                return '\n'
 
+        return '\n\n'
 
-def _merge_block_streaming_fences(chunks: list[str]) -> list[str]:
-    """
-    Stream-aware fence-conscious chunk merging.
+    # -- Streaming fence merge ---------------------------------------------
 
-    When streaming output produces multiple chunks truncated in the middle of a fence,
-    attempt to merge adjacent chunks to complete the fence.
+    @classmethod
+    def merge_block_streaming_fences(cls, chunks: list[str]) -> list[str]:
+        """
+        Stream-aware fence-conscious chunk merging.
 
-    Rules:
-    - If chunk i has an unclosed fence and chunk i+1 starts with ```,
-        merge i+1 into i (until the fence is closed or no more chunks).
-    - Use _infer_block_separator to infer the separator during merging.
+        When streaming output produces multiple chunks truncated in the middle of a fence,
+        attempt to merge adjacent chunks to complete the fence.
 
-    Args:
-        chunks: Original chunk list
+        Rules:
+        - If chunk i has an unclosed fence and chunk i+1 starts with ```,
+            merge i+1 into i (until the fence is closed or no more chunks).
+        - Use infer_block_separator to infer the separator during merging.
 
-    Returns:
-        Merged chunk list (length <= original length)
-    """
-    if not chunks:
-        return []
+        Args:
+            chunks: Original chunk list
 
-    result: list[str] = []
-    i = 0
-    while i < len(chunks):
-        current = chunks[i]
-        # If current chunk has unclosed fence, try merging subsequent chunks
-        while has_unclosed_fence(current) and i + 1 < len(chunks):
-            sep = _infer_block_separator(current, chunks[i + 1])
-            current = current + sep + chunks[i + 1]
+        Returns:
+            Merged chunk list (length <= original length)
+        """
+        if not chunks:
+            return []
+
+        result: list[str] = []
+        i = 0
+        while i < len(chunks):
+            current = chunks[i]
+            # If current chunk has unclosed fence, try merging subsequent chunks
+            while cls.has_unclosed_fence(current) and i + 1 < len(chunks):
+                sep = cls.infer_block_separator(current, chunks[i + 1])
+                current = current + sep + chunks[i + 1]
+                i += 1
+            result.append(current)
             i += 1
-        result.append(current)
-        i += 1
 
-    return result
+        return result
 
+    # -- Outer fence stripping ---------------------------------------------
 
-def _strip_outer_markdown_fence(text: str) -> str:
-    """
-    Strip outer Markdown fence.
+    @staticmethod
+    def strip_outer_markdown_fence(text: str) -> str:
+        """
+        Strip outer Markdown fence.
 
-    When AI reply is entirely wrapped in ```markdown\\n...\\n```, remove the outer fence,
-    keeping the content. Only strip when the first line is ```markdown (case-insensitive) and the last line is ```.
+        When AI reply is entirely wrapped in ```markdown\\n...\\n```, remove the outer fence,
+        keeping the content. Only strip when the first line is ```markdown (case-insensitive) and the last line is ```.
 
-    Args:
-        text: Text to process
+        Args:
+            text: Text to process
 
-    Returns:
-        Text with outer fence stripped (returns original if no match)
-    """
-    if not text:
-        return text
+        Returns:
+            Text with outer fence stripped (returns original if no match)
+        """
+        if not text:
+            return text
 
-    lines = text.split('\n')
-    if len(lines) < 3:
-        return text
+        lines = text.split('\n')
+        if len(lines) < 3:
+            return text
 
-    first_line = lines[0].strip()
-    last_line = lines[-1].strip()
+        first_line = lines[0].strip()
+        last_line = lines[-1].strip()
 
-    # First line must be ```markdown (optional language tag md/markdown)
-    if not re.match(r'^```(?:markdown|md)?\s*$', first_line, re.IGNORECASE):
-        return text
+        # First line must be ```markdown (optional language tag md/markdown)
+        if not re.match(r'^```(?:markdown|md)?\s*$', first_line, re.IGNORECASE):
+            return text
 
-    # Last line must be plain ```
-    if last_line != '```':
-        return text
+        # Last line must be plain ```
+        if last_line != '```':
+            return text
 
-    # Strip first and last lines
-    inner = '\n'.join(lines[1:-1])
-    return inner
+        # Strip first and last lines
+        inner = '\n'.join(lines[1:-1])
+        return inner
 
+    # -- Table sanitization ------------------------------------------------
 
-def _sanitize_markdown_table(text: str) -> str:
-    """
-    Table output sanitization.
+    @staticmethod
+    def sanitize_markdown_table(text: str) -> str:
+        """
+        Table output sanitization.
 
-    Handle common formatting issues in AI-generated Markdown tables:
-    1. Remove extra whitespace before/after table rows
-    2. Ensure separator rows (|---|---|) are correctly formatted
-    3. Remove empty table rows
+        Handle common formatting issues in AI-generated Markdown tables:
+        1. Remove extra whitespace before/after table rows
+        2. Ensure separator rows (|---|---|) are correctly formatted
+        3. Remove empty table rows
 
-    Args:
-        text: Markdown text containing tables
+        Args:
+            text: Markdown text containing tables
 
-    Returns:
-        Sanitized text
-    """
-    if '|' not in text:
-        return text
+        Returns:
+            Sanitized text
+        """
+        if '|' not in text:
+            return text
 
-    lines = text.split('\n')
-    result_lines: list[str] = []
+        lines = text.split('\n')
+        result_lines: list[str] = []
 
-    for line in lines:
-        stripped = line.strip()
+        for line in lines:
+            stripped = line.strip()
 
-        # Table row processing
-        if stripped.startswith('|') and stripped.endswith('|'):
-            # Separator row normalization: | --- | --- | → |---|---|
-            if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)+\|$', stripped):
-                cells = stripped.split('|')
-                normalized = '|'.join(
-                    cell.strip() if cell.strip() else cell
-                    for cell in cells
-                )
-                result_lines.append(normalized)
-            elif stripped == '||' or stripped.replace('|', '').strip() == '':
-                # Empty table row → skip
-                continue
+            # Table row processing
+            if stripped.startswith('|') and stripped.endswith('|'):
+                # Separator row normalization: | --- | --- | → |---|---|
+                if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)+\|$', stripped):
+                    cells = stripped.split('|')
+                    normalized = '|'.join(
+                        cell.strip() if cell.strip() else cell
+                        for cell in cells
+                    )
+                    result_lines.append(normalized)
+                elif stripped == '||' or stripped.replace('|', '').strip() == '':
+                    # Empty table row → skip
+                    continue
+                else:
+                    result_lines.append(stripped)
             else:
-                result_lines.append(stripped)
-        else:
-            result_lines.append(line)
+                result_lines.append(line)
 
-    return '\n'.join(result_lines)
+        return '\n'.join(result_lines)
+
+    # -- Markdown hint prompt ----------------------------------------------
+
+    @staticmethod
+    def markdown_hint_system_prompt() -> str:
+        """
+        Markdown rendering hint (appended to system prompt).
+
+        Tell AI that Yuanbao platform supports Markdown rendering, including:
+        - Code blocks (```lang)
+        - Tables (| col | col |)
+        - Bold/italic
+        """
+        return (
+            "The current platform supports Markdown rendering. You can use the following formats:\n"
+            "- Code blocks: ```language\\ncode\\n```\n"
+            "- Tables: | col1 | col2 |\\n|---|---|\\n| val1 | val2 |\n"
+            "- Bold: **text** / Italic: *text*\n"
+            "Please use Markdown formatting when appropriate to improve readability."
+        )
+
 
 
 # ============================================================
 # Sign-ticket API (originally yuanbao_api.py)
 # ============================================================
 
-SIGN_TOKEN_PATH = "/api/v5/robotLogic/sign-token"
+class SignManager:
+    """Encapsulates all sign-token related logic for the Yuanbao platform.
 
-#: Retryable business error codes
-RETRYABLE_SIGN_CODE = 10099
-SIGN_MAX_RETRIES = 3
-SIGN_RETRY_DELAY_S = 1.0
-
-#: Early refresh margin (seconds), treat as expiring 60 seconds before actual expiry
-CACHE_REFRESH_MARGIN_S = 60
-
-#: HTTP timeout (seconds)
-HTTP_TIMEOUT_S = 10.0
-
-# Module-level cache
-# key: app_key
-# value: {"token": str, "bot_id": str, "expire_ts": float (unix timestamp)}
-_token_cache: dict[str, dict[str, Any]] = {}
-
-# Per-app_key refresh locks — prevents concurrent duplicate sign-token requests.
-# Safety note: Locks are created lazily inside _get_refresh_lock(), which is only
-# called from async functions (running event loop), so the Lock is always bound to
-# the correct loop.  disconnect() clears this dict to prevent stale locks from a
-# previous event loop persisting across reconnects.
-_refresh_locks: dict[str, asyncio.Lock] = {}
-
-
-def _get_refresh_lock(app_key: str) -> asyncio.Lock:
-    """Return (creating if needed) the per-app_key refresh lock.
-
-    Must only be called from within a running event loop (async context).
+    Manages token acquisition, caching, signature computation, and
+    automatic retry.  All state (cache, locks) is kept as class-level
+    attributes so that a single shared client serves the whole process.
     """
-    if app_key not in _refresh_locks:
-        _refresh_locks[app_key] = asyncio.Lock()
-    return _refresh_locks[app_key]
 
+    # -- Constants ---------------------------------------------------------
 
-def _compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str) -> str:
-    """
-    Compute signature (aligned with TypeScript original).
-    plain     = nonce + timestamp + app_key + app_secret
-    signature = HMAC-SHA256(key=app_secret, msg=plain).hexdigest()
-    """
-    plain = nonce + timestamp + app_key + app_secret
-    return hmac.new(app_secret.encode(), plain.encode(), hashlib.sha256).hexdigest()
+    TOKEN_PATH = "/api/v5/robotLogic/sign-token"
 
+    RETRYABLE_CODE = 10099
+    MAX_RETRIES = 3
+    RETRY_DELAY_S = 1.0
 
-def _build_timestamp() -> str:
-    """
-    Build Beijing time ISO-8601 timestamp (aligned with TypeScript original).
-    Format: 2006-01-02T15:04:05+08:00 (no milliseconds)
-    """
-    bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
-    return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    #: Early refresh margin (seconds), treat as expiring 60s before actual expiry
+    CACHE_REFRESH_MARGIN_S = 60
 
+    #: HTTP timeout (seconds)
+    HTTP_TIMEOUT_S = 10.0
 
-def _is_cache_valid(entry: dict[str, Any]) -> bool:
-    """Determine whether the cache is valid (not expired and has margin)."""
-    return entry["expire_ts"] - time.time() > CACHE_REFRESH_MARGIN_S
+    # -- Class-level shared state ------------------------------------------
 
+    # key: app_key → {"token", "bot_id", "expire_ts", ...}
+    _cache: dict[str, dict[str, Any]] = {}
 
-async def _do_fetch_sign_token(
-    app_key: str,
-    app_secret: str,
-    api_domain: str,
-    route_env: str = "",
-) -> dict[str, Any]:
-    """
-    Send sign-ticket HTTP request with auto-retry (up to SIGN_MAX_RETRIES times).
-    """
-    url = f"{api_domain.rstrip('/')}{SIGN_TOKEN_PATH}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        for attempt in range(SIGN_MAX_RETRIES + 1):
-            nonce = secrets.token_hex(16)
-            timestamp = _build_timestamp()
-            signature = _compute_signature(nonce, timestamp, app_key, app_secret)
+    # Per-app_key refresh locks — prevents concurrent duplicate sign-token
+    # requests.  Created lazily inside get_refresh_lock() which is only called
+    # from async context, so the Lock is always bound to the correct loop.
+    # disconnect() clears this dict to prevent stale locks across reconnects.
+    _locks: dict[str, asyncio.Lock] = {}
 
-            payload = {
-                "app_key": app_key,
-                "nonce": nonce,
-                "signature": signature,
-                "timestamp": timestamp,
-            }
+    # -- Internal helpers --------------------------------------------------
 
-            headers = {
-                "Content-Type": "application/json",
-                "X-AppVersion": _APP_VERSION,
-                "X-OperationSystem": _OPERATION_SYSTEM,
-                "X-Instance-Id": "16",
-                "X-Bot-Version": _BOT_VERSION,
-            }
-            if route_env:
-                headers["X-Route-Env"] = route_env
+    @classmethod
+    def get_refresh_lock(cls, app_key: str) -> asyncio.Lock:
+        """Return (creating if needed) the per-app_key refresh lock.
 
-            logger.info(
-                "Sign token request: url=%s%s",
-                url,
-                f" (retry {attempt}/{SIGN_MAX_RETRIES})" if attempt > 0 else "",
-            )
+        Must only be called from within a running event loop (async context).
+        """
+        if app_key not in cls._locks:
+            cls._locks[app_key] = asyncio.Lock()
+        return cls._locks[app_key]
 
-            response = await client.post(url, json=payload, headers=headers)
+    @staticmethod
+    def compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str) -> str:
+        """Compute HMAC-SHA256 signature (aligned with TypeScript original).
 
-            if response.status_code != 200:
-                body = response.text
-                raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
+        plain     = nonce + timestamp + app_key + app_secret
+        signature = HMAC-SHA256(key=app_secret, msg=plain).hexdigest()
+        """
+        plain = nonce + timestamp + app_key + app_secret
+        return hmac.new(app_secret.encode(), plain.encode(), hashlib.sha256).hexdigest()
 
-            try:
-                result_data: dict[str, Any] = response.json()
-            except Exception as exc:
-                raise ValueError(f"Sign token response parse error: {exc}") from exc
+    @staticmethod
+    def build_timestamp() -> str:
+        """Build Beijing-time ISO-8601 timestamp (no milliseconds).
 
-            code = result_data.get("code")
-            if code == 0:
-                data = result_data.get("data")
-                if not isinstance(data, dict):
-                    raise ValueError(f"Sign token response missing 'data' field: {result_data}")
-                logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
-                return data
+        Format: 2006-01-02T15:04:05+08:00
+        """
+        bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
+        return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
-            if code == RETRYABLE_SIGN_CODE and attempt < SIGN_MAX_RETRIES:
-                logger.warning(
-                    "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
-                    code,
-                    SIGN_RETRY_DELAY_S,
-                    attempt + 1,
-                    SIGN_MAX_RETRIES,
+    @classmethod
+    def is_cache_valid(cls, entry: dict[str, Any]) -> bool:
+        """Determine whether the cache entry is valid (not expired with margin)."""
+        return entry["expire_ts"] - time.time() > cls.CACHE_REFRESH_MARGIN_S
+
+    @classmethod
+    def clear_locks(cls) -> None:
+        """Clear all per-app_key refresh locks (called on disconnect)."""
+        cls._locks.clear()
+
+    # -- Core: fetch -------------------------------------------------------
+
+    @classmethod
+    async def fetch(
+        cls,
+        app_key: str,
+        app_secret: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> dict[str, Any]:
+        """Send sign-ticket HTTP request with auto-retry (up to MAX_RETRIES times)."""
+        url = f"{api_domain.rstrip('/')}{cls.TOKEN_PATH}"
+        async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
+            for attempt in range(cls.MAX_RETRIES + 1):
+                nonce = secrets.token_hex(16)
+                timestamp = cls.build_timestamp()
+                signature = cls.compute_signature(nonce, timestamp, app_key, app_secret)
+
+                payload = {
+                    "app_key": app_key,
+                    "nonce": nonce,
+                    "signature": signature,
+                    "timestamp": timestamp,
+                }
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-AppVersion": _APP_VERSION,
+                    "X-OperationSystem": _OPERATION_SYSTEM,
+                    "X-Instance-Id": "16",
+                    "X-Bot-Version": _BOT_VERSION,
+                }
+                if route_env:
+                    headers["X-Route-Env"] = route_env
+
+                logger.info(
+                    "Sign token request: url=%s%s",
+                    url,
+                    f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "",
                 )
-                await asyncio.sleep(SIGN_RETRY_DELAY_S)
-                continue
 
-            msg = result_data.get("msg", "")
-            raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
+                response = await client.post(url, json=payload, headers=headers)
 
-    raise RuntimeError("Sign token failed: max retries exceeded")
+                if response.status_code != 200:
+                    body = response.text
+                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
 
+                try:
+                    result_data: dict[str, Any] = response.json()
+                except Exception as exc:
+                    raise ValueError(f"Sign token response parse error: {exc}") from exc
 
-async def get_sign_token(
-    app_key: str,
-    app_secret: str,
-    api_domain: str,
-    route_env: str = "",
-) -> dict[str, Any]:
-    """
-    Get WS auth token (with cache).
+                code = result_data.get("code")
+                if code == 0:
+                    data = result_data.get("data")
+                    if not isinstance(data, dict):
+                        raise ValueError(f"Sign token response missing 'data' field: {result_data}")
+                    logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
+                    return data
 
-    Return directly on cache hit without re-requesting; treat as expiring 60 seconds before actual expiry, triggering refresh.
-    """
-    cached = _token_cache.get(app_key)
-    if cached and _is_cache_valid(cached):
-        remain = int(cached["expire_ts"] - time.time())
-        logger.info("Using cached token (%ds remaining)", remain)
-        return dict(cached)
+                if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
+                    logger.warning(
+                        "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
+                        code,
+                        cls.RETRY_DELAY_S,
+                        attempt + 1,
+                        cls.MAX_RETRIES,
+                    )
+                    await asyncio.sleep(cls.RETRY_DELAY_S)
+                    continue
 
-    async with _get_refresh_lock(app_key):
-        cached = _token_cache.get(app_key)
-        if cached and _is_cache_valid(cached):
+                msg = result_data.get("msg", "")
+                raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
+
+        raise RuntimeError("Sign token failed: max retries exceeded")
+
+    # -- Public API: get (with cache) --------------------------------------
+
+    @classmethod
+    async def get_token(
+        cls,
+        app_key: str,
+        app_secret: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> dict[str, Any]:
+        """Get WS auth token (with cache).
+
+        Return directly on cache hit without re-requesting; treat as expiring
+        60 seconds before actual expiry, triggering refresh.
+        """
+        cached = cls._cache.get(app_key)
+        if cached and cls.is_cache_valid(cached):
+            remain = int(cached["expire_ts"] - time.time())
+            logger.info("Using cached token (%ds remaining)", remain)
             return dict(cached)
 
-        data = await _do_fetch_sign_token(app_key, app_secret, api_domain, route_env)
+        async with cls.get_refresh_lock(app_key):
+            cached = cls._cache.get(app_key)
+            if cached and cls.is_cache_valid(cached):
+                return dict(cached)
 
-        duration: int = data.get("duration", 0)
-        expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
+            data = await cls.fetch(app_key, app_secret, api_domain, route_env)
 
-        _token_cache[app_key] = {
-            "token": data.get("token", ""),
-            "bot_id": data.get("bot_id", ""),
-            "duration": duration,
-            "product": data.get("product", ""),
-            "source": data.get("source", ""),
-            "expire_ts": expire_ts,
-        }
+            duration: int = data.get("duration", 0)
+            expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
 
-    return dict(_token_cache[app_key])
+            cls._cache[app_key] = {
+                "token": data.get("token", ""),
+                "bot_id": data.get("bot_id", ""),
+                "duration": duration,
+                "product": data.get("product", ""),
+                "source": data.get("source", ""),
+                "expire_ts": expire_ts,
+            }
 
+        return dict(cls._cache[app_key])
 
-async def force_refresh_sign_token(
-    app_key: str,
-    app_secret: str,
-    api_domain: str,
-    route_env: str = "",
-) -> dict[str, Any]:
-    """
-    Force refresh token (clear cache and re-sign).
-    """
-    logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
-    async with _get_refresh_lock(app_key):
-        _token_cache.pop(app_key, None)
-        data = await _do_fetch_sign_token(app_key, app_secret, api_domain, route_env)
+    # -- Public API: force refresh -----------------------------------------
 
-        duration: int = data.get("duration", 0)
-        expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
+    @classmethod
+    async def force_refresh(
+        cls,
+        app_key: str,
+        app_secret: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> dict[str, Any]:
+        """Force refresh token (clear cache and re-sign)."""
+        logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
+        async with cls.get_refresh_lock(app_key):
+            cls._cache.pop(app_key, None)
+            data = await cls.fetch(app_key, app_secret, api_domain, route_env)
 
-        _token_cache[app_key] = {
-            "token": data.get("token", ""),
-            "bot_id": data.get("bot_id", ""),
-            "duration": duration,
-            "product": data.get("product", ""),
-            "source": data.get("source", ""),
-            "expire_ts": expire_ts,
-        }
+            duration: int = data.get("duration", 0)
+            expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
 
-    return dict(_token_cache[app_key])
+            cls._cache[app_key] = {
+                "token": data.get("token", ""),
+                "bot_id": data.get("bot_id", ""),
+                "duration": duration,
+                "product": data.get("product", ""),
+                "source": data.get("source", ""),
+                "expire_ts": expire_ts,
+            }
+
+        return dict(cls._cache[app_key])
 
 
 # ---------------------------------------------------------------------------
-# Module-level send helper (used by send_message tool)
+# Module-level thin delegates (preserve import compatibility for external callers)
 # ---------------------------------------------------------------------------
 
-_YUANBAO_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+def get_active_adapter() -> Optional["YuanbaoAdapter"]:
+    """Delegate to ``YuanbaoAdapter.get_active()``."""
+    return YuanbaoAdapter.get_active()
 
 
 async def send_yuanbao_direct(
@@ -3527,38 +3955,5 @@ async def send_yuanbao_direct(
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Send helper for the ``send_message`` tool — text + media via Yuanbao.
-
-    Unlike Weixin which creates a fresh adapter per call, Yuanbao reuses the
-    running gateway adapter (persistent WebSocket). Logic mirrors
-    send_weixin_direct: send text first, then iterate media_files by extension.
-    """
-    last_result: Optional[SendResult] = None
-
-    # 1. Send text
-    if message.strip():
-        last_result = await adapter.send(chat_id, message)
-        if not last_result.success:
-            return {"error": f"Yuanbao send failed: {last_result.error}"}
-
-    # 2. Iterate media_files, dispatch by file extension
-    for media_path, _is_voice in media_files or []:
-        ext = Path(media_path).suffix.lower()
-        if ext in _YUANBAO_IMAGE_EXTS:
-            last_result = await adapter.send_image_file(chat_id, media_path)
-        else:
-            last_result = await adapter.send_document(chat_id, media_path)
-
-        if not last_result.success:
-            return {"error": f"Yuanbao media send failed: {last_result.error}"}
-
-    if last_result is None:
-        return {"error": "No deliverable text or media remained after processing"}
-
-    return {
-        "success": True,
-        "platform": "yuanbao",
-        "chat_id": chat_id,
-        "message_id": last_result.message_id if last_result else None,
-    }
+    """Delegate to ``OutboundManager.send_direct``."""
+    return await adapter._outbound.send_direct(chat_id, message, media_files)
