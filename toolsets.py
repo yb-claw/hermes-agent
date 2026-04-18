@@ -202,8 +202,8 @@ TOOLSETS = {
     },
 
     "yuanbao": {
-        "description": "Yuanbao platform tools - group info, member queries",
-        "tools": ["yb_query_group_info", "yb_query_group_members"],
+        "description": "Yuanbao platform tools - group info, member queries, DM",
+        "tools": ["yb_query_group_info", "yb_query_group_members", "yb_send_dm"],
         "includes": []
     },
 
@@ -387,10 +387,11 @@ TOOLSETS = {
     },
 
     "hermes-yuanbao": {
-        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询",
+        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊",
         "tools": _HERMES_CORE_TOOLS + [
             "yb_query_group_info",
             "yb_query_group_members",
+            "yb_send_dm",
         ],
         "module": "tools.yuanbao_tools",
         "includes": []

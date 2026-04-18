@@ -3057,7 +3057,8 @@ class MediaSendHandler(ABC):
                 )
 
             # 7. Lock + dispatch
-            return await sender.dispatch_msg_body(chat_id, msg_body, reply_to)
+            gc = kwargs.get("group_code", "")
+            return await sender.dispatch_msg_body(chat_id, msg_body, reply_to, group_code=gc)
 
         except ValueError as ve:
             return SendResult(success=False, error=str(ve))
@@ -3595,6 +3596,7 @@ class MessageSender:
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        group_code: str = "",
     ) -> "SendResult":
         """Send text message with auto-chunking and per-chat-id ordering guarantee."""
         adapter = self._adapter
@@ -3616,7 +3618,7 @@ class MessageSender:
             )
             for i, chunk in enumerate(chunks):
                 r_to = reply_to if i == 0 else None
-                result = await self.send_text_chunk(chat_id, chunk, r_to)
+                result = await self.send_text_chunk(chat_id, chunk, r_to, group_code=group_code)
                 if not result.success:
                     return result
 
@@ -3698,16 +3700,17 @@ class MessageSender:
         chat_id: str,
         msg_body: list,
         reply_to: Optional[str] = None,
+        group_code: str = "",
     ) -> "SendResult":
         """Lock + dispatch an arbitrary MsgBody to C2C or group."""
         lock = self.get_chat_lock(chat_id)
         async with lock:
             if chat_id.startswith("group:"):
-                group_code = chat_id[len("group:"):]
-                result = await self.send_group_msg_body(group_code, msg_body, reply_to)
+                grp = chat_id[len("group:"):]
+                result = await self.send_group_msg_body(grp, msg_body, reply_to)
             else:
                 to_account = chat_id.removeprefix("direct:")
-                result = await self.send_c2c_msg_body(to_account, msg_body)
+                result = await self.send_c2c_msg_body(to_account, msg_body, group_code=group_code)
 
         if result.get("success"):
             return SendResult(success=True, message_id=result.get("msg_key"))
@@ -3719,6 +3722,7 @@ class MessageSender:
         text: str,
         reply_to: Optional[str] = None,
         retry: int = 3,
+        group_code: str = "",
     ) -> "SendResult":
         """Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s)."""
         adapter = self._adapter
@@ -3726,11 +3730,11 @@ class MessageSender:
         for attempt in range(retry):
             try:
                 if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    raw = await self.send_group_message(group_code, text, reply_to)
+                    grp = chat_id[len("group:"):]
+                    raw = await self.send_group_message(grp, text, reply_to)
                 else:
                     to_account = chat_id.removeprefix("direct:")
-                    raw = await self.send_c2c_message(to_account, text)
+                    raw = await self.send_c2c_message(to_account, text, group_code=group_code)
 
                 if raw.get("success"):
                     return SendResult(success=True, message_id=raw.get("msg_key"))
@@ -3758,10 +3762,10 @@ class MessageSender:
 
     # -- C2C / Group message -----------------------------------------------
 
-    async def send_c2c_message(self, to_account: str, text: str) -> dict:
+    async def send_c2c_message(self, to_account: str, text: str, group_code: str = "") -> dict:
         """Send C2C text message, return {success: bool, msg_key: str}."""
         msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
-        return await self.send_c2c_msg_body(to_account, msg_body)
+        return await self.send_c2c_msg_body(to_account, msg_body, group_code=group_code)
 
     async def send_group_message(
         self,
@@ -3823,7 +3827,7 @@ class MessageSender:
 
         return msg_body
 
-    async def send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
+    async def send_c2c_msg_body(self, to_account: str, msg_body: list, group_code: str = "") -> dict:
         """Send C2C message with arbitrary MsgBody."""
         adapter = self._adapter
         req_id = f"c2c_{next_seq_no()}"
@@ -3832,6 +3836,7 @@ class MessageSender:
             msg_body=msg_body,
             from_account=adapter._bot_id or "",
             msg_id=req_id,
+            group_code=group_code,
         )
         return await self._dispatch_encoded(adapter, encoded, req_id)
 
@@ -3988,9 +3993,10 @@ class OutboundManager:
 
     async def send_text(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
+        group_code: str = "",
     ) -> "SendResult":
         """Send text message with auto-chunking."""
-        return await self.sender.send_text(chat_id, content, reply_to)
+        return await self.sender.send_text(chat_id, content, reply_to, group_code=group_code)
 
     async def send_media(
         self, chat_id: str, handler_name: str, **kwargs: Any,
@@ -4193,9 +4199,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        group_code: str = "",
     ) -> SendResult:
         """Send text message with auto-chunking. Delegates to OutboundManager."""
-        return await self._outbound.send_text(chat_id, content, reply_to)
+        return await self._outbound.send_text(chat_id, content, reply_to, group_code=group_code)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic chat metadata derived from the chat_id prefix.
@@ -4257,13 +4264,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     DM_MAX_CHARS = 10000  # DM text limit
 
-    async def send_dm(self, user_id: str, text: str) -> SendResult:
+    async def send_dm(self, user_id: str, text: str, group_code: str = "") -> SendResult:
         """
         Actively send C2C private chat message.
 
         Args:
             user_id: Target user ID
             text: Message text (limit 10000 characters)
+            group_code: Source group code (for group-originated DM context)
 
         Returns:
             SendResult
@@ -4273,7 +4281,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if len(text) > self.DM_MAX_CHARS:
             text = text[:self.DM_MAX_CHARS] + "\n...(truncated)"
         chat_id = f"direct:{user_id}"
-        return await self.send(chat_id, text)
+        return await self.send(chat_id, text, group_code=group_code)
 
     # ------------------------------------------------------------------
     # Media send methods
@@ -4292,6 +4300,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return await self._outbound.send_media(
             chat_id, "image_url",
             reply_to=reply_to, caption=caption, image_url=image_url,
+            **kwargs,
         )
 
     async def send_image_file(
@@ -4307,6 +4316,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return await self._outbound.send_media(
             chat_id, "image_file",
             reply_to=reply_to, caption=caption, image_path=image_path,
+            **kwargs,
         )
 
     async def send_file(
@@ -4322,6 +4332,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return await self._outbound.send_media(
             chat_id, "file_url",
             reply_to=reply_to, file_url=file_url, filename=filename,
+            **kwargs,
         )
 
     async def send_sticker(
@@ -4337,6 +4348,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_id, "sticker",
             reply_to=reply_to,
             sticker_name=sticker_name, face_index=face_index,
+            **kwargs,
         )
 
     async def send_document(
@@ -4354,6 +4366,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_id, "document",
             reply_to=reply_to, caption=caption,
             file_path=file_path, filename=filename,
+            **kwargs,
         )
 
     async def _get_cached_token(self) -> dict:

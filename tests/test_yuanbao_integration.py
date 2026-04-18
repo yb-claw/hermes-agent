@@ -298,10 +298,12 @@ class TestToolset:
         from tools.yuanbao_tools import (
             get_group_info,
             query_group_members,
+            send_dm,
         )
         assert all(callable(f) for f in [
             get_group_info,
             query_group_members,
+            send_dm,
         ])
 
 
