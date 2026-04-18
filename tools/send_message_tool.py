@@ -243,6 +243,16 @@ def _handle_send(args):
     from gateway.platforms.base import BasePlatformAdapter
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+
+    # Fallback: if no MEDIA: tags found, detect bare local file paths
+    # (e.g. /path/to/img.jpg) so the agent doesn't need to remember the
+    # MEDIA: prefix — any referenced local image/video is auto-attached.
+    if not media_files:
+        local_paths, cleaned_message = BasePlatformAdapter.extract_local_files(
+            cleaned_message
+        )
+        media_files = [(p, False) for p in local_paths]
+
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
