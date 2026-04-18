@@ -228,6 +228,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Inbound dispatch tasks — tracked so disconnect() can cancel them
         self._inbound_tasks: set[asyncio.Task] = set()
 
+        # DM message batching: when a non-text message (photo/voice/file)
+        # arrives in a private chat, delay dispatch for a short window so a
+        # follow-up text caption can be merged into the same turn.
+        self._dm_batch_delay_seconds: float = float(
+            os.getenv("HERMES_YUANBAO_DM_BATCH_DELAY_SECONDS", "2.0")
+        )
+        self._dm_pending_batches: Dict[str, MessageEvent] = {}
+        self._dm_batch_tasks: Dict[str, asyncio.Task] = {}
+
         # Reconnection state
         self._reconnect_attempts: int = 0
         self._reconnecting: bool = False         # guards against concurrent reconnects
@@ -472,6 +481,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not task.done():
                 task.cancel()
         self._inbound_tasks.clear()
+
+        # Cancel DM batch flush timers and discard buffered events
+        for task in list(self._dm_batch_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._dm_batch_tasks.clear()
+        self._dm_pending_batches.clear()
 
         # Clear module-level refresh locks to avoid stale locks from a previous event loop
         _refresh_locks.clear()
@@ -2173,32 +2189,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
 
-            logger.info(
-                "[%s] Dispatching MessageEvent:\n"
-                "  chat_id=%s chat_type=%s user_id=%s msg_id=%s msg_type=%s\n"
-                "  reply_to_message_id=%s reply_to_text=%r\n"
-                "  media_urls (count=%d, from_history=%d)=%s\n"
-                "  media_types=%s\n"
-                "  text (len=%d):\n%s\n"
-                "  channel_prompt (len=%s):\n%s",
-                self.name,
-                dispatch_source.chat_id,
-                dispatch_source.chat_type,
-                dispatch_source.user_id,
-                msg_id_field or "",
-                getattr(msg_type, "value", msg_type),
-                reply_to_message_id,
-                (reply_to_text or "")[:200],
-                len(media_urls),
-                len(extra_img_urls),
-                media_urls,
-                media_types,
-                len(_patched_event_text or ""),
-                _patched_event_text,
-                len(event_channel_prompt) if event_channel_prompt else "None",
-                event_channel_prompt if event_channel_prompt else "<None>",
-            )
-
             event = MessageEvent(
                 text=_patched_event_text,
                 message_type=msg_type,
@@ -2211,6 +2201,27 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 reply_to_text=reply_to_text,
                 channel_prompt=event_channel_prompt,
             )
+
+            # DM non-text batching: buffer photos/voice/files briefly so a
+            # follow-up text caption can be merged into the same turn.
+            if (
+                chat_type == "dm"
+                and self._dm_batch_delay_seconds > 0
+                and msg_type not in (MessageType.TEXT, MessageType.COMMAND)
+            ):
+                self._enqueue_dm_nontext(event)
+                return
+
+            # DM text arriving while a non-text message is buffered — merge
+            # and flush immediately so the model sees both together.
+            if (
+                chat_type == "dm"
+                and self._dm_batch_delay_seconds > 0
+                and msg_type == MessageType.TEXT
+                and self._try_merge_text_into_dm_batch(event)
+            ):
+                return
+
             await self.handle_message(event)
 
         task = asyncio.create_task(
@@ -2315,6 +2326,84 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if etype == "TIMFileElem":
                 return MessageType.DOCUMENT
         return MessageType.TEXT
+
+    # ------------------------------------------------------------------
+    # DM non-text message batching (wait for follow-up text caption)
+    # ------------------------------------------------------------------
+
+    def _dm_batch_key(self, event: MessageEvent) -> str:
+        """Session-scoped key for DM message batching."""
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+    def _enqueue_dm_nontext(self, event: MessageEvent) -> None:
+        """Buffer a DM non-text event and start/reset the flush timer."""
+        key = self._dm_batch_key(event)
+        existing = self._dm_pending_batches.get(key)
+        if existing is not None:
+            if event.text:
+                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            if event.media_urls:
+                existing.media_urls.extend(event.media_urls)
+                existing.media_types.extend(event.media_types)
+        else:
+            self._dm_pending_batches[key] = event
+
+        prior = self._dm_batch_tasks.get(key)
+        if prior and not prior.done():
+            prior.cancel()
+        task = asyncio.create_task(self._flush_dm_batch(key))
+        self._dm_batch_tasks[key] = task
+        self._inbound_tasks.add(task)
+        task.add_done_callback(self._inbound_tasks.discard)
+
+    def _try_merge_text_into_dm_batch(self, event: MessageEvent) -> bool:
+        """Merge a DM text event into a pending non-text batch if one exists.
+
+        Returns True if merged (caller should skip normal dispatch).
+        """
+        key = self._dm_batch_key(event)
+        pending = self._dm_pending_batches.get(key)
+        if pending is None:
+            return False
+
+        if event.text:
+            pending.text = f"{pending.text}\n{event.text}" if pending.text else event.text
+
+        prior = self._dm_batch_tasks.get(key)
+        if prior and not prior.done():
+            prior.cancel()
+        self._dm_batch_tasks.pop(key, None)
+
+        merged = self._dm_pending_batches.pop(key, None)
+        if merged:
+            logger.info(
+                "[%s] DM batch: merged follow-up text into buffered %s message for %s",
+                self.name, getattr(merged.message_type, "value", merged.message_type), key[:30],
+            )
+            task = asyncio.create_task(self.handle_message(merged))
+            self._inbound_tasks.add(task)
+            task.add_done_callback(self._inbound_tasks.discard)
+        return True
+
+    async def _flush_dm_batch(self, key: str) -> None:
+        """Timer expired — dispatch the buffered non-text message as-is."""
+        try:
+            await asyncio.sleep(self._dm_batch_delay_seconds)
+        except asyncio.CancelledError:
+            return
+        event = self._dm_pending_batches.pop(key, None)
+        self._dm_batch_tasks.pop(key, None)
+        if event:
+            logger.info(
+                "[%s] DM batch: flushing %s message (no follow-up text within %.1fs) for %s",
+                self.name, getattr(event.message_type, "value", event.message_type),
+                self._dm_batch_delay_seconds, key[:30],
+            )
+            await self.handle_message(event)
 
     # ------------------------------------------------------------------
     # DM active private chat + access control
