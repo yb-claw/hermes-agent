@@ -35,6 +35,26 @@ let
       };
     };
 
+  # alibabacloud sdist-only packages that use setuptools but don't declare it
+  # as a build dependency — provide it explicitly on all platforms.
+  addSetuptools = final: prev:
+    let
+      needsSetuptools = [
+        "alibabacloud-credentials-api"
+        "alibabacloud-endpoint-util"
+        "alibabacloud-gateway-dingtalk"
+        "alibabacloud-gateway-spi"
+        "alibabacloud-tea"
+      ];
+      mkOverride = name: {
+        inherit name;
+        value = prev.${name}.overrideAttrs (old: {
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ final.setuptools ];
+        });
+      };
+    in
+    builtins.listToAttrs (builtins.filter (o: prev ? ${o.name}) (map mkOverride needsSetuptools));
+
   pythonPackageOverrides = final: _prev:
     if isAarch64Darwin then {
       numpy = mkPrebuiltOverride final python311.pkgs.numpy { };
@@ -75,6 +95,7 @@ let
       (lib.composeManyExtensions [
         pyproject-build-systems.overlays.default
         overlay
+        addSetuptools
         pythonPackageOverrides
       ]);
 in
