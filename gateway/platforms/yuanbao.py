@@ -160,7 +160,7 @@ _REPLY_REF_MAX_ENTRIES = 500       # Max capacity of reference dedup dict
 
 # Slow-response hint: push a waiting message when agent produces no data for this duration (seconds)
 SLOW_RESPONSE_TIMEOUT_S = 120.0
-SLOW_RESPONSE_MESSAGE = "The task is a bit complex, working hard on it, please wait patiently..."
+SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
 
 # Placeholder message filter (skip these pure placeholders when no actual media content)
 _SKIPPABLE_PLACEHOLDERS = frozenset({
