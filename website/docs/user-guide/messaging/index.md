@@ -24,16 +24,15 @@ For the full voice feature set — including CLI microphone mode, spoken replies
 | Home Assistant | — | — | — | — | — | — | — |
 | Mattermost | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
 | Matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| DingTalk | — | ✅ | ✅ | — | ✅ | — | ✅ |
+| DingTalk | — | — | — | — | — | ✅ | ✅ |
 | Feishu/Lark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | WeCom | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 | WeCom Callback | — | — | — | — | — | — | — |
 | Weixin | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 | BlueBubbles | — | ✅ | ✅ | — | ✅ | ✅ | — |
 | QQ | ✅ | ✅ | ✅ | — | — | ✅ | — |
-| Yuanbao | — | ✅ | ✅ | — | — | ✅ | ✅ |
+| Yuanbao | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 
-**Voice**
 **Voice** = TTS audio replies and/or voice message transcription. **Images** = send/receive images. **Files** = send/receive file attachments. **Threads** = threaded conversations. **Reactions** = emoji reactions on messages. **Typing** = typing indicator while processing. **Streaming** = progressive message updates via editing.
 
 ## Architecture
@@ -191,7 +190,6 @@ DINGTALK_ALLOWED_USERS=user-id-1
 FEISHU_ALLOWED_USERS=ou_xxxxxxxx,ou_yyyyyyyy
 WECOM_ALLOWED_USERS=user-id-1,user-id-2
 WECOM_CALLBACK_ALLOWED_USERS=user-id-1,user-id-2
-YUANBAO_ALLOWED_USERS=user-id-1,user-id-2
 
 # Or allow
 GATEWAY_ALLOWED_USERS=123456789,987654321
@@ -378,7 +376,7 @@ Each platform has its own toolset:
 | Weixin | `hermes-weixin` | Full tools including terminal |
 | BlueBubbles | `hermes-bluebubbles` | Full tools including terminal |
 | QQBot | `hermes-qqbot` | Full tools including terminal |
-| Yuanbao | `hermes-yuanbao` | Full tools including terminal + group query tools (yb_query_group_info, yb_query_group_members) |
+| Yuanbao | `hermes-yuanbao` | Full tools including terminal |
 | API Server | `hermes` (default) | Full tools including terminal |
 | Webhooks | `hermes-webhook` | Full tools including terminal |
 
