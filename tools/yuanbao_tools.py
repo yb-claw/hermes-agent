@@ -173,7 +173,13 @@ from tools.registry import registry, tool_result, tool_error  # noqa: E402
 
 
 def _check_yuanbao():
-    """Toolset availability check — True when adapter is connected."""
+    """Toolset availability check — True when running in a yuanbao gateway session."""
+    try:
+        from gateway.session_context import get_session_env
+        if get_session_env("HERMES_SESSION_PLATFORM", "") == "yuanbao":
+            return True
+    except Exception:
+        pass
     return _get_active_adapter() is not None
 
 
