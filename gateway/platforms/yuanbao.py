@@ -3419,7 +3419,7 @@ class MessageSender:
             from_account=adapter._bot_id or "",
             msg_id=req_id,
         )
-        return await self._dispatch_encoded(a, encoded, req_id)
+        return await self._dispatch_encoded(adapter, encoded, req_id)
 
     async def send_group_msg_body(
         self,
@@ -3437,7 +3437,7 @@ class MessageSender:
             msg_id=req_id,
             ref_msg_id=reply_to or "",
         )
-        return await self._dispatch_encoded(a, encoded, req_id)
+        return await self._dispatch_encoded(adapter, encoded, req_id)
 
     # -- Common dispatch helper --------------------------------------------
 

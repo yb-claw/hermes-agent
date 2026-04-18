@@ -416,6 +416,46 @@ WSL_ENVIRONMENT_HINT = (
 )
 
 
+def detect_user_language_hint(messages: list, platform: str) -> str:
+    """Detect the dominant language from recent user messages and return a hint.
+
+    Only active for the ``yuanbao`` platform.  Scans the last few user
+    messages for CJK character density and returns a short instruction
+    asking the model to reply in the detected language.  Returns an empty
+    string when detection is inconclusive or the platform is not yuanbao.
+    """
+    if (platform or "").lower().strip() != "yuanbao":
+        return ""
+
+    # Collect the last N user messages (text only)
+    user_texts: list[str] = []
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            user_texts.append(content.strip())
+        if len(user_texts) >= 5:
+            break
+
+    if not user_texts:
+        return ""
+
+    combined = " ".join(user_texts)
+    cjk_count = sum(1 for c in combined if '\u4e00' <= c <= '\u9fff')
+    total_alpha = sum(1 for c in combined if c.isalpha())
+
+    if total_alpha == 0:
+        return ""
+
+    if cjk_count / total_alpha > 0.3:
+        return "[Reminder: The user is writing in Chinese. You must reply in Chinese (简体中文).]"
+
+    # If the user is clearly writing in a non-Chinese language, don't
+    # force Chinese — let the platform hint's "same language" rule apply.
+    return ""
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 
