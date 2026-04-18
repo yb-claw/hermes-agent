@@ -95,7 +95,7 @@ BIZ_SERVICES = {
     "SendGroupHeartbeatRsp": f"{_BIZ_PKG}.SendGroupHeartbeatRsp",
 }
 
-# openclaw instance_id（固定值 17）
+# instance_id（hermes 固定值 17）
 HERMES_INSTANCE_ID = 17
 
 # Reply Heartbeat 状态常量
