@@ -282,6 +282,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
         )
         self._group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
 
+        # ------------------------------------------------------------------
+        # Auto-sethome: first user to message the bot becomes the owner.
+        # If no home channel is configured, the first conversation will be
+        # automatically set as the home channel.  When the existing home
+        # channel is a group chat (group:xxx), it stays eligible for
+        # upgrade — the first DM will override it with direct:xxx.
+        # ------------------------------------------------------------------
+        _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (
+            config.home_channel.chat_id if config.home_channel else ""
+        )
+        self._auto_sethome_done: bool = bool(_existing_home) and not _existing_home.startswith("group:")
+
     # ------------------------------------------------------------------
     # Task tracking helper
     # ------------------------------------------------------------------
@@ -1871,6 +1883,45 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     self.name, group_code, self._group_policy,
                 )
                 return
+
+        # ------------------------------------------------------------------
+        # Auto-sethome: on the very first inbound message, if no home
+        # channel has been configured yet, automatically designate this
+        # conversation as the Yuanbao home channel.
+        # When the existing home is a group chat and a DM arrives,
+        # upgrade to DM (direct:xxx overrides group:xxx).
+        # ------------------------------------------------------------------
+        if not self._auto_sethome_done:
+            _cur_home = os.getenv("YUANBAO_HOME_CHANNEL", "")
+            # Trigger when: (a) no home at all, or (b) home is group and this is DM
+            _should_set = (
+                not _cur_home
+                or (_cur_home.startswith("group:") and chat_type == "dm")
+            )
+            if chat_type == "dm":
+                self._auto_sethome_done = True  # DM seen — no further upgrades needed
+            if _should_set:
+                try:
+                    from hermes_constants import get_hermes_home
+                    from utils import atomic_yaml_write
+                    import yaml
+
+                    _home = get_hermes_home()
+                    config_path = _home / "config.yaml"
+                    user_config: dict = {}
+                    if config_path.exists():
+                        with open(config_path, encoding="utf-8") as f:
+                            user_config = yaml.safe_load(f) or {}
+                    user_config["YUANBAO_HOME_CHANNEL"] = chat_id
+                    atomic_yaml_write(config_path, user_config)
+                    os.environ["YUANBAO_HOME_CHANNEL"] = str(chat_id)
+                    logger.info(
+                        "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",
+                        self.name, chat_id, chat_name,
+                    )
+                    # Silent auto-sethome: no user-facing message, only log
+                except Exception as e:
+                    logger.warning("[%s] Auto-sethome failed: %s", self.name, e)
 
         # Extract raw text first (before any history enrichment)
         raw_text = self._rewrite_slash_command(self._extract_text(msg_body))
