@@ -52,6 +52,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
 )
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
@@ -167,6 +169,13 @@ _SKIPPABLE_PLACEHOLDERS = frozenset({
     "[image]", "[图片]", "[file]", "[文件]",
     "[video]", "[视频]", "[voice]", "[语音]",
 })
+
+# Anchor regex: matches [image|ybres:xxx], [file:name|ybres:xxx], [voice|ybres:xxx], [video|ybres:xxx]
+_YB_RES_REF_RE = re.compile(
+    r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]"
+)
+OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
+OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
 
 
 def _strip_cron_wrapper_for_yuanbao(content: str) -> str:
@@ -628,8 +637,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
     async def _resolve_inbound_media_urls(
         self, media_refs: List[Dict[str, str]]
     ) -> Tuple[List[str], List[str]]:
-        """
-        Parse inbound image/file URLs (no local caching), return (media_urls, media_types).
+        """Download inbound image/file to local cache, return (local_paths, mime_types).
+
+        Yuanbao COS hostnames resolve to private IPs, tripping the SSRF guard
+        in vision_tools. We download ourselves and return local cache paths.
         """
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -646,52 +657,108 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 logger.warning("[%s] inbound media resolve failed: kind=%s url=%s err=%s", self.name, kind, url, exc)
                 continue
 
-            # Infer MIME by resource type, pass fetch_url directly to the model side.
-            if kind == "image":
-                ext = self._guess_image_ext_from_url(fetch_url)
-                mime = guess_mime_type(f"image{ext}")
-                if not mime.startswith("image/"):
-                    mime = "image/jpeg"
-                media_urls.append(fetch_url)
-                media_types.append(mime)
+            cached = await self._download_and_cache_yuanbao_resource(
+                fetch_url=fetch_url,
+                kind=kind,
+                file_name=str(ref.get("name") or "").strip() or None,
+                log_tag=f"placeholder_url={url[:80]}",
+            )
+            if cached is None:
                 continue
-
-            file_name = str(ref.get("name") or "").strip()
-            if not file_name:
-                parsed = urllib.parse.urlparse(fetch_url)
-                file_name = os.path.basename(parsed.path) or "file"
-            mime = guess_mime_type(file_name) or "application/octet-stream"
-            media_urls.append(fetch_url)
+            local_path, mime = cached
+            media_urls.append(local_path)
             media_types.append(mime)
 
         return media_urls, media_types
 
-    async def _resolve_inbound_download_url(self, url: str) -> str:
-        """
-        Resolve Yuanbao resource placeholder download link to a directly fetchable real URL.
+    async def _download_and_cache_yuanbao_resource(
+        self,
+        *,
+        fetch_url: str,
+        kind: str,
+        file_name: Optional[str] = None,
+        log_tag: str = "",
+    ) -> Optional[Tuple[str, str]]:
+        """Download a Yuanbao resource to local cache. Returns ``(local_path, mime)`` or ``None``."""
+        try:
+            file_bytes, content_type = await media_download_url(
+                fetch_url, max_size_mb=self.MEDIA_MAX_SIZE_MB,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] inbound media download failed: kind=%s %s err=%s",
+                self.name, kind, log_tag, exc,
+            )
+            return None
 
-        Common URL patterns for Yuanbao inbound images/files:
-          https://hunyuan.tencent.com/api/resource/download?resourceId=...
-        Direct GET on this URL returns 401; need to call the business API:
-          GET /api/resource/v1/download?resourceId=...
-        """
+        if kind == "image":
+            ext = self._guess_image_ext_from_url(fetch_url)
+            try:
+                local_path = cache_image_from_bytes(file_bytes, ext=ext)
+            except ValueError as exc:
+                logger.warning(
+                    "[%s] inbound image cache rejected: %s err=%s",
+                    self.name, log_tag, exc,
+                )
+                return None
+            mime = guess_mime_type(f"image{ext}")
+            if not mime.startswith("image/"):
+                mime = content_type if content_type.startswith("image/") else "image/jpeg"
+            return local_path, mime
+
+        # kind == "file"
+        if not file_name:
+            parsed = urllib.parse.urlparse(fetch_url)
+            file_name = os.path.basename(parsed.path) or "file"
+        try:
+            local_path = cache_document_from_bytes(file_bytes, file_name)
+        except Exception as exc:
+            logger.warning(
+                "[%s] inbound file cache failed: %s err=%s",
+                self.name, log_tag, exc,
+            )
+            return None
+        mime = guess_mime_type(file_name) or content_type or "application/octet-stream"
+        return local_path, mime
+
+    @staticmethod
+    def _parse_resource_id(url: str) -> str:
+        """Extract ``resourceId`` from a Yuanbao resource placeholder URL."""
+        if not url:
+            return ""
         try:
             parsed = urllib.parse.urlparse(url)
         except Exception:
-            return url
-
+            return ""
         query = urllib.parse.parse_qs(parsed.query)
         resource_ids = query.get("resourceId") or query.get("resourceid") or []
-        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        return str(resource_ids[0]).strip() if resource_ids else ""
+
+    async def _resolve_inbound_download_url(self, url: str) -> str:
+        """Resolve a Yuanbao resource placeholder URL to a fetchable real URL.
+
+        Falls back to the original URL on failure.
+        """
+        resource_id = self._parse_resource_id(url)
         if not resource_id:
             return url
+        try:
+            return await self._download_url_by_resource_id(resource_id)
+        except Exception:
+            return url
+
+    async def _download_url_by_resource_id(self, resource_id: str) -> str:
+        """Exchange a Yuanbao ``resourceId`` for a short-lived direct download URL. Raises on failure."""
+        resource_id = resource_id.strip()
+        if not resource_id:
+            raise RuntimeError("missing resource_id")
 
         token_data = await self._get_cached_token()
         token = str(token_data.get("token") or "").strip()
         source = str(token_data.get("source") or "web").strip() or "web"
         bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
         if not token or not bot_id:
-            return url
+            raise RuntimeError("missing token or bot_id for resource download")
 
         api_url = f"{self._api_domain}/api/resource/v1/download"
 
@@ -731,7 +798,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     return real_url
                 raise RuntimeError("resource/v1/download missing url/realUrl")
 
-        return url
+        raise RuntimeError("resource/v1/download did not return a URL")
 
     @staticmethod
     def truncate_message(
@@ -1382,7 +1449,29 @@ class YuanbaoAdapter(BasePlatformAdapter):
             "and answer it directly."
         )
 
-    def _detect_owner_command(
+    # Owner-only group commands (no @Bot required for the creator).
+    _OWNER_ONLY_GROUP_COMMANDS = frozenset({
+        "/new",         # Start new session
+        "/reset",       # Alias for /new
+        "/retry",       # Retry last message
+        "/undo",        # Delete last user/assistant turn
+        "/stop",        # Kill all running background processes
+        "/approve",     # Approve pending dangerous command
+        "/deny",        # Deny pending dangerous command
+        "/background",  # Run a prompt in background
+        "/bg",          # Alias for /background
+        "/btw",         # Temporary side question based on current session context
+        "/queue",       # Queue a prompt for next turn
+        "/q",           # Alias for /queue
+    })
+
+    # Commands any participant can fire with @Bot (e.g. approve/deny pending tool calls).
+    _GROUP_AT_BOT_COMMANDS = frozenset({
+        "/approve",
+        "/deny",
+    })
+
+    def _detect_group_slash_command(
         self,
         *,
         push: dict,
@@ -1390,84 +1479,56 @@ class YuanbaoAdapter(BasePlatformAdapter):
         chat_type: str,
         chat_id: str,
         from_account: str,
-    ) -> Tuple[Optional[str], Optional[str], bool]:
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
+        """Identify an in-group slash command. Returns ``(cmd, cmd_line, scope, is_owner)``.
+
+        scope: ``"owner"`` (skip @Bot), ``"at_bot"`` (require @Bot), ``"owner_only_reject"``, or ``None``.
         """
-        Identify "in-group allowlisted slash commands" and determine sender identity.
+        if chat_type != "group":
+            return None, None, None, False
 
-        Match conditions (all must be met to be considered an allowlisted command):
-          - Group chat (chat_type == "group")
-          - After removing all TIMCustomElem (e.g. @Bot AT elements) from msg_body,
-              there must be exactly one TIMTextElem (i.e. only one plain text segment besides AT)
-          - The first token of that text matches the allowlist
-
-        Returns (cmd, cmd_line, is_owner):
-          - (None, None, False): Not an allowlisted command; caller proceeds with normal message dispatch
-          - (cmd,  cmd_line, True):  Owner match; caller should skip @Bot detection,
-              and set event.text to cmd_line (to avoid @Bot prefix interfering with command recognition)
-          - (cmd,  cmd_line, False): Allowlisted command but sender is not owner; caller should reject
-
-        Where `cmd` is the first token (e.g. `"/new"`), `cmd_line` is the normalized
-        full command line text (with arguments, e.g. `"/queue analyze the logs"`).
-
-        Owner identity is determined by: push.bot_owner_id == from_account.
-        bot_owner_id is injected by Tencent IM backend in each downstream message; empty means non-owner.
-
-        Note: Command recognition in GatewayRunner._handle_message uses event.get_command()
-        based on event.text; in owner scenarios, event.text must be replaced with cmd_line from this function,
-        otherwise event.text remains something like "@Bot /new" with AT prefix, causing command recognition to fail.
-        """
-        # Slash command allowlist that bot owner can execute in group without @Bot (modify here)
-        allowlist = frozenset({
-            "/new",         # Start new session
-            "/reset",       # Alias for /new
-            "/retry",       # Retry last message
-            "/undo",        # Delete last user/assistant turn
-            "/stop",        # Kill all running background processes
-            "/approve",     # Approve pending dangerous command
-            "/deny",        # Deny pending dangerous command
-            "/background",  # Run a prompt in background
-            "/bg",          # Alias for /background
-            "/btw",         # Temporary side question based on current session context
-            "/queue",       # Queue a prompt for next turn
-            "/q",           # Alias for /queue
-        })
-
-        if chat_type != "group" or not allowlist:
-            return None, None, False
-
-        # Extract TIMTextElem from msg_body: only do command recognition when there is exactly one text segment.
-        # Other types (AT / image / emoji etc.) are ignored — to prevent _extract_text from concatenating AT
-        # into "@xxx /new" which would interfere with command recognition.
         text_elems = [
             e for e in (msg_body or [])
             if e.get("msg_type") == "TIMTextElem"
         ]
         if len(text_elems) != 1:
-            return None, None, False
+            return None, None, None, False
 
         text = (text_elems[0].get("msg_content") or {}).get("text", "")
-        cmd_line = self._rewrite_slash_command(text)  # Normalize full-width slash + strip
+        cmd_line = self._rewrite_slash_command(text)
         if not cmd_line.startswith("/"):
-            return None, None, False
+            return None, None, None, False
         cmd = cmd_line.split(maxsplit=1)[0].lower()
-        if cmd not in allowlist:
-            return None, None, False
 
-        # Sender identity check: bot owner ⇔ push.from_account == push.bot_owner_id
+        in_owner_list = cmd in self._OWNER_ONLY_GROUP_COMMANDS
+        in_at_bot_list = cmd in self._GROUP_AT_BOT_COMMANDS
+        if not in_owner_list and not in_at_bot_list:
+            return None, None, None, False
+
         owner_id = (push or {}).get("bot_owner_id") or ""
         is_owner = bool(owner_id) and owner_id == from_account
 
-        if is_owner:
+        if in_owner_list and is_owner:
+            scope = "owner"
             logger.info(
-                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
+                "[%s] Owner slash command: chat=%s from=%s cmd=%s",
+                self.name, chat_id, from_account, cmd,
+            )
+        elif in_at_bot_list:
+            scope = "at_bot"
+            logger.info(
+                "[%s] At-bot slash command candidate: chat=%s from=%s cmd=%s "
+                "(admission still gated on @Bot detection)",
                 self.name, chat_id, from_account, cmd,
             )
         else:
+            scope = "owner_only_reject"
             logger.info(
                 "[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s owner=%s",
                 self.name, chat_id, from_account, cmd, owner_id or "(empty)",
             )
-        return cmd, cmd_line, is_owner
+
+        return cmd, cmd_line, scope, is_owner
 
     # ------------------------------------------------------------------
     # Group chat: observe messages into session transcript
@@ -1476,16 +1537,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     def _observe_group_message(
         self, source: SessionSource, sender_display: str, text: str,
     ) -> None:
-        """Write a group message into the session transcript without triggering the agent.
-
-        This allows the model to see the full group conversation when it is
-        eventually invoked via @bot.  Messages are stored with ``role: "user"``
-        in the format ``[nickname|user_id]\\n<content>`` so the model
-        can distinguish participants and their user ids.
-
-        Requires ``group_sessions_per_user: false`` in the platform extra
-        config so that all participants share a single session transcript.
-        """
+        """Write a non-@bot group message into the transcript for context."""
         store = getattr(self, "_session_store", None)
         if not store:
             return
@@ -1504,6 +1556,80 @@ class YuanbaoAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.warning("[%s] Failed to observe group message: %s", self.name, exc)
+
+    # ------------------------------------------------------------------
+    # Observed-media hydration: download image/file anchors from recent
+    # transcript and cache locally for the current @bot turn.
+    # ------------------------------------------------------------------
+
+    async def _collect_observed_media(
+        self, source: SessionSource,
+    ) -> Tuple[List[str], List[str]]:
+        """Resolve recent observed image/file anchors into ``(local_paths, mimes)``."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return [], []
+        try:
+            session_entry = store.get_or_create_session(source)
+            history = store.load_transcript(session_entry.session_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Observed-media hydration setup failed: %s",
+                self.name, exc,
+            )
+            return [], []
+        if not history:
+            return [], []
+
+        start = max(0, len(history) - OBSERVED_MEDIA_BACKFILL_LOOKBACK)
+        order: List[Tuple[str, str, str]] = []  # (rid, kind, filename)
+        seen: set[str] = set()
+        for msg in history[start:]:
+            content = msg.get("content")
+            if not isinstance(content, str) or "|ybres:" not in content:
+                continue
+            for m in _YB_RES_REF_RE.finditer(content):
+                head = m.group(1)  # "image" | "file:<name>" | "voice" | "video"
+                rid = m.group(2)
+                kind, _, filename = head.partition(":")
+                kind = kind.strip()
+                if kind not in ("image", "file"):
+                    continue
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                order.append((rid, kind, filename.strip()))
+                if len(order) >= OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN:
+                    break
+            if len(order) >= OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN:
+                break
+
+        if not order:
+            return [], []
+
+        media_paths: List[str] = []
+        mimes: List[str] = []
+        for rid, kind, filename in order:
+            try:
+                fresh_url = await self._download_url_by_resource_id(rid)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] observed-media resolve failed: rid=%s kind=%s err=%s",
+                    self.name, rid, kind, exc,
+                )
+                continue
+            cached = await self._download_and_cache_yuanbao_resource(
+                fetch_url=fresh_url,
+                kind=kind,
+                file_name=filename or None,
+                log_tag=f"rid={rid}",
+            )
+            if cached is None:
+                continue
+            path, mime = cached
+            media_paths.append(path)
+            mimes.append(mime)
+        return media_paths, mimes
 
     # ------------------------------------------------------------------
     # Reply Heartbeat state machine
@@ -1934,28 +2060,31 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
-        # Bot owner allowlisted command fast path.
-        # - Owner match: skip @Bot detection, set raw_text to clean command text
-        #   (strip AT prefix) so downstream event.get_command() can recognize correctly
-        # - Non-owner match: send rejection message and return
-        # - No match: proceed with normal message dispatch
-        matched_cmd, cmd_line, is_owner = self._detect_owner_command(
+        matched_cmd, cmd_line, cmd_scope, is_owner = self._detect_group_slash_command(
             push=push,
             msg_body=msg_body,
             chat_type=chat_type,
             chat_id=chat_id,
             from_account=from_account,
         )
-        if matched_cmd and not is_owner:
-            self._track_task(asyncio.create_task(
-                self.send(chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
-                name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
-            ))
+        if cmd_scope == "owner_only_reject":
+            if self._is_at_bot(msg_body):
+                self._track_task(asyncio.create_task(
+                    self.send(chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
+                    name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
+                ))
             return
-        owner_command: Optional[str] = None
-        if matched_cmd and is_owner and cmd_line:
-            owner_command = matched_cmd
-            raw_text = cmd_line  # Override with clean command text, strip AT prefix
+
+        if cmd_scope == "at_bot" and not self._is_at_bot(msg_body):
+            return
+
+        admitted_command: Optional[str] = None
+        if cmd_scope == "owner" and cmd_line:
+            admitted_command = matched_cmd
+            raw_text = cmd_line
+        elif cmd_scope == "at_bot" and cmd_line:
+            admitted_command = matched_cmd
+            raw_text = cmd_line
 
         source = self.build_source(
             chat_id=chat_id,
@@ -1970,9 +2099,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             thread_id="main" if chat_type == "group" else None,
         )
 
-        # ---- Group chat: observe non-@bot messages, reply only on @Bot ----
-        # Owner commands skip @Bot detection (owner doesn't need to @Bot).
-        if chat_type == "group" and not owner_command and not self._is_at_bot(msg_body):
+        if chat_type == "group" and not admitted_command and not self._is_at_bot(msg_body):
             self._observe_group_message(source, sender_nickname or from_account, raw_text)
             logger.info(
                 "[%s] Group message observed (no @bot): chat=%s from=%s",
@@ -1984,7 +2111,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         event_channel_prompt = None
         event_text = raw_text
         dispatch_source = source
-        if chat_type == "group" and not owner_command:
+        if chat_type == "group" and not admitted_command:
             event_channel_prompt = self._build_group_channel_prompt(msg_body)
             user_id_label = from_account or "unknown"
             nickname_label = sender_nickname or from_account or "unknown"
@@ -1998,9 +2125,82 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if self._is_skippable_placeholder(raw_text, len(media_urls)):
                 logger.debug("[%s] Skip placeholder after media download: %r", self.name, raw_text)
                 return
+
+            extra_img_urls: List[str] = []
+            extra_img_mimes: List[str] = []
+            try:
+                extra_img_urls, extra_img_mimes = await self._collect_observed_media(
+                    dispatch_source,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] observed-image hydration raised, continuing anyway: %s",
+                    self.name, exc,
+                )
+            if extra_img_urls:
+                current = set(media_urls)
+                for u, m in zip(extra_img_urls, extra_img_mimes):
+                    if u in current:
+                        continue
+                    media_urls.append(u)
+                    media_types.append(m)
+                    current.add(u)
+
+            # Replace [kind|ybres:xxx] anchors with local cache paths so
+            # the transcript records usable paths for the model.
+            _patched_event_text = event_text
+            for u, m in zip(media_urls, media_types):
+                if not u.startswith("/"):
+                    continue
+                anchor_match = _YB_RES_REF_RE.search(_patched_event_text)
+                if not anchor_match:
+                    continue
+                head = anchor_match.group(1)
+                kind, _, filename = head.partition(":")
+                kind = kind.strip()
+                if kind == "image" and m.startswith("image/"):
+                    replacement = f"[image: {u}]"
+                elif kind == "file":
+                    label = filename.strip() or os.path.basename(u)
+                    replacement = f"[file: {label} → {u}]"
+                else:
+                    continue
+                _patched_event_text = (
+                    _patched_event_text[:anchor_match.start()]
+                    + replacement
+                    + _patched_event_text[anchor_match.end():]
+                )
+
             reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
+
+            logger.info(
+                "[%s] Dispatching MessageEvent:\n"
+                "  chat_id=%s chat_type=%s user_id=%s msg_id=%s msg_type=%s\n"
+                "  reply_to_message_id=%s reply_to_text=%r\n"
+                "  media_urls (count=%d, from_history=%d)=%s\n"
+                "  media_types=%s\n"
+                "  text (len=%d):\n%s\n"
+                "  channel_prompt (len=%s):\n%s",
+                self.name,
+                dispatch_source.chat_id,
+                dispatch_source.chat_type,
+                dispatch_source.user_id,
+                msg_id_field or "",
+                getattr(msg_type, "value", msg_type),
+                reply_to_message_id,
+                (reply_to_text or "")[:200],
+                len(media_urls),
+                len(extra_img_urls),
+                media_urls,
+                media_types,
+                len(_patched_event_text or ""),
+                _patched_event_text,
+                len(event_channel_prompt) if event_channel_prompt else "None",
+                event_channel_prompt if event_channel_prompt else "<None>",
+            )
+
             event = MessageEvent(
-                text=event_text,
+                text=_patched_event_text,
                 message_type=msg_type,
                 source=dispatch_source,
                 message_id=msg_id_field or None,
@@ -2021,17 +2221,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         task.add_done_callback(self._inbound_tasks.discard)
 
     def _extract_text(self, msg_body: list) -> str:
-        """
-        Extract plain text content from MsgBody.
-        - TIMTextElem      → extract text field
-        - TIMImageElem     → "[image]"
-        - TIMFileElem      → "[file: {filename}]"
-        - TIMSoundElem     → "[voice]"
-        - TIMVideoFileElem → "[video]"
-        - TIMFaceElem      → "[emoji: {name}]" or "[emoji]"
-        - TIMCustomElem    → try to extract data field, otherwise "[custom message]"
-        - Multiple elems joined with spaces
-        """
+        """Extract plain text from MsgBody. Media elems embed ``[kind|ybres:<id>]`` anchors."""
         parts: list[str] = []
         for elem in msg_body:
             elem_type: str = elem.get("msg_type", "")
@@ -2042,14 +2232,32 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 if text:
                     parts.append(text)
             elif elem_type == "TIMImageElem":
-                parts.append("[image]")
+                image_info_array = content.get("image_info_array")
+                image_url = ""
+                if isinstance(image_info_array, list):
+                    if len(image_info_array) > 1 and isinstance(image_info_array[1], dict):
+                        image_url = str(image_info_array[1].get("url") or "").strip()
+                    if not image_url and image_info_array and isinstance(image_info_array[0], dict):
+                        image_url = str(image_info_array[0].get("url") or "").strip()
+                rid = self._parse_resource_id(image_url)
+                parts.append(f"[image|ybres:{rid}]" if rid else "[image]")
             elif elem_type == "TIMFileElem":
                 filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
-                parts.append(f"[file: {filename}]" if filename else "[file]")
+                rid = self._parse_resource_id(str(content.get("url") or ""))
+                if filename and rid:
+                    parts.append(f"[file:{filename}|ybres:{rid}]")
+                elif rid:
+                    parts.append(f"[file|ybres:{rid}]")
+                elif filename:
+                    parts.append(f"[file: {filename}]")
+                else:
+                    parts.append("[file]")
             elif elem_type == "TIMSoundElem":
-                parts.append("[voice]")
+                rid = self._parse_resource_id(str(content.get("url") or ""))
+                parts.append(f"[voice|ybres:{rid}]" if rid else "[voice]")
             elif elem_type == "TIMVideoFileElem":
-                parts.append("[video]")
+                rid = self._parse_resource_id(str(content.get("url") or ""))
+                parts.append(f"[video|ybres:{rid}]" if rid else "[video]")
             elif elem_type == "TIMCustomElem":
                 data_val = content.get("data", "")
                 if data_val:
