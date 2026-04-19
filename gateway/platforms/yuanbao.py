@@ -2,8 +2,7 @@
 Yuanbao platform adapter.
 
 Connects to the Yuanbao WebSocket gateway, handles authentication (AUTH_BIND),
-heartbeat, and reconnection.  Message receive (T05) and send (T06) logic
-will be added in follow-up tasks.
+heartbeat, reconnection, message receive (T05) and send (T06).
 
 Configuration in config.yaml (or via env vars):
     platforms:
@@ -116,7 +115,7 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
 AUTH_TIMEOUT_SECONDS = 10.0
 MAX_RECONNECT_ATTEMPTS = 100
-DEFAULT_SEND_TIMEOUT = 30.0  # WS biz request timeout (was 10s)
+DEFAULT_SEND_TIMEOUT = 30.0  # WS biz request timeout
 
 # Close codes that indicate permanent errors — do NOT reconnect.
 NO_RECONNECT_CLOSE_CODES = {4012, 4013, 4014, 4018, 4019, 4021}
@@ -149,12 +148,6 @@ _YB_RES_REF_RE = re.compile(
 OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
 # Max number of resource references to resolve per inbound turn
 OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
-
-
-# ============================================================
-# Markdown processing (originally yuanbao_markdown.py)
-# ============================================================
-
 
 class MarkdownProcessor:
     """Encapsulates all Markdown-related utilities for the Yuanbao platform.
@@ -636,12 +629,6 @@ class MarkdownProcessor:
             "Please use Markdown formatting when appropriate to improve readability."
         )
 
-
-
-# ============================================================
-# Sign-ticket API (originally yuanbao_api.py)
-# ============================================================
-
 class SignManager:
     """Encapsulates all sign-token related logic for the Yuanbao platform.
 
@@ -863,12 +850,9 @@ class SignManager:
             }
 
         return dict(cls._cache[app_key])
-# ============================================================
-# Region: Inbound Pipeline Engine & Context
-# ============================================================
+
 
 from dataclasses import dataclass, field as dc_field
-
 
 @dataclass
 class InboundContext:
@@ -1045,12 +1029,6 @@ class InboundPipeline:
             # End of chain — nothing more to do
 
         await next_fn()
-
-
-# ============================================================
-# Region: Inbound Middlewares (OOP)
-# ============================================================
-
 class DecodeMiddleware(InboundMiddleware):
     """Decode raw inbound frames from JSON or Protobuf into ctx.push.
 
@@ -2286,11 +2264,6 @@ class InboundPipelineBuilder:
             pipeline.use(mw_cls())
         return pipeline
 
-
-# ============================================================
-# ConnectionManager — WebSocket lifecycle (open / close / heartbeat / reconnect)
-# ============================================================
-
 class ConnectionManager:
     """Manages the WebSocket connection lifecycle for YuanbaoAdapter.
 
@@ -2940,11 +2913,6 @@ class ConnectionManager:
             except Exception:
                 pass
 
-
-# ============================================================
-# MediaSendHandler — strategy pattern for media message sending
-# ============================================================
-
 class MediaSendHandler(ABC):
     """Abstract base class for media send strategies.
 
@@ -3203,11 +3171,6 @@ class StickerHandler(MediaSendHandler):
         else:
             sticker = get_random_sticker()
             return build_sticker_msg_body(sticker)
-
-
-# ============================================================
-# Outbound — message sending, heartbeat, slow-response notification
-# ============================================================
 
 class GroupQueryService:
     """Encapsulates all group query operations (both low-level WS calls and
