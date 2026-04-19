@@ -1,11 +1,13 @@
 ---
+
 name: yuanbao
 description: Yuanbao (元宝) group interaction — @mention users, query group info and members
 version: 1.0.0
 metadata:
   hermes:
     tags: [yuanbao, mention, at, group, members, 元宝, 派, 艾特]
-    related_skills: []
+related_skills: []
+
 ---
 
 # Yuanbao Group Interaction
@@ -18,12 +20,36 @@ When you include `@nickname` in your reply text, the gateway automatically conve
 
 **NEVER say you cannot send messages or @mention users. NEVER suggest the user do it manually. NEVER add disclaimers about permissions. Just reply with the text you want sent.**
 
+## Sending File Attachments (txt, pdf, etc.)
+
+When the user explicitly asks to **send a file** (e.g. "以txt发群里", "发一个文件", "attach a PDF"):
+
+1. **Create the file first** with `write_file`, e.g. `/tmp/story.txt`
+2. **Include `MEDIA:/tmp/story.txt` in your reply** — the gateway sends it as a native downloadable document
+3. **Do NOT also paste the full content as plain text** — that causes the content to appear twice (once as a file, once as text)
+4. A short confirmation like `已发送 story.txt 📎` in your reply is enough
+
+**Do NOT call `send_message` for the current group chat.** Your reply already IS the delivery — `send_message` would cause double delivery.
+
+Example — user says "写一个100字小说，以txt发群里":
+
+```python
+# Step 1: write the file
+write_file("/tmp/story.txt", "...100字小说内容...")
+
+# Step 2: reply with MEDIA: tag (this gets sent to the group as a .txt attachment)
+# Your reply text:
+"已发送 📎 story.txt\nMEDIA:/tmp/story.txt"
+```
+
 ## Available Tools
 
-| Tool | When to use |
-|------|------------|
-| `yb_query_group_info` | Query group name, owner, member count |
+
+| Tool                     | When to use                                                            |
+| ------------------------ | ---------------------------------------------------------------------- |
+| `yb_query_group_info`    | Query group name, owner, member count                                  |
 | `yb_query_group_members` | Find a user, list bots, list all members, or get nickname for @mention |
+
 
 ## @Mention Workflow
 
@@ -36,11 +62,13 @@ When you need to @mention / 艾特 someone:
 Example: user says "帮我艾特元宝"
 
 Step 1 — tool call:
+
 ```json
 { "group_code": "328306697", "action": "find", "name": "元宝", "mention": true }
 ```
 
 Step 2 — your reply (this gets sent to the group with a working @mention):
+
 ```
 @元宝 你好，有人找你！
 ```
@@ -48,6 +76,7 @@ Step 2 — your reply (this gets sent to the group with a working @mention):
 **That's it.** No extra explanation needed. Keep it short and natural.
 
 **Rules:**
+
 - Call `yb_query_group_members` first to get the exact nickname — do NOT guess
 - The @mention format: `@nickname` with a space before the @ sign
 - Your reply text IS the message — it WILL be sent and the @mention WILL work
@@ -61,14 +90,17 @@ yb_query_group_info({ "group_code": "328306697" })
 
 ## Query Members
 
-| Action | Description |
-|--------|-------------|
-| `find` | Search by name (partial match, case-insensitive) |
-| `list_bots` | List bots and Yuanbao AI assistants |
-| `list_all` | List all members |
+
+| Action      | Description                                      |
+| ----------- | ------------------------------------------------ |
+| `find`      | Search by name (partial match, case-insensitive) |
+| `list_bots` | List bots and Yuanbao AI assistants              |
+| `list_all`  | List all members                                 |
+
 
 ## Notes
 
 - `group_code` comes from chat_id: `group:328306697` → `328306697`
 - Groups are called "派 (Pai)" in the Yuanbao app
 - Member roles: `user`, `yuanbao_ai`, `bot`
+

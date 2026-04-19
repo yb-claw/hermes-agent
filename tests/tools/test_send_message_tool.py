@@ -1234,3 +1234,128 @@ class TestSendMatrixUrlEncoding:
         put_url = mock_session.put.call_args[0][0]
         assert "%21HLOQwxYGgFPMPJUSNR%3Amatrix.org" in put_url
         assert "!HLOQwxYGgFPMPJUSNR:matrix.org" not in put_url
+
+
+class TestCurrentSessionDeliverySkip:
+    """_maybe_skip_current_session_delivery guards against double-delivery
+    when send_message targets the same chat the gateway is already replying to."""
+
+    def _make_yuanbao_config(self):
+        yb_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+        from gateway.config import Platform
+        config = SimpleNamespace(
+            platforms={Platform.YUANBAO: yb_cfg},
+            get_home_channel=lambda _p: None,
+        )
+        return config, yb_cfg
+
+    def test_skipped_when_targeting_current_yuanbao_session(self):
+        """send_message to the active Yuanbao group chat is silently skipped."""
+        config, _ = self._make_yuanbao_config()
+
+        session_env = {
+            "HERMES_SESSION_PLATFORM": "yuanbao",
+            "HERMES_SESSION_CHAT_ID": "group:608473182",
+            "HERMES_SESSION_THREAD_ID": "",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env", side_effect=lambda k, d="": session_env.get(k, d)):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "yuanbao:group:608473182",
+                    "message": "这是一篇短篇小说",
+                })
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "current_session_auto_delivery"
+        assert "twice" in result["note"] or "double" in result["note"] or "两次" in result["note"] or "final reply" in result["note"]
+        send_mock.assert_not_awaited()
+
+    def test_skipped_when_bare_platform_resolves_to_current_session(self):
+        """send_message(target='yuanbao') when session chat matches is skipped."""
+        config, _ = self._make_yuanbao_config()
+
+        session_env = {
+            "HERMES_SESSION_PLATFORM": "yuanbao",
+            "HERMES_SESSION_CHAT_ID": "group:608473182",
+            "HERMES_SESSION_THREAD_ID": "",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env", side_effect=lambda k, d="": session_env.get(k, d)):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "yuanbao",
+                    "message": "这是一篇短篇小说",
+                })
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "current_session_auto_delivery"
+        send_mock.assert_not_awaited()
+
+    def test_not_skipped_when_targeting_different_yuanbao_chat(self):
+        """send_message to a different Yuanbao chat is NOT skipped."""
+        config, _ = self._make_yuanbao_config()
+
+        session_env = {
+            "HERMES_SESSION_PLATFORM": "yuanbao",
+            "HERMES_SESSION_CHAT_ID": "group:608473182",
+            "HERMES_SESSION_THREAD_ID": "",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env", side_effect=lambda k, d="": session_env.get(k, d)):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "yuanbao:group:999999999",   # different chat
+                    "message": "发到别的群",
+                })
+            )
+
+        assert result["success"] is True
+        assert result.get("skipped") is not True
+        send_mock.assert_awaited_once()
+
+    def test_not_skipped_in_cli_context(self):
+        """In CLI context (no session platform), send_message is never skipped."""
+        config, _ = self._make_yuanbao_config()
+
+        # Simulate CLI: HERMES_SESSION_PLATFORM is empty
+        session_env = {
+            "HERMES_SESSION_PLATFORM": "",
+            "HERMES_SESSION_CHAT_ID": "",
+            "HERMES_SESSION_THREAD_ID": "",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env", side_effect=lambda k, d="": session_env.get(k, d)):
+            # Need a home channel since CLI won't have session chat_id
+            from gateway.config import Platform
+            config.get_home_channel = lambda _p: SimpleNamespace(chat_id="group:608473182")
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "yuanbao",
+                    "message": "来自 CLI 的发送",
+                })
+            )
+
+        assert result["success"] is True
+        assert result.get("skipped") is not True
+        send_mock.assert_awaited_once()

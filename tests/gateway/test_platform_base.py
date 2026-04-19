@@ -322,6 +322,72 @@ class TestExtractMedia:
         assert "After" in cleaned
 
 
+class TestCondenseTextForDocumentDelivery:
+    def _adapter(self, platform_name="yuanbao"):
+        class StubAdapter(BasePlatformAdapter):
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, *a, **kw):
+                pass
+
+            async def get_chat_info(self, *a):
+                return {}
+
+        from gateway.config import Platform, PlatformConfig
+
+        platform = getattr(Platform, platform_name.upper())
+        config = PlatformConfig(enabled=True, token="test")
+        return StubAdapter(config=config, platform=platform)
+
+    def test_yuanbao_document_delivery_keeps_short_confirmation(self):
+        adapter = self._adapter("yuanbao")
+        text = (
+            "已生成文件，直接发给你 👇\n\n"
+            "---\n\n"
+            "这里是很长很长的正文，不应该再作为文本发送到群里。"
+        )
+        result = adapter._condense_text_for_document_delivery(
+            text,
+            [("/tmp/story.txt", False)],
+            [],
+        )
+        assert result == "已生成文件，直接发给你 👇"
+
+    def test_yuanbao_document_delivery_falls_back_to_filename(self):
+        adapter = self._adapter("yuanbao")
+        text = "---"
+        result = adapter._condense_text_for_document_delivery(
+            text,
+            [("/tmp/story.txt", False)],
+            [],
+        )
+        assert result == "已发送附件 📎 story.txt"
+
+    def test_non_yuanbao_platform_is_unchanged(self):
+        adapter = self._adapter("telegram")
+        text = "已生成文件，直接发给你 👇\n\n---\n\n这里是正文"
+        result = adapter._condense_text_for_document_delivery(
+            text,
+            [("/tmp/story.txt", False)],
+            [],
+        )
+        assert result == text
+
+    def test_yuanbao_image_delivery_is_unchanged(self):
+        adapter = self._adapter("yuanbao")
+        text = "这是图片说明\n\n---\n\n这里是更多内容"
+        result = adapter._condense_text_for_document_delivery(
+            text,
+            [("/tmp/image.png", False)],
+            [],
+        )
+        assert result == text
+
+
 # ---------------------------------------------------------------------------
 # truncate_message
 # ---------------------------------------------------------------------------

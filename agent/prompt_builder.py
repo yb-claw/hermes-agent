@@ -394,7 +394,13 @@ PLATFORM_HINTS = {
         "(max 50 MB). You can also include image URLs in markdown format ![alt](url) and "
         "they will be downloaded and sent as native photos. "
         "Do NOT tell the user you lack file-sending capability — use MEDIA: syntax "
-        "whenever a file delivery is appropriate."
+        "whenever a file delivery is appropriate.\n"
+        "FILE DELIVERY WORKFLOW: When the user explicitly asks to send a file "
+        "(e.g. '以txt发群里', 'send as a file', 'attach a PDF'): "
+        "(1) Create the file first with write_file (e.g. /tmp/story.txt). "
+        "(2) Include MEDIA:/tmp/story.txt in your reply — the gateway delivers it as an attachment. "
+        "(3) Do NOT also paste the full content as plain text in the same reply — "
+        "that would send it twice. A brief confirmation like '已发送 story.txt 📎' is enough."
     ),
 }
 

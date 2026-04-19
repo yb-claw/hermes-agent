@@ -1368,6 +1368,52 @@ class BasePlatformAdapter(ABC):
 
         return paths, cleaned
 
+    def _condense_text_for_document_delivery(
+        self,
+        text_content: str,
+        media_files: List[Tuple[str, bool]],
+        local_files: List[str],
+    ) -> str:
+        """Prefer a brief confirmation when Yuanbao sends document attachments."""
+        if not text_content:
+            return text_content
+
+        if getattr(self.platform, "value", "").lower() != "yuanbao":
+            return text_content
+
+        audio_exts = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+        document_paths: List[str] = []
+        for media_path, _is_voice in media_files:
+            ext = Path(media_path).suffix.lower()
+            if ext not in audio_exts and ext not in video_exts and ext not in image_exts:
+                document_paths.append(media_path)
+        for file_path in local_files:
+            ext = Path(file_path).suffix.lower()
+            if ext not in video_exts and ext not in image_exts:
+                document_paths.append(file_path)
+
+        if not document_paths:
+            return text_content
+
+        condensed = text_content.strip()
+        for separator in ("\n\n---\n\n", "\n---\n", "\n\n***\n\n", "\n***\n"):
+            if separator in condensed:
+                condensed = condensed.split(separator, 1)[0].strip()
+                break
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", condensed) if p.strip()]
+        if len(condensed) > 160 or len(paragraphs) > 1:
+            condensed = paragraphs[0] if paragraphs else condensed
+
+        condensed = condensed.rstrip("-* \n").strip()
+        if condensed:
+            return condensed
+
+        return f"已发送附件 📎 {Path(document_paths[0]).name}"
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
         """
         Continuously send typing indicator until cancelled.
@@ -1728,6 +1774,11 @@ class BasePlatformAdapter(ABC):
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                text_content = self._condense_text_for_document_delivery(
+                    text_content,
+                    media_files,
+                    local_files,
+                )
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Skipped when the chat has voice mode disabled (/voice off)

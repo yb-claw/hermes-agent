@@ -117,7 +117,15 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send"
+                "description": (
+                    "The message text to send. "
+                    "To deliver a file attachment (e.g. a .txt, .pdf, or .md file), "
+                    "first create the file with write_file, then include "
+                    "MEDIA:/absolute/path/to/file in this field — the platform will "
+                    "send it as a native downloadable attachment. "
+                    "Do NOT paste the full file contents as plain text when the user "
+                    "explicitly asked for a file."
+                )
             }
         },
         "required": []
@@ -222,6 +230,16 @@ def _handle_send(args):
     from gateway.platforms.base import BasePlatformAdapter
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+
+    # Fallback: if no MEDIA: tag was found, scan for bare local file paths
+    # (e.g. /tmp/story.txt written without the MEDIA: prefix).  This makes
+    # the send_message path consistent with the gateway reply path which also
+    # calls extract_local_files after extract_media.
+    if not media_files:
+        local_doc_files, cleaned_message = BasePlatformAdapter.extract_local_files(cleaned_message)
+        if local_doc_files:
+            media_files = [(p, False) for p in local_doc_files]
+
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
@@ -253,6 +271,10 @@ def _handle_send(args):
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
+
+    session_skip = _maybe_skip_current_session_delivery(platform_name, chat_id, thread_id)
+    if session_skip:
+        return json.dumps(session_skip)
 
     try:
         from model_tools import _run_async
@@ -380,6 +402,62 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
             f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
             "its final response to that same target. Put the intended user-facing content in "
             "your final response instead, or use a different target if you want an additional message."
+        ),
+    }
+
+
+def _maybe_skip_current_session_delivery(platform_name: str, chat_id: str, thread_id: str | None):
+    """Skip send_message when the target is the active gateway session being replied to.
+
+    On platforms like Yuanbao (and others where the gateway auto-delivers the
+    agent's final response as a chat message), calling send_message to the *same*
+    chat that originated the request causes the content to appear twice:
+      1. Once from send_message → adapter.send() (tool path)
+      2. Once from the gateway's _process_message_background → adapter.send() (reply path)
+
+    When the resolved target exactly matches the current session context we skip
+    the tool-level send and instruct the model to put the content in its final
+    reply instead — which is the single authoritative delivery path.
+
+    Only active for gateway sessions (HERMES_SESSION_PLATFORM is set).  CLI and
+    cron runs are unaffected because they have no concurrent auto-delivery.
+    """
+    from gateway.session_context import get_session_env
+
+    sess_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if not sess_platform or sess_platform == "local":
+        return None
+
+    sess_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not sess_chat_id:
+        return None
+
+    if sess_platform != platform_name:
+        return None
+    if str(sess_chat_id) != str(chat_id):
+        return None
+
+    # Thread/topic check: only skip when thread also matches (or both are absent).
+    sess_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+    if thread_id is not None and sess_thread_id != thread_id:
+        return None
+
+    target_label = f"{platform_name}:{chat_id}"
+    if thread_id is not None:
+        target_label += f":{thread_id}"
+
+    return {
+        "success": True,
+        "skipped": True,
+        "reason": "current_session_auto_delivery",
+        "target": target_label,
+        "note": (
+            f"Skipped send_message to {target_label}. "
+            "The gateway already delivers your final reply to this chat automatically — "
+            "calling send_message to the same destination causes the content to appear twice. "
+            "Put the content in your final response instead. "
+            "Use an explicit different target (e.g. 'yuanbao:group:OTHER_ID') to send "
+            "to a different chat or platform."
         ),
     }
 
