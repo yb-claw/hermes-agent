@@ -29,12 +29,9 @@ pip install websockets httpx aiofiles
 
 ### 1. Create a Bot in Yuanbao
 
-1. Log in to the Yuanbao platform admin panel
-2. Navigate to Bot Management or Developer Settings
-3. Create a new bot application
-4. Note the **APP_ID** and **APP_SECRET** provided
-5. Record the **WebSocket URL** (e.g., `wss://api.yuanbao.example.com/ws`)
-6. Record the **API Domain** (e.g., `https://api.yuanbao.example.com`)
+1. Download the Yuanbao app from [https://yuanbao.tencent.com/](https://yuanbao.tencent.com/)
+2. In the app, go to **PAI → My Bot** and create a new bot
+3. After the bot is created, copy the **APP_ID** and **APP_SECRET**
 
 ### 2. Run the Setup Wizard
 
@@ -48,10 +45,11 @@ Select **Yuanbao** when prompted. The wizard will:
 
 1. Ask for your APP_ID
 2. Ask for your APP_SECRET
-3. Ask for the WebSocket URL
-4. Ask for the API Domain
-5. Verify the connection
-6. Save the configuration automatically
+3. Save the configuration automatically
+
+:::tip
+The WebSocket URL and API Domain have sensible defaults built in. You only need to provide APP_ID and APP_SECRET to get started.
+:::
 
 ### 3. Configure Environment Variables
 
@@ -64,14 +62,17 @@ YUANBAO_APP_SECRET=your-app-secret
 YUANBAO_WS_URL=wss://api.yuanbao.example.com/ws
 YUANBAO_API_DOMAIN=https://api.yuanbao.example.com
 
-# Optional: bot account ID (normally obtained from sign-token)
+# Optional: bot account ID (normally obtained automatically from sign-token)
 # YUANBAO_BOT_ID=your-bot-id
 
-# Optional: home channel for cron/notifications
-YUANBAO_HOME_CHANNEL=@bot_account_id
+# Optional: internal routing environment (e.g. test/staging/production)
+# YUANBAO_ROUTE_ENV=production
+
+# Optional: home channel for cron/notifications (format: direct:<account> or group:<group_code>)
+YUANBAO_HOME_CHANNEL=direct:bot_account_id
 YUANBAO_HOME_CHANNEL_NAME="Bot Notifications"
 
-# Optional: restrict access
+# Optional: restrict access (legacy, see Access Control below for fine-grained policies)
 YUANBAO_ALLOWED_USERS=user_account_1,user_account_2
 ```
 
@@ -96,18 +97,20 @@ The adapter will connect to the Yuanbao WebSocket gateway, authenticate using HM
 - **Typing indicators** — shows "typing…" status while the agent processes
 - **Automatic reconnection** — handles WebSocket disconnections with exponential backoff
 - **Group information queries** — retrieve group details and member lists
-- **Reply heartbeat** — tracks response states during long operations
+- **Sticker/Emoji support** — send TIMFaceElem stickers and emoji in conversations
+- **Auto-sethome** — first user to message the bot is automatically set as the home channel owner
+- **Slow-response notification** — sends a waiting message when the agent takes longer than expected
 
 ## Configuration Options
 
 ### Chat ID Formats
 
-Yuanbao uses different account identifiers depending on conversation type:
+Yuanbao uses prefixed identifiers depending on conversation type:
 
 | Chat Type | Format | Example |
 |-----------|--------|---------|
-| Direct message (C2C) | User account | `@user_account` or numeric ID |
-| Group message | Group code | `@group_code` or group ID |
+| Direct message (C2C) | `direct:<account>` | `direct:user123` |
+| Group message | `group:<group_code>` | `group:grp456` |
 
 ### Media Uploads
 
@@ -123,10 +126,16 @@ Media URLs are automatically validated and downloaded before upload to prevent S
 
 Use the `/sethome` command in any Yuanbao chat (DM or group) to designate it as the **home channel**. Scheduled tasks (cron jobs) deliver their results to this channel.
 
+:::tip Auto-sethome
+If no home channel is configured, the first user to message the bot will be automatically set as the home channel owner. If the current home channel is a group chat, the first DM will upgrade it to a direct channel.
+:::
+
 You can also set it manually in `~/.hermes/.env`:
 
 ```bash
-YUANBAO_HOME_CHANNEL=@user_account_or_group_code
+YUANBAO_HOME_CHANNEL=direct:user_account_id
+# or for a group:
+# YUANBAO_HOME_CHANNEL=group:group_code
 YUANBAO_HOME_CHANNEL_NAME="My Bot Updates"
 ```
 
@@ -173,13 +182,13 @@ All standard Hermes commands work on Yuanbao:
 
 ### Sending Files
 
-To send a file to the bot, mention it:
+To send a file to the bot, simply attach it directly in the Yuanbao chat. The bot will automatically download and process the file attachment.
+
+You can also include a message with the attachment:
 
 ```
-Analyze this document @file.pdf
+Please analyze this document
 ```
-
-The bot downloads and processes the file.
 
 ### Receiving Files
 
@@ -237,25 +246,55 @@ When you ask the bot to create or export a file, it sends the file directly to y
 3. Ensure stable network connection to Yuanbao API
 4. Consider enabling verbose logging: `HERMES_LOG_LEVEL=debug`
 
+## Access Control
+
+Yuanbao supports fine-grained access control for both DM and group conversations:
+
+```bash
+# DM policy: open (default) | allowlist | disabled
+YUANBAO_DM_POLICY=open
+# Comma-separated user IDs allowed to DM the bot (only used when DM_POLICY=allowlist)
+YUANBAO_DM_ALLOW_FROM=user_id_1,user_id_2
+
+# Group policy: open (default) | allowlist | disabled
+YUANBAO_GROUP_POLICY=open
+# Comma-separated group codes allowed (only used when GROUP_POLICY=allowlist)
+YUANBAO_GROUP_ALLOW_FROM=group_code_1,group_code_2
+```
+
+These can also be set in `config.yaml`:
+
+```yaml
+platforms:
+  yuanbao:
+    yuanbao_dm_policy: allowlist
+    yuanbao_dm_allow_from: "user1,user2"
+    yuanbao_group_policy: open
+    yuanbao_group_allow_from: ""
+```
+
 ## Advanced Configuration
 
-### Custom Message Chunking
+### Message Chunking
 
-Yuanbao has a maximum message size. Hermes automatically chunks large responses, but you can customize behavior:
+Yuanbao has a maximum message size. Hermes automatically chunks large responses with Markdown-aware splitting (respects code fences, tables, and paragraph boundaries).
 
-```bash
-# In ~/.hermes/config.yaml under platforms.yuanbao:
-message_chunk_size: 4096  # Adjust text chunk size (bytes)
-```
+### Connection Parameters
 
-### Connection Timeout Settings
+The following connection parameters are built into the adapter with sensible defaults:
 
-```bash
-# In ~/.hermes/.env:
-YUANBAO_CONNECT_TIMEOUT=30      # WebSocket connect timeout (seconds)
-YUANBAO_HEARTBEAT_INTERVAL=60   # Heartbeat frequency (seconds)
-YUANBAO_RECONNECT_MAX_WAIT=300  # Max backoff time (seconds)
-```
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| WebSocket connect timeout | 15 seconds | Time to wait for WS handshake |
+| Heartbeat interval | 30 seconds | Ping frequency to keep connection alive |
+| Max reconnect attempts | 100 | Maximum number of reconnection tries |
+| Reconnect backoff | 1s → 60s (exponential) | Wait time between reconnect attempts |
+| Reply heartbeat interval | 2 seconds | RUNNING status send frequency |
+| Send timeout | 30 seconds | Timeout for outbound WS messages |
+
+:::note
+These values are currently not configurable via environment variables. They are optimized for typical Yuanbao deployments.
+:::
 
 ### Verbose Logging
 
@@ -290,7 +329,7 @@ Run long operations without blocking the conversation:
 Send a message from CLI to Yuanbao:
 
 ```bash
-hermes send-message yuanbao "@group_code" "Hello from CLI"
+hermes chat -q "Send 'Hello from CLI' to yuanbao:group:group_code"
 ```
 
 ## Related Documentation

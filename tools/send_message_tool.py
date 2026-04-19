@@ -1487,9 +1487,6 @@ async def _send_qqbot(pconfig, chat_id, message):
 async def _send_yuanbao(chat_id, message, media_files=None):
     """Send via Yuanbao using the running gateway adapter's WebSocket connection.
 
-    Follows the same pattern as _send_weixin: thin wrapper that delegates
-    to a platform-side helper for text + media delivery.
-
     Yuanbao uses a persistent WebSocket — unlike HTTP-based platforms, we
     cannot create a throwaway client.  We obtain the running singleton from
     the adapter module itself (``get_active_adapter``).
