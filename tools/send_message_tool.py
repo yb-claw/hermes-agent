@@ -226,29 +226,16 @@ def _handle_send(args):
 
     used_home_channel = False
     if not chat_id:
-        # Prefer the current session's chat when the model targets the same
-        # platform it's running on (e.g. send_message(target="yuanbao") from a
-        # yuanbao group chat).  This prevents accidental delivery to the home
-        # channel when the model omits the chat_id.
-        from gateway.session_context import get_session_env
-        _sess_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        _sess_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if _sess_platform == platform_name and _sess_chat_id:
-            chat_id = _sess_chat_id
-            _sess_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
-            if _sess_thread_id and not thread_id:
-                thread_id = _sess_thread_id
+        home = config.get_home_channel(platform)
+        if home:
+            chat_id = home.chat_id
+            used_home_channel = True
         else:
-            home = config.get_home_channel(platform)
-            if home:
-                chat_id = home.chat_id
-                used_home_channel = True
-            else:
-                return json.dumps({
-                    "error": f"No home channel set for {platform_name} to determine where to send the message. "
-                    f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                    f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
-                })
+            return json.dumps({
+                "error": f"No home channel set for {platform_name} to determine where to send the message. "
+                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
+                f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
+            })
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
