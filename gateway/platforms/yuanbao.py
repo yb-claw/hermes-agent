@@ -1386,6 +1386,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     fut.set_result(True)
             return
 
+        # Fire-and-forget heartbeat ACKs — server always responds but callers don't
+        # wait on these; silently discard to avoid "Unmatched Response" noise.
+        if cmd_type == CMD_TYPE["Response"] and cmd in (
+            "send_group_heartbeat",
+            "send_private_heartbeat",
+        ):
+            logger.debug("[%s] Heartbeat ACK received: cmd=%s msg_id=%s", self.name, cmd, msg_id)
+            return
+
         # Response to an outbound RPC call (e.g. send-message, query_group_info)
         if cmd_type == CMD_TYPE["Response"]:
             if msg_id and msg_id in self._pending_acks:
