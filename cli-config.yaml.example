@@ -564,7 +564,7 @@ platform_toolsets:
   slack: [hermes-slack]
   signal: [hermes-signal]
   homeassistant: [hermes-homeassistant]
-  yuanbao: [hermes-telegram]  # Yuanbao uses the same toolset as other messaging platforms
+  yuanbao: [hermes-yuanbao]  # Bundles yb_* preset tools (group info, member queries, stickers)
 
 # =============================================================================
 # Gateway Platform Settings

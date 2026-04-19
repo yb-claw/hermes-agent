@@ -597,14 +597,30 @@ def _get_platform_tools(
 
     # Preserve any explicit non-configurable toolset entries (for example,
     # custom toolsets or MCP server names saved in platform_toolsets).
-    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    #
+    # Note: the current platform's OWN default_toolset (e.g. "hermes-yuanbao"
+    # for platform=yuanbao) must be passed through as well. Some platform
+    # presets bundle preset-only tools (like Yuanbao's yb_query_group_info
+    # and the sticker helpers yb_search_sticker / yb_send_sticker) that are
+    # not part of any configurable toolset. If we strip the preset keys they
+    # never make it into the agent's runtime tool list. We only strip OTHER
+    # platforms' default_toolsets, since those are almost certainly stale
+    # entries a user didn't mean to apply on this platform.
+    own_default = PLATFORMS.get(platform, {}).get("default_toolset")
+    foreign_defaults = {
+        p["default_toolset"]
+        for key, p in PLATFORMS.items()
+        if key != platform
+    }
     explicit_passthrough = {
         ts
         for ts in toolset_names
         if ts not in configurable_keys
         and ts not in plugin_ts_keys
-        and ts not in platform_default_keys
+        and ts not in foreign_defaults
     }
+    if own_default and own_default in toolset_names:
+        explicit_passthrough.add(own_default)
 
     # MCP servers are expected to be available on all platforms by default.
     # If the platform explicitly lists one or more MCP server names, treat that
