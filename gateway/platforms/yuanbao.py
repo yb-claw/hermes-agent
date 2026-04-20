@@ -1165,10 +1165,11 @@ class DecodeMiddleware(InboundMiddleware):
                     ctx.adapter.name, via, len(data),
                 )
             else:
-                # Subsequent pushes: merge msg_body into the base
+                # Subsequent pushes: merge msg_body into the base with a
                 extra_body = push.get("msg_body", [])
                 if extra_body:
-                    merged_push["msg_body"] = merged_push.get("msg_body", []) + extra_body
+                    _sep = {"msg_type": "TIMTextElem", "msg_content": {"text": "\n"}}
+                    merged_push["msg_body"] = merged_push.get("msg_body", []) + [_sep] + extra_body
                     logger.info(
                         "[%s] Merged %d extra msg_body elements from aggregated push",
                         ctx.adapter.name, len(extra_body),
@@ -2455,6 +2456,12 @@ class DispatchMiddleware(InboundMiddleware):
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
 
+        _sk = build_session_key(
+            ctx.source,
+            group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+        )
+
         async def _dispatch_inbound_event() -> None:
             media_urls = list(ctx.media_urls)
             media_types = list(ctx.media_types)
@@ -2517,11 +2524,6 @@ class DispatchMiddleware(InboundMiddleware):
                 reply_to_text=ctx.reply_to_text,
                 channel_prompt=ctx.channel_prompt,
             )
-            _sk = build_session_key(
-                ctx.source,
-                group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
-            )
             if _sk and ctx.msg_id:
                 adapter._processing_msg_ids[_sk] = ctx.msg_id
                 adapter._processing_msg_texts[_sk] = ctx.raw_text or ""
@@ -2529,19 +2531,60 @@ class DispatchMiddleware(InboundMiddleware):
                 cache = adapter._msg_content_cache
                 cache[ctx.msg_id] = ctx.raw_text
                 if len(cache) > 200:
-                    # Evict oldest entries
                     for k in list(cache)[:len(cache) - 200]:
                         del cache[k]
             await adapter.handle_message(event)
 
-        task = asyncio.create_task(
-            _dispatch_inbound_event(),
-            name=f"yuanbao-inbound-{ctx.msg_id or 'unknown'}",
-        )
-        adapter._inbound_tasks.add(task)
-        task.add_done_callback(adapter._inbound_tasks.discard)
+        if ctx.chat_type == "group":
+            is_new = _sk not in adapter._group_queues
+            queue = adapter._group_queues.setdefault(_sk, asyncio.Queue())
+            queue.put_nowait(_dispatch_inbound_event)
+            logger.info(
+                "[%s] Group message enqueued (qsize=%d) for %s",
+                adapter.name, queue.qsize(), (_sk or "")[:50],
+            )
+            if is_new:
+                consumer = asyncio.create_task(
+                    self._consume_group_queue(adapter, _sk),
+                    name=f"yuanbao-group-consumer-{(_sk or '')[:30]}",
+                )
+                adapter._inbound_tasks.add(consumer)
+                consumer.add_done_callback(adapter._inbound_tasks.discard)
+        else:
+            task = asyncio.create_task(
+                _dispatch_inbound_event(),
+                name=f"yuanbao-inbound-{ctx.msg_id or 'unknown'}",
+            )
+            adapter._inbound_tasks.add(task)
+            task.add_done_callback(adapter._inbound_tasks.discard)
 
         await next_fn()
+
+    @staticmethod
+    async def _consume_group_queue(adapter: "YuanbaoAdapter", session_key: str) -> None:
+        """Drain the group queue one dispatch at a time, waiting for each to finish."""
+        _IDLE_TIMEOUT = 2.0
+        queue = adapter._group_queues.get(session_key)
+        if not queue:
+            return
+        try:
+            while True:
+                try:
+                    dispatch_fn = await asyncio.wait_for(queue.get(), timeout=_IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    break
+                logger.debug(
+                    "[%s] Group queue: dispatching for %s (remaining=%d)",
+                    adapter.name, (session_key or "")[:50], queue.qsize(),
+                )
+                try:
+                    await dispatch_fn()
+                    while session_key in adapter._active_sessions:
+                        await asyncio.sleep(0.1)
+                except Exception:
+                    logger.exception("[%s] Group queue consumer error", adapter.name)
+        finally:
+            adapter._group_queues.pop(session_key, None)
 
 
 class InboundPipelineBuilder:
@@ -4392,6 +4435,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Inbound message deduplication (WS reconnect / network jitter)
         self._dedup = MessageDeduplicator(ttl_seconds=300)
 
+        # Group chat sequential dispatch queue (session_key → asyncio.Queue).
+        self._group_queues: Dict[str, asyncio.Queue] = {}
+
         # Recall support: track which msg_id is being processed per session_key
         # so RecallGuardMiddleware can detect "currently processing" messages.
         self._processing_msg_ids: Dict[str, str] = {}
@@ -4491,6 +4537,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not task.done():
                 task.cancel()
         self._inbound_tasks.clear()
+
+        self._group_queues.clear()
 
         logger.info("[%s] Disconnected", self.name)
 

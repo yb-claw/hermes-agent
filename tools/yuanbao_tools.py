@@ -279,6 +279,7 @@ async def send_sticker(
                 "name": sticker_obj.get("name", ""),
             },
             "message_id": getattr(result, "message_id", None),
+            "note": "Sticker delivered to the chat. If you have additional text to say, reply now; otherwise end your turn without generating text.",
         }
     return {
         "success": False,
