@@ -155,17 +155,17 @@ class PlatformConfig:
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
     
-    # Yuanbao (元宝 IM Bot) platform-specific settings
-    yuanbao_app_id: Optional[str] = None          # App ID, used for sign-token API auth
-    yuanbao_app_secret: Optional[str] = None      # App Secret，用于 HMAC 签名
-    yuanbao_bot_id: Optional[str] = None          # Bot 账号 ID（可选，sign-token 接口会返回）
+    # Yuanbao IM Bot platform-specific settings
+    yuanbao_app_id: Optional[str] = None           # App ID, used for sign-token API auth
+    yuanbao_app_secret: Optional[str] = None       # App Secret, used for HMAC signing
+    yuanbao_bot_id: Optional[str] = None           # Bot account ID (optional, returned by sign-token API)
     yuanbao_ws_url: Optional[str] = None           # WebSocket URL (e.g. wss://...)
     yuanbao_api_domain: Optional[str] = None       # API domain (e.g. https://bot.yuanbao.tencent.com)
-    yuanbao_route_env: Optional[str] = None       # 内部路由环境标识（如测试/预发/生产）
-    yuanbao_dm_policy: Optional[str] = None       # DM 策略: open | allowlist | disabled
-    yuanbao_dm_allow_from: Optional[str] = None    # DM 白名单（逗号分隔 user_id）
-    yuanbao_group_policy: Optional[str] = None     # 群聊策略: open | allowlist | disabled
-    yuanbao_group_allow_from: Optional[str] = None # 群聊白名单（逗号分隔 group_code）
+    yuanbao_route_env: Optional[str] = None        # Internal routing env (e.g. test/staging/production)
+    yuanbao_dm_policy: Optional[str] = None        # DM policy: open | allowlist | disabled
+    yuanbao_dm_allow_from: Optional[str] = None    # DM allowlist (comma-separated user_id)
+    yuanbao_group_policy: Optional[str] = None     # Group chat policy: open | allowlist | disabled
+    yuanbao_group_allow_from: Optional[str] = None # Group allowlist (comma-separated group_code)
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -1175,6 +1175,23 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
             )
+    
+    # WeCom callback mode (self-built apps)
+    wecom_callback_corp_id = os.getenv("WECOM_CALLBACK_CORP_ID")
+    wecom_callback_corp_secret = os.getenv("WECOM_CALLBACK_CORP_SECRET")
+    if wecom_callback_corp_id and wecom_callback_corp_secret:
+        if Platform.WECOM_CALLBACK not in config.platforms:
+            config.platforms[Platform.WECOM_CALLBACK] = PlatformConfig()
+        config.platforms[Platform.WECOM_CALLBACK].enabled = True
+        config.platforms[Platform.WECOM_CALLBACK].extra.update({
+            "corp_id": wecom_callback_corp_id,
+            "corp_secret": wecom_callback_corp_secret,
+            "agent_id": os.getenv("WECOM_CALLBACK_AGENT_ID", ""),
+            "token": os.getenv("WECOM_CALLBACK_TOKEN", ""),
+            "encoding_aes_key": os.getenv("WECOM_CALLBACK_ENCODING_AES_KEY", ""),
+            "host": os.getenv("WECOM_CALLBACK_HOST", "0.0.0.0"),
+            "port": int(os.getenv("WECOM_CALLBACK_PORT", "8645")),
+        })
 
     # Weixin (personal WeChat via iLink Bot API)
     weixin_token = os.getenv("WEIXIN_TOKEN")
@@ -1239,23 +1256,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=bluebubbles_home,
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
         )
-
-    # WeCom callback mode (self-built apps)
-    wecom_callback_corp_id = os.getenv("WECOM_CALLBACK_CORP_ID")
-    wecom_callback_corp_secret = os.getenv("WECOM_CALLBACK_CORP_SECRET")
-    if wecom_callback_corp_id and wecom_callback_corp_secret:
-        if Platform.WECOM_CALLBACK not in config.platforms:
-            config.platforms[Platform.WECOM_CALLBACK] = PlatformConfig()
-        config.platforms[Platform.WECOM_CALLBACK].enabled = True
-        config.platforms[Platform.WECOM_CALLBACK].extra.update({
-            "corp_id": wecom_callback_corp_id,
-            "corp_secret": wecom_callback_corp_secret,
-            "agent_id": os.getenv("WECOM_CALLBACK_AGENT_ID", ""),
-            "token": os.getenv("WECOM_CALLBACK_TOKEN", ""),
-            "encoding_aes_key": os.getenv("WECOM_CALLBACK_ENCODING_AES_KEY", ""),
-            "host": os.getenv("WECOM_CALLBACK_HOST", "0.0.0.0"),
-            "port": int(os.getenv("WECOM_CALLBACK_PORT", "8645")),
-        })
 
     # QQ (Official Bot API v2)
     qq_app_id = os.getenv("QQ_APP_ID")
