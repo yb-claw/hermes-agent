@@ -753,7 +753,6 @@ class TestCardLifecycle:
     @pytest.fixture
     def adapter_with_card(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
-
         a = DingTalkAdapter(PlatformConfig(
             enabled=True,
             extra={"card_template_id": "tmpl-1"},

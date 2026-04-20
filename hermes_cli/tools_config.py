@@ -110,6 +110,7 @@ PLATFORMS = {
     for k, info in _PLATFORMS_REGISTRY.items()
 }
 
+
 # ─── Tool Categories (provider-aware configuration) ──────────────────────────
 # Maps toolset keys to their provider options. When a toolset is newly enabled,
 # we use this to show provider selection and prompt for the right API keys.
