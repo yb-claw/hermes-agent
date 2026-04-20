@@ -589,6 +589,20 @@ def _encode_log_ext(trace_id: str) -> bytes:
     return _encode_field(1, WT_LEN, _encode_string(trace_id))
 
 
+def _decode_im_msg_seq(data: bytes) -> dict:
+    """Decode a single ImMsgSeq sub-message (field 17 of InboundMessagePush).
+
+    ImMsgSeq proto fields:
+      1: msg_seq (uint64)
+      2: msg_id  (string)
+    """
+    fdict = _fields_to_dict(_parse_fields(data))
+    return {
+        "msg_seq": _get_varint(fdict, 1),
+        "msg_id": _get_string(fdict, 2),
+    }
+
+
 def _decode_log_ext(data: bytes) -> dict:
     fdict = _fields_to_dict(_parse_fields(data))
     return {"trace_id": _get_string(fdict, 1)}
@@ -648,6 +662,7 @@ def decode_inbound_push(data: bytes) -> Optional[dict]:
           "claw_msg_type": int,
           "private_from_group_code": str,
           "trace_id":      str,
+          "recall_msg_seq_list": [{"msg_seq": int, "msg_id": str}, ...] 或 None,
         }
         或 None（解析失败）
     """
@@ -661,6 +676,9 @@ def decode_inbound_push(data: bytes) -> Optional[dict]:
 
         log_ext_bytes = _get_bytes(fdict, 20)
         trace_id = _decode_log_ext(log_ext_bytes).get("trace_id", "") if log_ext_bytes else ""
+
+        recall_seq_raw = _get_repeated_bytes(fdict, 17)
+        recall_msg_seq_list = [_decode_im_msg_seq(b) for b in recall_seq_raw] or None
 
         result: dict = {
             "callback_command": _get_string(fdict, 1),
@@ -679,6 +697,7 @@ def decode_inbound_push(data: bytes) -> Optional[dict]:
             "cloud_custom_data": _get_string(fdict, 14),
             "event_time": _get_varint(fdict, 15),
             "bot_owner_id": _get_string(fdict, 16),
+            "recall_msg_seq_list": recall_msg_seq_list,
             "claw_msg_type": _get_varint(fdict, 18),
             "private_from_group_code": _get_string(fdict, 19),
             "trace_id": trace_id,

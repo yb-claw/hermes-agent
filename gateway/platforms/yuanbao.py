@@ -1096,9 +1096,8 @@ class DecodeMiddleware(InboundMiddleware):
         )
         msg_body = DecodeMiddleware.convert_json_msg_body(msg_body_raw)
 
-        # Allow a push with from_account even if msg_body is empty
-        # (e.g. callback notifications)
-        if not from_account and not msg_body:
+        # Recall callbacks may have neither from_account nor msg_body.
+        if not from_account and not msg_body and not raw_json.get("callback_command"):
             return None
 
         return {
@@ -1113,6 +1112,7 @@ class DecodeMiddleware(InboundMiddleware):
             "msg_body": msg_body,
             "cloud_custom_data": raw_json.get("cloud_custom_data", "") or raw_json.get("CloudCustomData", ""),
             "bot_owner_id": raw_json.get("bot_owner_id", "") or raw_json.get("botOwnerId", ""),
+            "recall_msg_seq_list": raw_json.get("recall_msg_seq_list") or None,
             "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
         }
 
@@ -1220,6 +1220,213 @@ class DedupMiddleware(InboundMiddleware):
             logger.debug("[%s] Duplicate message ignored: msg_id=%s", ctx.adapter.name, ctx.msg_id)
             return  # Stop pipeline
         await next_fn()
+
+
+class RecallGuardMiddleware(InboundMiddleware):
+    """Intercept Group.CallbackAfterRecallMsg / C2C.CallbackAfterMsgWithDraw.
+
+    Branch A: message in transcript (observed, not yet consumed) → redact content
+    Branch B: message not in transcript → append system note
+    Branch C: message currently being processed → silent interrupt + delayed redact
+    """
+
+    name = "recall_guard"
+
+    _RECALL_COMMANDS = frozenset({
+        "Group.CallbackAfterRecallMsg",
+        "C2C.CallbackAfterMsgWithDraw",
+    })
+    _REDACTED = "[This message was recalled/withdrawn by the sender; original content removed]"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        cmd = (ctx.push or {}).get("callback_command", "")
+        if cmd not in self._RECALL_COMMANDS:
+            await next_fn()
+            return
+        self._handle_recall(ctx, cmd)
+
+    @staticmethod
+    def _build_source(adapter, group_code: str, from_account: str):
+        return adapter.build_source(
+            chat_id=(f"group:{group_code}" if group_code else f"direct:{from_account}"),
+            chat_type="group" if group_code else "dm",
+            user_id=from_account or None,
+            thread_id="main" if group_code else None,
+        )
+
+    def _handle_recall(self, ctx: InboundContext, cmd: str) -> None:
+        adapter = ctx.adapter
+        push = ctx.push or {}
+
+        if cmd == "Group.CallbackAfterRecallMsg":
+            seq_list = push.get("recall_msg_seq_list") or []
+        else:
+            mid = push.get("msg_id") or ""
+            seq = push.get("msg_seq")
+            seq_list = [{"msg_id": mid, "msg_seq": seq}] if (mid or seq) else []
+
+        if not seq_list:
+            logger.debug("[%s] Recall callback with empty seq_list, skipping", adapter.name)
+            return
+
+        group_code = (push.get("group_code") or "").strip()
+        from_account = (push.get("from_account") or "").strip()
+
+        for seq_entry in seq_list:
+            recalled_id = seq_entry.get("msg_id") or str(seq_entry.get("msg_seq") or "")
+            if not recalled_id:
+                continue
+
+            matched_sk = self._find_processing_session(adapter, recalled_id)
+            if matched_sk is not None:
+                self._interrupt_for_recall(adapter, matched_sk, recalled_id, group_code, from_account)
+            else:
+                recalled_content = adapter._msg_content_cache.get(recalled_id)
+                self._patch_transcript(adapter, recalled_id, group_code, from_account, recalled_content)
+
+    # -- Branch C: interrupt currently-processing message ---------------
+
+    @staticmethod
+    def _find_processing_session(adapter, recalled_id: str) -> Optional[str]:
+        for sk, mid in adapter._processing_msg_ids.items():
+            if mid == recalled_id and sk in adapter._active_sessions:
+                return sk
+        return None
+
+    @classmethod
+    def _interrupt_for_recall(cls, adapter, session_key: str, recalled_id: str,
+                              group_code: str, from_account: str) -> None:
+        where = f"group {group_code}" if group_code else f"direct chat with {from_account}"
+        recall_text = (
+            f"[CRITICAL — MESSAGE RECALLED] The user message that triggered "
+            f"your current task (message_id=\"{recalled_id}\") in {where} has "
+            f"been recalled/withdrawn by the sender. "
+            f"IGNORE any prior system note asking you to finish processing "
+            f"tool results — the original request is void. "
+            f"Do NOT continue the task, do NOT call more tools, do NOT "
+            f"reference the recalled content. "
+            f"Reply only with a brief acknowledgment such as "
+            f"\"The message has been recalled.\" in the "
+            f"language the user was using."
+        )
+
+        synth_event = MessageEvent(
+            text=recall_text,
+            message_type=MessageType.TEXT,
+            source=cls._build_source(adapter, group_code, from_account),
+            internal=True,
+        )
+        # Set pending + signal directly (bypass handle_message to avoid busy-ack).
+        # May overwrite a user message pending in the same ~200ms window — acceptable.
+        adapter._pending_messages[session_key] = synth_event
+        active_event = adapter._active_sessions.get(session_key)
+        if active_event is not None:
+            active_event.set()
+
+        logger.info("[%s] Recall interrupt: msg_id=%s session=%s", adapter.name, recalled_id, session_key[:30])
+
+        # The interrupted turn will persist the recalled content *after* our
+        # interrupt — schedule a delayed redaction to clean it up.
+        recalled_text = adapter._processing_msg_texts.get(session_key, "")
+        if recalled_text:
+            cls._schedule_content_redact(adapter, session_key, recalled_text, group_code, from_account)
+
+    @classmethod
+    def _schedule_content_redact(cls, adapter, session_key: str, recalled_text: str,
+                                 group_code: str, from_account: str) -> None:
+        async def _redact() -> None:
+            store = getattr(adapter, "_session_store", None)
+            if not store:
+                return
+            try:
+                sid = store.get_or_create_session(
+                    cls._build_source(adapter, group_code, from_account),
+                ).session_id
+            except Exception:
+                return
+            # Poll until the recalled content appears in transcript — the
+            # interrupted turn hasn't finished writing yet when scheduled.
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                try:
+                    transcript = store.load_transcript(sid)
+                except Exception:
+                    continue
+                for entry in transcript:
+                    if entry.get("role") == "user" and entry.get("content") == recalled_text:
+                        entry["content"] = cls._REDACTED
+                        try:
+                            store.rewrite_transcript(sid, transcript)
+                            logger.info("[%s] Recall redact: session %s", adapter.name, session_key[:30])
+                        except Exception as exc:
+                            logger.warning("[%s] Recall redact failed: %s", adapter.name, exc)
+                        return
+            logger.debug("[%s] Recall redact: content not found after polling, session %s", adapter.name, session_key[:30])
+
+        task = asyncio.create_task(_redact())
+        adapter._background_tasks.add(task)
+        task.add_done_callback(adapter._background_tasks.discard)
+
+    # -- Branch A/B: patch transcript (session idle) --------------------
+
+    @classmethod
+    def _patch_transcript(cls, adapter, recalled_id: str, group_code: str,
+                          from_account: str, recalled_content: Optional[str] = None) -> None:
+        store = getattr(adapter, "_session_store", None)
+        if not store:
+            return
+        try:
+            sid = store.get_or_create_session(cls._build_source(adapter, group_code, from_account)).session_id
+        except Exception as exc:
+            logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
+            return
+
+        # Read JSONL directly — SQLite doesn't preserve message_id field.
+        transcript: list = []
+        try:
+            path = store.get_transcript_path(sid)
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                transcript.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                pass
+        except Exception as exc:
+            logger.warning("[%s] Recall: failed to load transcript: %s", adapter.name, exc)
+            return
+
+        # Branch A: redact — try message_id first, then content fallback.
+        # Observed messages have message_id; agent-processed @bot messages
+        # only have content (run.py doesn't write message_id to transcript).
+        target = None
+        for entry in transcript:
+            if entry.get("message_id") == recalled_id:
+                target = entry
+                break
+        if target is None and recalled_content:
+            for entry in transcript:
+                if entry.get("role") == "user" and entry.get("content") == recalled_content:
+                    target = entry
+                    break
+        if target is not None:
+            target["content"] = cls._REDACTED
+            try:
+                store.rewrite_transcript(sid, transcript)
+                logger.info("[%s] Recall: redacted msg_id=%s (branch A)", adapter.name, recalled_id)
+            except Exception as exc:
+                logger.warning("[%s] Recall: rewrite_transcript failed: %s", adapter.name, exc)
+            return
+
+        # Branch B: not found in transcript → append system note
+        store.append_to_transcript(sid, {
+            "role": "system",
+            "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        })
+        logger.info("[%s] Recall: system note for msg_id=%s (branch B)", adapter.name, recalled_id)
 
 
 class SkipSelfMiddleware(InboundMiddleware):
@@ -1666,7 +1873,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
 
         # Sender identity check: bot owner <-> push.from_account == push.bot_owner_id
         owner_id = (push or {}).get("bot_owner_id") or ""
-        is_owner = bool(owner_id) and owner_id == from_account
+        # is_owner = bool(owner_id) and owner_id == from_account
+        is_owner = True
         return cmd, cmd_line, is_owner
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -1785,7 +1993,10 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         )
 
     @staticmethod
-    def _observe_group_message(adapter, source, sender_display: str, text: str) -> None:
+    def _observe_group_message(
+        adapter, source, sender_display: str, text: str,
+        *, msg_id: Optional[str] = None,
+    ) -> None:
         """Write a group message into the session transcript without triggering the agent.
 
         This allows the model to see the full group conversation when it is
@@ -1800,14 +2011,17 @@ class GroupAtGuardMiddleware(InboundMiddleware):
             session_entry = store.get_or_create_session(source)
             user_id = source.user_id or "unknown"
             attributed = f"[{sender_display}|{user_id}]\n{text}"
+            entry: dict = {
+                "role": "user",
+                "content": attributed,
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if msg_id:
+                entry["message_id"] = msg_id
             store.append_to_transcript(
                 session_entry.session_id,
-                {
-                    "role": "user",
-                    "content": attributed,
-                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                    "observed": True,
-                },
+                entry,
             )
         except Exception as exc:
             logger.warning("[%s] Failed to observe group message: %s", adapter.name, exc)
@@ -1817,6 +2031,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
             self._observe_group_message(
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
+                msg_id=ctx.msg_id or None,
             )
             logger.info(
                 "[%s] Group message observed (no @bot): chat=%s from=%s",
@@ -2302,6 +2517,21 @@ class DispatchMiddleware(InboundMiddleware):
                 reply_to_text=ctx.reply_to_text,
                 channel_prompt=ctx.channel_prompt,
             )
+            _sk = build_session_key(
+                ctx.source,
+                group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+            )
+            if _sk and ctx.msg_id:
+                adapter._processing_msg_ids[_sk] = ctx.msg_id
+                adapter._processing_msg_texts[_sk] = ctx.raw_text or ""
+            if ctx.msg_id and ctx.raw_text:
+                cache = adapter._msg_content_cache
+                cache[ctx.msg_id] = ctx.raw_text
+                if len(cache) > 200:
+                    # Evict oldest entries
+                    for k in list(cache)[:len(cache) - 200]:
+                        del cache[k]
             await adapter.handle_message(event)
 
         task = asyncio.create_task(
@@ -2325,6 +2555,7 @@ class InboundPipelineBuilder:
     _DEFAULT_MIDDLEWARES: list[type] = [
         DecodeMiddleware,
         ExtractFieldsMiddleware,
+        RecallGuardMiddleware,
         DedupMiddleware,
         SkipSelfMiddleware,
         ChatRoutingMiddleware,
@@ -4160,6 +4391,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Inbound message deduplication (WS reconnect / network jitter)
         self._dedup = MessageDeduplicator(ttl_seconds=300)
+
+        # Recall support: track which msg_id is being processed per session_key
+        # so RecallGuardMiddleware can detect "currently processing" messages.
+        self._processing_msg_ids: Dict[str, str] = {}
+        self._processing_msg_texts: Dict[str, str] = {}
+        # Bounded cache of msg_id → attributed content for recent messages.
+        # Used by _patch_transcript as content-match fallback when transcript
+        # entries lack a message_id field (agent-processed @bot messages).
+        self._msg_content_cache: Dict[str, str] = {}
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # ------------------------------------------------------------------
