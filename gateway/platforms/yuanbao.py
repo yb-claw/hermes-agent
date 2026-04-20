@@ -138,7 +138,7 @@ REPLY_REF_TTL_S = 300.0            # Reference dedup TTL (5 minutes)
 
 # Slow-response hint: push a waiting message when agent produces no data for this duration (seconds)
 SLOW_RESPONSE_TIMEOUT_S = 120.0
-SLOW_RESPONSE_MESSAGE = "The task is a bit complex, working hard on it, please wait patiently..."
+SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
 
 # Regex matching Yuanbao resource reference anchors in transcript text:
 #   [image|ybres:abc123]  [file:report.pdf|ybres:xyz789]  [voice|ybres:...]
