@@ -324,7 +324,7 @@ compression:
   protect_last_n: 20
 
   # To pin a specific model/provider for compression summaries, use the
-  # Supported platform keys: cli, telegram, discord, whatsapp, slack, qqbot
+  # auxiliary section below (auxiliary.compression.provider / model).
 
 # =============================================================================
 # Auxiliary Models (Advanced — Experimental)
@@ -549,7 +549,7 @@ agent:
 #   - A preset like "hermes-cli" or "hermes-telegram" (curated tool set)
 #   - A list of individual toolsets to compose your own (see list below)
 #
-# Supported platform keys: cli, telegram, discord, whatsapp, slack
+# Supported platform keys: cli, telegram, discord, whatsapp, slack, qqbot
 #
 # Examples:
 #
