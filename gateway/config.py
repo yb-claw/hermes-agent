@@ -155,8 +155,7 @@ class PlatformConfig:
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
     
-    # Platform-specific settings (credentials, policies, etc.)
-    # All platform-specific fields go here — keeps PlatformConfig platform-agnostic.
+    # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
