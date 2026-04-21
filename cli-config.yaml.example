@@ -924,7 +924,7 @@ display:
 # =============================================================================
 # Connect to Tencent Yuanbao IM Bot via WebSocket long-connection.
 # Required: YUANBAO_APP_ID and YUANBAO_APP_SECRET in .env
-#           (or configure under platforms.yuanbao below)
+#           (or configure under platforms.yuanbao.extra below)
 #
 # Environment variables (recommended — avoids storing secrets in this file):
 #   YUANBAO_APP_ID          - App ID for sign-token API authentication
@@ -937,11 +937,12 @@ display:
 # platforms:
 #   yuanbao:
 #     enabled: true
-#     yuanbao_app_id: "your-app-id"              # App ID，用于签票接口鉴权
-#     yuanbao_app_secret: "your-app-secret"     # App Secret，用于 HMAC 签名
-#     yuanbao_bot_id: "your-bot-id"             # Bot 账号 ID（可选，sign-token 接口会返回）
-#     yuanbao_ws_url: "wss://your-ws-gateway"           # WebSocket URL
-#     yuanbao_api_domain: "https://bot.yuanbao.tencent.com"  # API domain
+#     extra:
+#       app_id: "your-app-id"                        # App ID for sign-token API auth
+#       app_secret: "your-app-secret"                # App Secret for HMAC signing
+#       bot_id: "your-bot-id"                        # Bot account ID (optional, returned by sign-token)
+#       ws_url: "wss://your-ws-gateway"              # WebSocket URL
+#       api_domain: "https://bot.yuanbao.tencent.com"  # API domain
 #     # home_channel:
 #     #   platform: yuanbao
 #     #   chat_id: "your-home-chat-id"

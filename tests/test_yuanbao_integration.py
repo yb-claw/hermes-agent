@@ -26,11 +26,13 @@ from gateway.platforms.yuanbao import YuanbaoAdapter
 
 
 def make_config(**kwargs):
+    extra = kwargs.pop("extra", {})
+    extra.setdefault("app_id", "test_key")
+    extra.setdefault("app_secret", "test_secret")
+    extra.setdefault("ws_url", "wss://test.example.com/ws")
+    extra.setdefault("api_domain", "https://test.example.com")
     return PlatformConfig(
-        yuanbao_app_id="test_key",
-        yuanbao_app_secret="test_secret",
-        yuanbao_ws_url="wss://test.example.com/ws",
-        yuanbao_api_domain="https://test.example.com",
+        extra=extra,
         **kwargs,
     )
 
@@ -64,29 +66,28 @@ class TestYuanbaoConfig:
 
     def test_config_fields(self):
         config = make_config()
-        assert config.yuanbao_app_id == "test_key"
-        assert config.yuanbao_app_secret == "test_secret"
+        assert config.extra["app_id"] == "test_key"
+        assert config.extra["app_secret"] == "test_secret"
 
     def test_get_connected_platforms_requires_key_and_secret(self):
-        # 只有 key，没有 secret → 不在 connected 列表
+        # Only key, no secret → not in connected list
         gw_only_key = GatewayConfig(
             platforms={
                 Platform.YUANBAO: PlatformConfig(
                     enabled=True,
-                    yuanbao_app_id="key",
+                    extra={"app_id": "key"},
                 )
             }
         )
         platforms = gw_only_key.get_connected_platforms()
         assert Platform.YUANBAO not in platforms
 
-        # key + secret 都有 → 在 connected 列表
+        # key + secret both present → in connected list
         gw_full = GatewayConfig(
             platforms={
                 Platform.YUANBAO: PlatformConfig(
                     enabled=True,
-                    yuanbao_app_id="key",
-                    yuanbao_app_secret="secret",
+                    extra={"app_id": "key", "app_secret": "secret"},
                 )
             }
         )

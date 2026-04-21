@@ -51,11 +51,13 @@ from gateway.config import Platform, PlatformConfig
 # ============================================================
 
 def make_config(**kwargs):
+    extra = kwargs.pop("extra", {})
+    extra.setdefault("app_id", "test_key")
+    extra.setdefault("app_secret", "test_secret")
+    extra.setdefault("ws_url", "wss://test.example.com/ws")
+    extra.setdefault("api_domain", "https://test.example.com")
     return PlatformConfig(
-        yuanbao_app_id="test_key",
-        yuanbao_app_secret="test_secret",
-        yuanbao_ws_url="wss://test.example.com/ws",
-        yuanbao_api_domain="https://test.example.com",
+        extra=extra,
         **kwargs,
     )
 

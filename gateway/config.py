@@ -155,19 +155,8 @@ class PlatformConfig:
     # - "all": All chunks in multi-part replies thread to user's message
     reply_to_mode: str = "first"
     
-    # Yuanbao IM Bot platform-specific settings
-    yuanbao_app_id: Optional[str] = None           # App ID, used for sign-token API auth
-    yuanbao_app_secret: Optional[str] = None       # App Secret, used for HMAC signing
-    yuanbao_bot_id: Optional[str] = None           # Bot account ID (optional, returned by sign-token API)
-    yuanbao_ws_url: Optional[str] = None           # WebSocket URL (e.g. wss://...)
-    yuanbao_api_domain: Optional[str] = None       # API domain (e.g. https://bot.yuanbao.tencent.com)
-    yuanbao_route_env: Optional[str] = None        # Internal routing env (e.g. test/staging/production)
-    yuanbao_dm_policy: Optional[str] = None        # DM policy: open | allowlist | disabled
-    yuanbao_dm_allow_from: Optional[str] = None    # DM allowlist (comma-separated user_id)
-    yuanbao_group_policy: Optional[str] = None     # Group chat policy: open | allowlist | disabled
-    yuanbao_group_allow_from: Optional[str] = None # Group allowlist (comma-separated group_code)
-
-    # Platform-specific settings
+    # Platform-specific settings (credentials, policies, etc.)
+    # All platform-specific fields go here — keeps PlatformConfig platform-agnostic.
     extra: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -182,26 +171,6 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
-        if self.yuanbao_app_id:
-            result["yuanbao_app_id"] = self.yuanbao_app_id
-        if self.yuanbao_app_secret:
-            result["yuanbao_app_secret"] = self.yuanbao_app_secret
-        if self.yuanbao_bot_id:
-            result["yuanbao_bot_id"] = self.yuanbao_bot_id
-        if self.yuanbao_ws_url:
-            result["yuanbao_ws_url"] = self.yuanbao_ws_url
-        if self.yuanbao_api_domain:
-            result["yuanbao_api_domain"] = self.yuanbao_api_domain
-        if self.yuanbao_route_env:
-            result["yuanbao_route_env"] = self.yuanbao_route_env
-        if self.yuanbao_dm_policy:
-            result["yuanbao_dm_policy"] = self.yuanbao_dm_policy
-        if self.yuanbao_dm_allow_from:
-            result["yuanbao_dm_allow_from"] = self.yuanbao_dm_allow_from
-        if self.yuanbao_group_policy:
-            result["yuanbao_group_policy"] = self.yuanbao_group_policy
-        if self.yuanbao_group_allow_from:
-            result["yuanbao_group_allow_from"] = self.yuanbao_group_allow_from
         return result
     
     @classmethod
@@ -217,16 +186,6 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             extra=data.get("extra", {}),
-            yuanbao_app_id=data.get("yuanbao_app_id"),
-            yuanbao_app_secret=data.get("yuanbao_app_secret"),
-            yuanbao_bot_id=data.get("yuanbao_bot_id"),
-            yuanbao_ws_url=data.get("yuanbao_ws_url"),
-            yuanbao_api_domain=data.get("yuanbao_api_domain"),
-            yuanbao_route_env=data.get("yuanbao_route_env"),
-            yuanbao_dm_policy=data.get("yuanbao_dm_policy"),
-            yuanbao_dm_allow_from=data.get("yuanbao_dm_allow_from"),
-            yuanbao_group_policy=data.get("yuanbao_group_policy"),
-            yuanbao_group_allow_from=data.get("yuanbao_group_allow_from"),
         )
 
 
@@ -357,8 +316,8 @@ class GatewayConfig:
             # QQBot uses extra dict for app credentials
             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
                 connected.append(platform)
-            # Yuanbao uses dedicated fields for app credentials
-            elif platform == Platform.YUANBAO and config.yuanbao_app_id and config.yuanbao_app_secret:
+            # Yuanbao uses extra dict for app credentials
+            elif platform == Platform.YUANBAO and config.extra.get("app_id") and config.extra.get("app_secret"):
                 connected.append(platform)
             # DingTalk uses client_id/client_secret from config.extra or env vars
             elif platform == Platform.DINGTALK and (
@@ -1324,20 +1283,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.YUANBAO not in config.platforms:
             config.platforms[Platform.YUANBAO] = PlatformConfig()
         config.platforms[Platform.YUANBAO].enabled = True
-        config.platforms[Platform.YUANBAO].yuanbao_app_id = yuanbao_app_id
-        config.platforms[Platform.YUANBAO].yuanbao_app_secret = yuanbao_app_secret
+        extra = config.platforms[Platform.YUANBAO].extra
+        extra["app_id"] = yuanbao_app_id
+        extra["app_secret"] = yuanbao_app_secret
         yuanbao_bot_id = os.getenv("YUANBAO_BOT_ID")
         if yuanbao_bot_id:
-            config.platforms[Platform.YUANBAO].yuanbao_bot_id = yuanbao_bot_id
+            extra["bot_id"] = yuanbao_bot_id
         yuanbao_ws_url = os.getenv("YUANBAO_WS_URL")
         if yuanbao_ws_url:
-            config.platforms[Platform.YUANBAO].yuanbao_ws_url = yuanbao_ws_url
+            extra["ws_url"] = yuanbao_ws_url
         yuanbao_api_domain = os.getenv("YUANBAO_API_DOMAIN")
         if yuanbao_api_domain:
-            config.platforms[Platform.YUANBAO].yuanbao_api_domain = yuanbao_api_domain
+            extra["api_domain"] = yuanbao_api_domain
         yuanbao_route_env = os.getenv("YUANBAO_ROUTE_ENV")
         if yuanbao_route_env:
-            config.platforms[Platform.YUANBAO].yuanbao_route_env = yuanbao_route_env
+            extra["route_env"] = yuanbao_route_env
         yuanbao_home = os.getenv("YUANBAO_HOME_CHANNEL")
         if yuanbao_home:
             config.platforms[Platform.YUANBAO].home_channel = HomeChannel(
@@ -1347,16 +1307,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             )
         yuanbao_dm_policy = os.getenv("YUANBAO_DM_POLICY")
         if yuanbao_dm_policy:
-            config.platforms[Platform.YUANBAO].yuanbao_dm_policy = yuanbao_dm_policy.strip().lower()
+            extra["dm_policy"] = yuanbao_dm_policy.strip().lower()
         yuanbao_dm_allow_from = os.getenv("YUANBAO_DM_ALLOW_FROM")
         if yuanbao_dm_allow_from:
-            config.platforms[Platform.YUANBAO].yuanbao_dm_allow_from = yuanbao_dm_allow_from
+            extra["dm_allow_from"] = yuanbao_dm_allow_from
         yuanbao_group_policy = os.getenv("YUANBAO_GROUP_POLICY")
         if yuanbao_group_policy:
-            config.platforms[Platform.YUANBAO].yuanbao_group_policy = yuanbao_group_policy.strip().lower()
+            extra["group_policy"] = yuanbao_group_policy.strip().lower()
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
-            config.platforms[Platform.YUANBAO].yuanbao_group_allow_from = yuanbao_group_allow_from
+            extra["group_allow_from"] = yuanbao_group_allow_from
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

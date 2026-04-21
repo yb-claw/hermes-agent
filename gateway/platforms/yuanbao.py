@@ -7,11 +7,12 @@ heartbeat, reconnection, message receive (T05) and send (T06).
 Configuration in config.yaml (or via env vars):
     platforms:
       yuanbao:
-        yuanbao_app_id: "..."         # or YUANBAO_APP_ID
-        yuanbao_app_secret: "..."     # or YUANBAO_APP_SECRET
-        yuanbao_bot_id: "..."         # or YUANBAO_BOT_ID  (optional, returned by sign-token)
-        yuanbao_ws_url: "wss://..."          # or YUANBAO_WS_URL
-        yuanbao_api_domain: "https://..."      # or YUANBAO_API_DOMAIN
+        extra:
+          app_id: "..."              # or YUANBAO_APP_ID
+          app_secret: "..."          # or YUANBAO_APP_SECRET
+          bot_id: "..."              # or YUANBAO_BOT_ID  (optional, returned by sign-token)
+          ws_url: "wss://..."        # or YUANBAO_WS_URL
+          api_domain: "https://..."  # or YUANBAO_API_DOMAIN
 """
 
 from __future__ import annotations
@@ -4403,13 +4404,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
 
-        # Credentials / endpoints from config (populated by config.py from env/yaml)
-        self._app_key: str = (config.yuanbao_app_id or "").strip()
-        self._app_secret: str = (config.yuanbao_app_secret or "").strip()
-        self._bot_id: Optional[str] = config.yuanbao_bot_id or None
-        self._ws_url: str = (config.yuanbao_ws_url or DEFAULT_WS_GATEWAY_URL).strip()
-        self._api_domain: str = (config.yuanbao_api_domain or DEFAULT_API_DOMAIN).rstrip("/")
-        self._route_env: str = (config.yuanbao_route_env or "").strip()
+        # Credentials / endpoints from config.extra (populated by config.py from env/yaml)
+        _extra = config.extra or {}
+        self._app_key: str = (_extra.get("app_id") or "").strip()
+        self._app_secret: str = (_extra.get("app_secret") or "").strip()
+        self._bot_id: Optional[str] = _extra.get("bot_id") or None
+        self._ws_url: str = (_extra.get("ws_url") or DEFAULT_WS_GATEWAY_URL).strip()
+        self._api_domain: str = (_extra.get("api_domain") or DEFAULT_API_DOMAIN).rstrip("/")
+        self._route_env: str = (_extra.get("route_env") or "").strip()
 
         # Core managers (UML composition)
         self._connection: ConnectionManager = ConnectionManager(self)
@@ -4447,23 +4449,23 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Access control policy (DM / Group)
         # ------------------------------------------------------------------
         dm_policy: str = (
-            config.yuanbao_dm_policy
+            _extra.get("dm_policy")
             or os.getenv("YUANBAO_DM_POLICY", "open")
         ).strip().lower()
 
         _dm_allow_from_raw: str = (
-            config.yuanbao_dm_allow_from
+            _extra.get("dm_allow_from")
             or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
         )
         dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
 
         group_policy: str = (
-            config.yuanbao_group_policy
+            _extra.get("group_policy")
             or os.getenv("YUANBAO_GROUP_POLICY", "open")
         ).strip().lower()
 
         _group_allow_from_raw: str = (
-            config.yuanbao_group_allow_from
+            _extra.get("group_allow_from")
             or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
         )
         group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]

@@ -267,10 +267,11 @@ These can also be set in `config.yaml`:
 ```yaml
 platforms:
   yuanbao:
-    yuanbao_dm_policy: allowlist
-    yuanbao_dm_allow_from: "user1,user2"
-    yuanbao_group_policy: open
-    yuanbao_group_allow_from: ""
+    extra:
+      dm_policy: allowlist
+      dm_allow_from: "user1,user2"
+      group_policy: open
+      group_allow_from: ""
 ```
 
 ## Advanced Configuration
