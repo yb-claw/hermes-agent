@@ -16,6 +16,12 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from hermes_cli import __version__ as _HERMES_VERSION
+
+# Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
+# Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
+_HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
+
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
@@ -26,7 +32,7 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
-    ("moonshotai/kimi-k2.5",            "recommended"),
+    ("moonshotai/kimi-k2.6",            "recommended"),
     ("anthropic/claude-opus-4.7",       ""),
     ("anthropic/claude-opus-4.6",       ""),
     ("anthropic/claude-sonnet-4.6",     ""),
@@ -75,7 +81,7 @@ def _codex_curated_models() -> list[str]:
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
-        "moonshotai/kimi-k2.5",
+        "moonshotai/kimi-k2.6",
         "xiaomi/mimo-v2-pro",
         "anthropic/claude-opus-4.7",
         "anthropic/claude-opus-4.6",
@@ -159,12 +165,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # (map to OpenRouter defaults — users get familiar picks on NIM)
         "qwen/qwen3.5-397b-a17b",
         "deepseek-ai/deepseek-v3.2",
-        "moonshotai/kimi-k2.5",
+        "moonshotai/kimi-k2.6",
         "minimaxai/minimax-m2.5",
         "z-ai/glm5",
         "openai/gpt-oss-120b",
     ],
     "kimi-coding": [
+        "kimi-k2.6",
         "kimi-k2.5",
         "kimi-for-coding",
         "kimi-k2-thinking",
@@ -173,12 +180,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-0905-preview",
     ],
     "kimi-coding-cn": [
+        "kimi-k2.6",
         "kimi-k2.5",
         "kimi-k2-thinking",
         "kimi-k2-turbo-preview",
         "kimi-k2-0905-preview",
     ],
     "moonshot": [
+        "kimi-k2.6",
         "kimi-k2.5",
         "kimi-k2-thinking",
         "kimi-k2-turbo-preview",
@@ -225,7 +234,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5.4-pro",
         "gpt-5.4",
         "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
         "gpt-5.2",
         "gpt-5.2-codex",
         "gpt-5.1",
@@ -313,6 +321,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "zai-org/GLM-5",
         "XiaomiMiMo/MiMo-V2-Flash",
         "moonshotai/Kimi-K2-Thinking",
+        "moonshotai/Kimi-K2.6",
     ],
     # AWS Bedrock — static fallback list used when dynamic discovery is
     # unavailable (no boto3, no credentials, or API error).  The agent
@@ -1769,7 +1778,7 @@ def probe_api_models(
         candidates.append((alternate_base, True))
 
     tried: list[str] = []
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if normalized.startswith(COPILOT_BASE_URL):

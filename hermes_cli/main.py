@@ -1003,6 +1003,17 @@ def _launch_tui(resume_session_id: Optional[str] = None, tui_dev: bool = False):
     )
     env.setdefault("HERMES_PYTHON", sys.executable)
     env.setdefault("HERMES_CWD", os.getcwd())
+    # Guarantee an 8GB V8 heap + exposed GC for the TUI. Default node cap is
+    # ~1.5–4GB depending on version and can fatal-OOM on long sessions with
+    # large transcripts / reasoning blobs. Token-level merge: respect any
+    # user-supplied --max-old-space-size (they may have set it higher) and
+    # avoid duplicating --expose-gc.
+    _tokens = env.get("NODE_OPTIONS", "").split()
+    if not any(t.startswith("--max-old-space-size=") for t in _tokens):
+        _tokens.append("--max-old-space-size=8192")
+    if "--expose-gc" not in _tokens:
+        _tokens.append("--expose-gc")
+    env["NODE_OPTIONS"] = " ".join(_tokens)
     if resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
 
@@ -3340,8 +3351,9 @@ def _model_flow_kimi(config, current_model=""):
 
     # Step 3: Model selection — show appropriate models for the endpoint
     if is_coding_plan:
-        # Coding Plan models (kimi-k2.5 first)
+        # Coding Plan models (kimi-k2.6 first)
         model_list = [
+            "kimi-k2.6",
             "kimi-k2.5",
             "kimi-for-coding",
             "kimi-k2-thinking",
@@ -7448,6 +7460,17 @@ Examples:
         "-f",
         action="store_true",
         help="Remove existing plugin and reinstall",
+    )
+    _install_enable_group = plugins_install.add_mutually_exclusive_group()
+    _install_enable_group.add_argument(
+        "--enable",
+        action="store_true",
+        help="Auto-enable the plugin after install (skip confirmation prompt)",
+    )
+    _install_enable_group.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Install disabled (skip confirmation prompt); enable later with `hermes plugins enable <name>`",
     )
 
     plugins_update = plugins_subparsers.add_parser(

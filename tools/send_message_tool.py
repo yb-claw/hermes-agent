@@ -368,11 +368,12 @@ def _describe_media_for_mirror(media_files):
 
 def _get_cron_auto_delivery_target():
     """Return the cron scheduler's auto-delivery target for the current run, if any."""
-    platform = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
-    chat_id = os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
     if not platform or not chat_id:
         return None
-    thread_id = os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+    thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
     return {
         "platform": platform,
         "chat_id": chat_id,
@@ -522,15 +523,27 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # --- Yuanbao: route through running adapter (supports text + image + file) ---
-    if platform == Platform.YUANBAO:
-        return await _send_yuanbao(chat_id, message, media_files=media_files)
+    # --- Signal: native attachment support via JSON-RPC attachments param ---
+    if platform == Platform.SIGNAL and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_signal(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
 
-    # --- Non-Telegram/Discord platforms ---
+    # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, and yuanbao; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -538,7 +551,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, and yuanbao"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao"
         )
 
     last_result = None
@@ -984,8 +997,12 @@ async def _send_whatsapp(extra, chat_id, message):
         return _error(f"WhatsApp send failed: {e}")
 
 
-async def _send_signal(extra, chat_id, message):
-    """Send via signal-cli JSON-RPC API."""
+async def _send_signal(extra, chat_id, message, media_files=None):
+    """Send via signal-cli JSON-RPC API.
+
+    Supports both text-only and text-with-attachments (images/audio/documents).
+    Attachments are sent as an 'attachments' array in the JSON-RPC params.
+    """
     try:
         import httpx
     except ImportError:
@@ -1002,6 +1019,18 @@ async def _send_signal(extra, chat_id, message):
         else:
             params["recipient"] = [chat_id]
 
+        # Add attachments if media_files are present
+        valid_media = media_files or []
+        attachment_paths = []
+        for media_path, _is_voice in valid_media:
+            if os.path.exists(media_path):
+                attachment_paths.append(media_path)
+            else:
+                logger.warning("Signal media file not found, skipping: %s", media_path)
+
+        if attachment_paths:
+            params["attachments"] = attachment_paths
+
         payload = {
             "jsonrpc": "2.0",
             "method": "send",
@@ -1015,7 +1044,12 @@ async def _send_signal(extra, chat_id, message):
             data = resp.json()
             if "error" in data:
                 return _error(f"Signal RPC error: {data['error']}")
-            return {"success": True, "platform": "signal", "chat_id": chat_id}
+
+            # Return warning for any skipped media files
+            result = {"success": True, "platform": "signal", "chat_id": chat_id}
+            if len(attachment_paths) < len(valid_media):
+                result["warnings"] = [f"Some media files were skipped (not found on disk)"]
+            return result
     except Exception as e:
         return _error(f"Signal send failed: {e}")
 
