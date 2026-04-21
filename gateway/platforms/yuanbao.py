@@ -146,6 +146,9 @@ _YB_RES_REF_RE = re.compile(
     r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]"
 )
 
+# Strip page indicators like (1/3) appended by BasePlatformAdapter
+_INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
+
 # Observed-media backfill: how many recent transcript messages to scan
 OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
 # Max number of resource references to resolve per inbound turn
@@ -705,6 +708,23 @@ class SignManager:
         """Clear all per-app_key refresh locks (called on disconnect)."""
         cls._locks.clear()
 
+    @classmethod
+    def purge_expired(cls) -> int:
+        """Remove all expired entries from the token cache.
+
+        Returns the number of entries purged.  Called lazily from
+        ``get_token()`` so that stale app_key entries don't accumulate
+        indefinitely in long-running processes.
+        """
+        now = time.time()
+        expired_keys = [
+            k for k, v in cls._cache.items()
+            if now - v.get("expire_ts", 0) > 0
+        ]
+        for k in expired_keys:
+            cls._cache.pop(k, None)
+        return len(expired_keys)
+
     # -- Core: fetch -------------------------------------------------------
 
     @classmethod
@@ -796,6 +816,9 @@ class SignManager:
         Return directly on cache hit without re-requesting; treat as expiring
         60 seconds before actual expiry, triggering refresh.
         """
+        # Lazily evict stale entries from other app_keys
+        cls.purge_expired()
+
         cached = cls._cache.get(app_key)
         if cached and cls.is_cache_valid(cached):
             remain = int(cached["expire_ts"] - time.time())
@@ -2156,34 +2179,24 @@ class MediaResolveMiddleware(InboundMiddleware):
         return ".jpg"
 
     @staticmethod
-    async def _resolve_download_url(adapter, url: str) -> str:
-        """Resolve Yuanbao resource placeholder to a directly fetchable real URL.
+    async def _fetch_resource_url(adapter, resource_id: str) -> str:
+        """Low-level helper: exchange a ``resourceId`` for a direct download URL.
 
-        Common URL patterns:
-          https://hunyuan.tencent.com/api/resource/download?resourceId=...
-        Direct GET returns 401; need business API:
-          GET /api/resource/v1/download?resourceId=...
+        Handles token retrieval, the ``/api/resource/v1/download`` API call,
+        and a single 401-retry with token force-refresh.  Raises on failure.
         """
-        try:
-            parsed = urllib.parse.urlparse(url)
-        except Exception:
-            return url
-
-        query = urllib.parse.parse_qs(parsed.query)
-        resource_ids = query.get("resourceId") or query.get("resourceid") or []
-        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        resource_id = resource_id.strip()
         if not resource_id:
-            return url
+            raise RuntimeError("missing resource_id")
 
         token_data = await adapter._get_cached_token()
         token = str(token_data.get("token") or "").strip()
         source = str(token_data.get("source") or "web").strip() or "web"
         bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
         if not token or not bot_id:
-            return url
+            raise RuntimeError("missing token or bot_id for resource download")
 
         api_url = f"{adapter._api_domain}/api/resource/v1/download"
-
         headers = {
             "Content-Type": "application/json",
             "X-ID": bot_id,
@@ -2222,7 +2235,32 @@ class MediaResolveMiddleware(InboundMiddleware):
                     return real_url
                 raise RuntimeError("resource/v1/download missing url/realUrl")
 
-        return url
+        raise RuntimeError("resource/v1/download did not return a URL")
+
+    @staticmethod
+    async def _resolve_download_url(adapter, url: str) -> str:
+        """Resolve Yuanbao resource placeholder to a directly fetchable real URL.
+
+        Common URL patterns:
+          https://hunyuan.tencent.com/api/resource/download?resourceId=...
+        Direct GET returns 401; need business API:
+          GET /api/resource/v1/download?resourceId=...
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return url
+
+        query = urllib.parse.parse_qs(parsed.query)
+        resource_ids = query.get("resourceId") or query.get("resourceid") or []
+        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        if not resource_id:
+            return url
+
+        try:
+            return await MediaResolveMiddleware._fetch_resource_url(adapter, resource_id)
+        except Exception:
+            return url
 
     @classmethod
     async def _download_and_cache(
@@ -2274,56 +2312,7 @@ class MediaResolveMiddleware(InboundMiddleware):
     @classmethod
     async def _resolve_by_resource_id(cls, adapter, resource_id: str) -> str:
         """Exchange a Yuanbao ``resourceId`` for a short-lived direct download URL. Raises on failure."""
-        resource_id = resource_id.strip()
-        if not resource_id:
-            raise RuntimeError("missing resource_id")
-
-        token_data = await adapter._get_cached_token()
-        token = str(token_data.get("token") or "").strip()
-        source = str(token_data.get("source") or "web").strip() or "web"
-        bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
-        if not token or not bot_id:
-            raise RuntimeError("missing token or bot_id for resource download")
-
-        api_url = f"{adapter._api_domain}/api/resource/v1/download"
-        headers = {
-            "Content-Type": "application/json",
-            "X-ID": bot_id,
-            "X-Token": token,
-            "X-Source": source,
-        }
-
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            for attempt in range(2):
-                resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
-                if resp.status_code == 401 and attempt == 0:
-                    token_data = await SignManager.force_refresh(
-                        adapter._app_key, adapter._app_secret, adapter._api_domain,
-                    )
-                    token = str(token_data.get("token") or "").strip()
-                    source = str(token_data.get("source") or source or "web").strip() or "web"
-                    bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
-                    if not token or not bot_id:
-                        break
-                    headers["X-ID"] = bot_id
-                    headers["X-Token"] = token
-                    headers["X-Source"] = source
-                    continue
-
-                resp.raise_for_status()
-                payload = resp.json()
-                code = payload.get("code")
-                if code not in (None, 0):
-                    raise RuntimeError(
-                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
-                    )
-                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-                real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
-                if real_url:
-                    return real_url
-                raise RuntimeError("resource/v1/download missing url/realUrl")
-
-        raise RuntimeError("resource/v1/download did not return a URL")
+        return await cls._fetch_resource_url(adapter, resource_id)
 
     @classmethod
     async def _resolve_media_urls(
@@ -3620,7 +3609,7 @@ class GroupQueryService:
             else:
                 result = {"members": [], "next_offset": 0, "is_complete": True}
             if result and result.get("members"):
-                adapter._member_cache[group_code] = result["members"]
+                adapter._member_cache[group_code] = (time.time(), result["members"])
             return result
         except asyncio.TimeoutError:
             logger.warning("[%s] get_group_member_list timeout: group=%s", adapter.name, group_code)
@@ -4117,7 +4106,12 @@ class MessageSender:
 
     def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
         """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
-        members = self._adapter._member_cache.get(group_code, [])
+        cached = self._adapter._member_cache.get(group_code)
+        if cached:
+            ts, member_list = cached
+            members = member_list if (time.time() - ts < self._adapter.MEMBER_CACHE_TTL_S) else []
+        else:
+            members = []
         if not members:
             return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
 
@@ -4254,7 +4248,6 @@ class MessageSender:
         )
 
         # Strip page indicators like (1/3) that BasePlatformAdapter may add
-        _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
         chunks = [_INDICATOR_RE.sub('', c) for c in chunks]
 
         return chunks if chunks else [content]
@@ -4428,9 +4421,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Set of background tasks — prevent GC from collecting fire-and-forget tasks
         self._background_tasks: set[asyncio.Task] = set()
 
-        # Member cache: group_code -> [{"user_id":..., "nickname":..., ...}, ...]
+        # Member cache: group_code -> (updated_ts, [{"user_id":..., "nickname":..., ...}, ...])
         # Populated by get_group_member_list(), used by @mention resolution.
-        self._member_cache: Dict[str, list] = {}
+        # Entries older than MEMBER_CACHE_TTL_S are treated as stale.
+        self._member_cache: Dict[str, Tuple[float, list]] = {}
+        self.MEMBER_CACHE_TTL_S: float = 300.0  # 5 minutes
 
         # Inbound message deduplication (WS reconnect / network jitter)
         self._dedup = MessageDeduplicator(ttl_seconds=300)
