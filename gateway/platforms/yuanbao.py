@@ -1898,8 +1898,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
 
         # Sender identity check: bot owner <-> push.from_account == push.bot_owner_id
         owner_id = (push or {}).get("bot_owner_id") or ""
-        # is_owner = bool(owner_id) and owner_id == from_account
-        is_owner = True
+        is_owner = bool(owner_id) and owner_id == from_account
         return cmd, cmd_line, is_owner
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
