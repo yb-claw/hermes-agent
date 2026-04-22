@@ -977,6 +977,11 @@ class InboundContext:
 
     # Populated by ContentExtractMiddleware
     raw_text: str = ""
+    # Populated by ExtractContentMiddleware; used by ClassifyMessageTypeMiddleware.
+    # Same as raw_text but with @mention text stripped, so slash command detection
+    # works even when mention text precedes the command (e.g. "@Bot /help").
+    # Falls back to raw_text when None (e.g. non-yuanbao platforms).
+    command_text: Optional[str] = None
     media_refs: list = dc_field(default_factory=list)
 
     # Owner command detection
@@ -1667,7 +1672,7 @@ class ExtractContentMiddleware(InboundMiddleware):
         return f"[link: {link} | visit link for full content]"
 
     @classmethod
-    def _extract_text(cls, msg_body: list) -> str:
+    def _extract_text(cls, msg_body: list) -> tuple[str, str]:
         """Extract plain text content from MsgBody.
 
         - TIMTextElem      -> text field
@@ -1678,8 +1683,14 @@ class ExtractContentMiddleware(InboundMiddleware):
         - TIMFaceElem      -> "[emoji: {name}]" or "[emoji]"
         - TIMCustomElem    -> try to extract data field, otherwise "[custom message]"
         - Multiple elems joined with spaces
+
+        Returns:
+            (full_text, command_text) — full_text includes @mention text as-is;
+            command_text is identical but omits ctype==1002 mention elements so
+            slash-command detection sees a clean "/cmd ..." prefix.
         """
         parts: list[str] = []
+        command_parts: list[str] = []
         for elem in msg_body:
             elem_type: str = elem.get("msg_type", "")
             content: dict = elem.get("msg_content", {})
@@ -1688,15 +1699,21 @@ class ExtractContentMiddleware(InboundMiddleware):
                 text = content.get("text", "")
                 if text:
                     parts.append(text)
+                    command_parts.append(text)
             elif elem_type == "TIMImageElem":
                 parts.append("[image]")
+                command_parts.append("[image]")
             elif elem_type == "TIMFileElem":
                 filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
-                parts.append(f"[file: {filename}]" if filename else "[file]")
+                rendered = f"[file: {filename}]" if filename else "[file]"
+                parts.append(rendered)
+                command_parts.append(rendered)
             elif elem_type == "TIMSoundElem":
                 parts.append("[voice]")
+                command_parts.append("[voice]")
             elif elem_type == "TIMVideoFileElem":
                 parts.append("[video]")
+                command_parts.append("[video]")
             elif elem_type == "TIMCustomElem":
                 data_val = content.get("data", "")
                 if data_val:
@@ -1704,24 +1721,34 @@ class ExtractContentMiddleware(InboundMiddleware):
                         custom = json.loads(data_val)
                         if not isinstance(custom, dict):
                             parts.append("[unsupported message type]")
+                            command_parts.append("[unsupported message type]")
                             continue
                         ctype = custom.get("elem_type")
                         if ctype == 1002:
+                            # @mention: keep in full_text for agent context,
+                            # skip in command_text so slash detection isn't blocked.
                             parts.append(custom.get("text", "[mention]"))
                         elif ctype == 1010:
-                            parts.append(cls._format_shared_link(custom))
+                            rendered = cls._format_shared_link(custom)
+                            parts.append(rendered)
+                            command_parts.append(rendered)
                         elif ctype == 1007:
                             text = cls._format_link_understanding(custom)
                             if text:
                                 parts.append(text)
+                                command_parts.append(text)
                             else:
                                 parts.append("[unsupported message type]")
+                                command_parts.append("[unsupported message type]")
                         else:
                             parts.append("[unsupported message type]")
+                            command_parts.append("[unsupported message type]")
                     except (json.JSONDecodeError, TypeError):
                         parts.append(data_val)
+                        command_parts.append(data_val)
                 else:
                     parts.append("[unsupported message type]")
+                    command_parts.append("[unsupported message type]")
             elif elem_type == "TIMFaceElem":
                 # Sticker/emoji: extract name from data JSON
                 raw_data = content.get("data", "")
@@ -1732,12 +1759,16 @@ class ExtractContentMiddleware(InboundMiddleware):
                         face_name = (face_data.get("name") or "").strip()
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         pass
-                parts.append(f"[emoji: {face_name}]" if face_name else "[emoji]")
+                rendered = f"[emoji: {face_name}]" if face_name else "[emoji]"
+                parts.append(rendered)
+                command_parts.append(rendered)
             elif elem_type:
                 # Unknown element type — include type as placeholder
-                parts.append(f"[{elem_type}]")
+                rendered = f"[{elem_type}]"
+                parts.append(rendered)
+                command_parts.append(rendered)
 
-        return " ".join(parts) if parts else ""
+        return " ".join(parts).strip(), " ".join(command_parts).strip()
 
     @staticmethod
     def _rewrite_slash_command(text: str) -> str:
@@ -1828,7 +1859,9 @@ class ExtractContentMiddleware(InboundMiddleware):
         return urls
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
+        full_text, command_text = self._extract_text(ctx.msg_body)
+        ctx.raw_text = self._rewrite_slash_command(full_text)
+        ctx.command_text = self._rewrite_slash_command(command_text)
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.link_urls = self._extract_link_urls(ctx.msg_body)
         await next_fn()
@@ -2137,7 +2170,7 @@ class ClassifyMessageTypeMiddleware(InboundMiddleware):
         return MessageType.TEXT
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        ctx.msg_type = self._classify(ctx.raw_text, ctx.msg_body)
+        ctx.msg_type = self._classify(ctx.command_text or ctx.raw_text, ctx.msg_body)
         await next_fn()
 
 

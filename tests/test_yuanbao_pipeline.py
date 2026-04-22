@@ -39,10 +39,13 @@ from gateway.platforms.yuanbao import (
     OwnerCommandMiddleware,
     BuildSourceMiddleware,
     GroupAtGuardMiddleware,
+    GroupAttributionMiddleware,
+    ClassifyMessageTypeMiddleware,
     DispatchMiddleware,
     InboundPipelineBuilder,
     YuanbaoAdapter,
 )
+from gateway.platforms.base import MessageType
 from gateway.config import Platform, PlatformConfig
 
 
@@ -1027,3 +1030,164 @@ class TestPipelineOOPRegistration:
         pipeline = InboundPipeline().use(MwA()).use(MwC())
         pipeline.use_after("a", MwB())
         assert pipeline.middleware_names == ["a", "b", "c"]
+
+
+# ============================================================
+# 7. Group Slash Command Detection (regression for the @Bot /help bug)
+# ============================================================
+
+class TestGroupSlashCommandDetection:
+    """Regression tests: group-chat slash commands (e.g. ``@Bot /help``) must be
+    classified as ``MessageType.COMMAND`` end-to-end through the inbound pipeline.
+
+    Prior to the command_text split, ``ctx.raw_text`` was polluted by the
+    @mention text and by ``GroupAttributionMiddleware``'s ``[nickname|uid]`` prefix,
+    so ``text.startswith("/")`` would never match. These tests exercise the
+    full middleware chain that runs after content extraction:
+
+        ExtractContentMiddleware
+          → GroupAtGuardMiddleware
+          → GroupAttributionMiddleware
+          → ClassifyMessageTypeMiddleware
+
+    They also pin the product constraint that @mention text MUST be preserved in
+    ``ctx.raw_text`` (needed for multi-mention awareness).
+    """
+
+    @staticmethod
+    def _mention_elem(bot_id: str, text: str = "@LOC Hermes") -> dict:
+        """Build a TIMCustomElem representing an @mention of the given user_id."""
+        return {
+            "msg_type": "TIMCustomElem",
+            "msg_content": {
+                "data": json.dumps({
+                    "elem_type": 1002,
+                    "text": text,
+                    "user_id": bot_id,
+                }),
+            },
+        }
+
+    @staticmethod
+    def _text_elem(text: str) -> dict:
+        return {"msg_type": "TIMTextElem", "msg_content": {"text": text}}
+
+    @staticmethod
+    def _make_pipeline() -> InboundPipeline:
+        """Build a mini-pipeline with just the 4 middlewares relevant to
+        slash-command classification. Avoids Dispatch/Media so we don't need
+        to mock adapter.handle_message / session_store."""
+        return (
+            InboundPipeline()
+            .use(ExtractContentMiddleware())
+            .use(GroupAtGuardMiddleware())
+            .use(GroupAttributionMiddleware())
+            .use(ClassifyMessageTypeMiddleware())
+        )
+
+    @staticmethod
+    def _make_group_ctx(adapter, msg_body: list) -> InboundContext:
+        """Create an InboundContext pre-populated as if ChatRouting/BuildSource
+        had already run for a group message from 'alice'."""
+        from gateway.session import SessionSource
+        source = SessionSource(
+            platform=Platform.YUANBAO,
+            chat_id="group:grp-1",
+            chat_name="Test Group",
+            chat_type="group",
+            user_id="alice",
+            user_name="Alice",
+            thread_id="main",
+        )
+        return InboundContext(
+            adapter=adapter,
+            msg_body=msg_body,
+            from_account="alice",
+            sender_nickname="Alice",
+            group_code="grp-1",
+            chat_id="group:grp-1",
+            chat_type="group",
+            chat_name="Test Group",
+            source=source,
+        )
+
+    @pytest.mark.asyncio
+    async def test_at_bot_slash_command_classified_as_command(self):
+        """Group message '@Bot /help' is classified as COMMAND, with mention
+        text preserved in raw_text and stripped from command_text."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        adapter._session_store = None  # Not needed — @bot branch doesn't observe
+
+        msg_body = [
+            self._mention_elem("bot_123", text="@LOC Hermes"),
+            self._text_elem("/help"),
+        ]
+        ctx = self._make_group_ctx(adapter, msg_body)
+        await self._make_pipeline().execute(ctx)
+
+        # raw_text keeps the mention text (product constraint) plus the
+        # [nickname|user_id] attribution prefix added by GroupAttributionMiddleware.
+        assert "@LOC Hermes" in ctx.raw_text
+        assert "/help" in ctx.raw_text
+        assert ctx.raw_text.startswith("[Alice|alice]")
+
+        # command_text omits the mention text and is not prefixed by attribution,
+        # so /help is routable as a command.
+        assert ctx.command_text is not None
+        assert "@LOC Hermes" not in ctx.command_text
+        assert ctx.command_text.lstrip().startswith("/")
+
+        assert ctx.msg_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_multi_mention_preserves_all_mentions_in_raw_text(self):
+        """Multi-@ scenario: raw_text keeps every mention, command_text strips
+        them all, classification still picks up the slash command."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        adapter._session_store = None
+
+        msg_body = [
+            self._mention_elem("other_user", text="@Alice"),
+            self._mention_elem("bot_123", text="@LOC Hermes"),
+            self._text_elem("/status"),
+        ]
+        ctx = self._make_group_ctx(adapter, msg_body)
+        await self._make_pipeline().execute(ctx)
+
+        # Both mentions are preserved for multi-mention awareness.
+        assert "@Alice" in ctx.raw_text
+        assert "@LOC Hermes" in ctx.raw_text
+        assert "/status" in ctx.raw_text
+
+        # command_text strips both mentions so routing sees a clean command.
+        assert ctx.command_text is not None
+        assert "@Alice" not in ctx.command_text
+        assert "@LOC Hermes" not in ctx.command_text
+        assert ctx.command_text.lstrip().startswith("/")
+
+        assert ctx.msg_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_full_width_slash_is_normalized_in_command_text(self):
+        """Full-width '／help' gets normalized to ASCII '/help' in
+        command_text so classification still detects COMMAND."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        adapter._session_store = None
+
+        msg_body = [
+            self._mention_elem("bot_123", text="@LOC Hermes"),
+            self._text_elem("\uff0fhelp"),  # full-width slash + help
+        ]
+        ctx = self._make_group_ctx(adapter, msg_body)
+        await self._make_pipeline().execute(ctx)
+
+        # _rewrite_slash_command is applied to command_text too, so the
+        # full-width slash is converted to ASCII.
+        assert ctx.command_text is not None
+        assert ctx.command_text.lstrip().startswith("/")
+        assert not ctx.command_text.lstrip().startswith("\uff0f")
+
+        assert ctx.msg_type == MessageType.COMMAND
