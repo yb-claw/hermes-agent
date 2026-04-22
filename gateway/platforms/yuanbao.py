@@ -897,10 +897,17 @@ class SignManager:
                     code, result.get("msg", ""),
                 )
                 return ""
-            owner_id = (
-                (result.get("data") or {})
-                .get("bot") or {}
-            ).get("owner_id") or ""
+            owner_id = (result.get("bot") or {}).get("owner_id") or ""
+            if owner_id:
+                logger.info(
+                    "fetch_bot_detail success: bot_id=%s owner_id=%s",
+                    bot_id, owner_id,
+                )
+            else:
+                logger.warning(
+                    "fetch_bot_detail: owner_id missing in response bot: %s",
+                    result.get("bot"),
+                )
             return str(owner_id) if owner_id else ""
         except Exception as exc:
             logger.error("fetch_bot_detail failed: %s", exc, exc_info=True)
@@ -2832,8 +2839,19 @@ class ConnectionManager:
             if owner_id:
                 adapter._owner_id = owner_id
                 logger.info("[%s] Bot owner_id=%s", adapter.name, owner_id)
-                if not os.getenv("YUANBAO_HOME_CHANNEL"):
+                existing_home = os.getenv("YUANBAO_HOME_CHANNEL")
+                if existing_home:
+                    logger.info(
+                        "[%s] Skipping auto-sethome: YUANBAO_HOME_CHANNEL already set to %r",
+                        adapter.name, existing_home,
+                    )
+                else:
                     _apply_sethome(owner_id, adapter.name)
+            else:
+                logger.warning(
+                    "[%s] fetch_bot_detail returned empty owner_id — auto-sethome skipped",
+                    adapter.name,
+                )
 
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
