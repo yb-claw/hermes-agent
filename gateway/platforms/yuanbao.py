@@ -847,6 +847,56 @@ class SignManager:
 
         return dict(cls._cache[app_key])
 
+    # -- Public API: fetch bot detail --------------------------------------
+
+    BOT_DETAIL_PATH = "/api/v5/robotLogic/get-bot-detail"
+
+    @classmethod
+    async def fetch_bot_detail(
+        cls,
+        bot_id: str,
+        token: str,
+        source: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> str:
+        """Fetch bot detail and return owner_id (empty string on any error).
+
+        Calls POST /api/v5/robotLogic/get-bot-detail with bot_id and scene=2.
+        Returns the owner_id from data.bot.owner_id, or "" if unavailable.
+        This call is non-fatal — connection proceeds regardless of outcome.
+        """
+        url = f"{api_domain.rstrip('/')}{cls.BOT_DETAIL_PATH}"
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "X-Token": token,
+            "X-ID": bot_id,
+            "X-Source": source,
+        }
+        if route_env:
+            headers["X-Route-Env"] = route_env
+        payload = {"bot_id": bot_id, "scene": 2}
+        try:
+            async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                result = resp.json()
+            code = result.get("code", -1)
+            if code != 0:
+                logger.warning(
+                    "get-bot-detail returned non-zero code=%s msg=%s",
+                    code, result.get("msg", ""),
+                )
+                return ""
+            owner_id = (
+                (result.get("data") or {})
+                .get("bot") or {}
+            ).get("owner_id") or ""
+            return str(owner_id) if owner_id else ""
+        except Exception as exc:
+            logger.warning("fetch_bot_detail failed: %s", exc)
+            return ""
+
     # -- Public API: force refresh -----------------------------------------
 
     @classmethod
@@ -2771,6 +2821,18 @@ class ConnectionManager:
                 await self._cleanup_ws()
                 return False
 
+            # Step 3b: Fetch bot detail to obtain owner_id
+            owner_id = await SignManager.fetch_bot_detail(
+                bot_id=adapter._bot_id or "",
+                token=token_data.get("token", ""),
+                source=token_data.get("source", ""),
+                api_domain=adapter._api_domain,
+                route_env=adapter._route_env,
+            )
+            if owner_id:
+                adapter._owner_id = owner_id
+                logger.info("[%s] Bot owner_id=%s", adapter.name, owner_id)
+
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
             adapter._mark_connected()
@@ -4491,6 +4553,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._app_key: str = (_extra.get("app_id") or "").strip()
         self._app_secret: str = (_extra.get("app_secret") or "").strip()
         self._bot_id: Optional[str] = _extra.get("bot_id") or None
+        self._owner_id: str = ""
         self._ws_url: str = (_extra.get("ws_url") or DEFAULT_WS_GATEWAY_URL).strip()
         self._api_domain: str = (_extra.get("api_domain") or DEFAULT_API_DOMAIN).rstrip("/")
         self._route_env: str = (_extra.get("route_env") or "").strip()
