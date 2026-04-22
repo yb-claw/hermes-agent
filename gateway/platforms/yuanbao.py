@@ -2637,7 +2637,7 @@ class InboundPipelineBuilder:
             pipeline.use(mw_cls())
         return pipeline
 
-def _apply_sethome(chat_id: str, adapter_name: str, label: str = "") -> None:
+def _apply_sethome(owner_id: str, adapter_name: str, label: str = "") -> None:
     """Write *chat_id* as YUANBAO_HOME_CHANNEL to config.yaml and os.environ.
 
     Silent: logs at INFO on success, WARNING on failure — no user-facing message.
@@ -2652,6 +2652,7 @@ def _apply_sethome(chat_id: str, adapter_name: str, label: str = "") -> None:
         from hermes_constants import get_hermes_home
         from utils import atomic_yaml_write
 
+        chat_id = f"direct:{owner_id}"
         _home = get_hermes_home()
         config_path = _home / "config.yaml"
         user_config: dict = {}
