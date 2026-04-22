@@ -113,6 +113,7 @@ _OPERATION_SYSTEM = sys.platform
 
 DEFAULT_WS_GATEWAY_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection"
 DEFAULT_API_DOMAIN = "https://bot.yuanbao.tencent.com"
+DEFAULT_SOURCE = "web"
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
@@ -2196,7 +2197,7 @@ class MediaResolveMiddleware(InboundMiddleware):
 
         token_data = await adapter._get_cached_token()
         token = str(token_data.get("token") or "").strip()
-        source = str(token_data.get("source") or "web").strip() or "web"
+        source = str(token_data.get("source") or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
         bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
         if not token or not bot_id:
             raise RuntimeError("missing token or bot_id for resource download")
@@ -2218,7 +2219,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                         adapter._app_key, adapter._app_secret, adapter._api_domain,
                     )
                     token = str(token_data.get("token") or "").strip()
-                    source = str(token_data.get("source") or source or "web").strip() or "web"
+                    source = str(token_data.get("source") or source or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
                     bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
                     if not token or not bot_id:
                         break
@@ -2812,7 +2813,7 @@ class ConnectionManager:
             owner_id = await SignManager.fetch_bot_detail(
                 bot_id=adapter._bot_id or "",
                 token=token_data.get("token", ""),
-                source=token_data.get("source", ""),
+                source=token_data.get("source", "") or DEFAULT_SOURCE,
                 api_domain=adapter._api_domain,
                 route_env=adapter._route_env,
             )
@@ -2895,7 +2896,7 @@ class ConnectionManager:
 
         token = token_data.get("token", "")
         uid = adapter._bot_id or token_data.get("bot_id", "")
-        source = token_data.get("source") or "bot"
+        source = token_data.get("source") or DEFAULT_SOURCE
         route_env = adapter._route_env or token_data.get("route_env", "") or ""
 
         msg_id = str(uuid.uuid4())
