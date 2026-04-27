@@ -350,7 +350,13 @@ PLATFORM_HINTS = {
     ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
-        "renderable inside a terminal."
+        "renderable inside a terminal. "
+        "File delivery: there is no attachment channel — the user reads your "
+        "response directly in their terminal. Do NOT emit MEDIA:/path tags "
+        "(those are only intercepted on messaging platforms like Telegram, "
+        "Discord, Slack, etc.; on the CLI they render as literal text). "
+        "When referring to a file you created or changed, just state its "
+        "absolute path in plain text; the user can open it from there."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
@@ -363,6 +369,32 @@ PLATFORM_HINTS = {
         "appear as text messages. You can send media files natively: include "
         "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
         ".heic) appear as photos and other files arrive as attachments."
+    ),
+    "mattermost": (
+        "You are in a Mattermost workspace communicating with your user. "
+        "Mattermost renders standard Markdown — headings, bold, italic, code "
+        "blocks, and tables all work. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images (.jpg, .png, .webp) are uploaded as photo "
+        "attachments, audio and video as file attachments. "
+        "Image URLs in markdown format ![alt](url) are rendered as inline previews automatically."
+    ),
+    "matrix": (
+        "You are in a Matrix room communicating with your user. "
+        "Matrix renders Markdown — bold, italic, code blocks, and links work; "
+        "the adapter converts your Markdown to HTML for rich display. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images (.jpg, .png, .webp) are sent as inline photos, "
+        "audio (.ogg, .mp3) as voice/audio messages, video (.mp4) inline, "
+        "and other files as downloadable attachments."
+    ),
+    "feishu": (
+        "You are in a Feishu (Lark) workspace communicating with your user. "
+        "Feishu renders Markdown in messages — bold, italic, code blocks, and "
+        "links are supported. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
+        "inline, audio files as voice messages, and other files as attachments."
     ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
@@ -431,47 +463,6 @@ WSL_ENVIRONMENT_HINT = (
     "to the /mnt/c/ equivalent. You can list /mnt/c/Users/ to discover "
     "the Windows username if needed."
 )
-
-
-def detect_user_language_hint(messages: list, platform: str) -> str:
-    """Detect the dominant language from recent user messages and return a hint.
-
-    Only active for the ``yuanbao`` platform.  Scans the last few user
-    messages for CJK character density and returns a short instruction
-    asking the model to reply in the detected language.  Returns an empty
-    string when detection is inconclusive or the platform is not yuanbao.
-    """
-    if (platform or "").lower().strip() != "yuanbao":
-        return ""
-
-    # Collect the last N user messages (text only)
-    user_texts: list[str] = []
-    for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            user_texts.append(content.strip())
-        if len(user_texts) >= 5:
-            break
-
-    if not user_texts:
-        return ""
-
-    combined = " ".join(user_texts)
-    cjk_count = sum(1 for c in combined if '\u4e00' <= c <= '\u9fff')
-    total_alpha = sum(1 for c in combined if c.isalpha())
-
-    if total_alpha == 0:
-        return ""
-
-    if cjk_count / total_alpha > 0.3:
-        return "[Reminder: The user is writing in Chinese. You must reply in Chinese (简体中文).]"
-
-    # If the user is clearly writing in a non-Chinese language, don't
-    # force Chinese — let the platform hint's "same language" rule apply.
-    return ""
-
 
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
@@ -856,6 +847,11 @@ def build_skills_system_prompt(
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "

@@ -93,6 +93,27 @@ class TestSessionLifecycle:
         assert session["input_tokens"] == 300
         assert session["output_tokens"] == 150
 
+    def test_update_token_counts_tracks_api_call_count(self, db):
+        """api_call_count increments with each update_token_counts call."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50, api_call_count=1)
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50, api_call_count=1)
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50, api_call_count=1)
+
+        session = db.get_session("s1")
+        assert session["api_call_count"] == 3
+
+    def test_update_token_counts_api_call_count_absolute(self, db):
+        """absolute mode sets api_call_count directly."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50, api_call_count=1)
+        db.update_token_counts("s1", input_tokens=300, output_tokens=150,
+                               api_call_count=5, absolute=True)
+
+        session = db.get_session("s1")
+        assert session["api_call_count"] == 5
+        assert session["input_tokens"] == 300
+
     def test_update_token_counts_backfills_model_when_null(self, db):
         db.create_session(session_id="s1", source="telegram")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
@@ -201,6 +222,35 @@ class TestMessageStorage:
         assert conv[0] == {"role": "user", "content": "Hello"}
         assert conv[1] == {"role": "assistant", "content": "Hi!"}
 
+    def test_get_messages_as_conversation_includes_ancestor_chain(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="first prompt")
+        db.append_message("root", role="assistant", content="first answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="second prompt")
+        db.append_message("child", role="assistant", content="second answer")
+
+        conv = db.get_messages_as_conversation("child", include_ancestors=True)
+
+        assert [m["content"] for m in conv] == [
+            "first prompt",
+            "first answer",
+            "second prompt",
+            "second answer",
+        ]
+
+    def test_get_messages_as_conversation_avoids_repeated_resume_prompts_from_ancestors(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="assistant", content="answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="next prompt")
+
+        conv = db.get_messages_as_conversation("child", include_ancestors=True)
+
+        assert [m["content"] for m in conv if m["role"] == "user"] == ["same prompt", "next prompt"]
+
     def test_finish_reason_stored(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="assistant", content="Done", finish_reason="stop")
@@ -254,6 +304,65 @@ class TestMessageStorage:
         msg = conv[0]
         assert msg["reasoning"] == "Thinking about what to say"
         assert msg["reasoning_details"] == details
+
+    def test_reasoning_content_persisted_and_restored(self, db):
+        """reasoning_content must survive session replay as its own field."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="Hello",
+            reasoning="Short summary",
+            reasoning_content="Longer provider-native scratchpad",
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        assert conv[0]["reasoning"] == "Short summary"
+        assert conv[0]["reasoning_content"] == "Longer provider-native scratchpad"
+
+    def test_reasoning_content_empty_string_restored_for_assistant(self, db):
+        """Empty reasoning_content still needs to round-trip for strict replays."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "date", "arguments": "{}"}}],
+            reasoning_content="",
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        assert "reasoning_content" in conv[0]
+        assert conv[0]["reasoning_content"] == ""
+
+    def test_codex_message_items_persisted_and_restored(self, db):
+        """codex_message_items must round-trip through JSON serialization."""
+        db.create_session(session_id="s1", source="cli")
+        items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_123",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Thinking..."}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_456",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Done!"}],
+            },
+        ]
+        db.append_message("s1", role="assistant", content="Done!", codex_message_items=items)
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        assert conv[0].get("codex_message_items") == items
 
     def test_reasoning_not_set_for_non_assistant(self, db):
         """reasoning is never leaked onto user or tool messages."""
@@ -1120,7 +1229,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 9
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1176,17 +1285,23 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v9
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 9
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
         assert session is not None
         assert session["title"] is None
+
+        # Verify api_call_count column was added with default 0
+        cursor = migrated_db._conn.execute(
+            "SELECT api_call_count FROM sessions WHERE id = 'existing'"
+        )
+        assert cursor.fetchone()[0] == 0
 
         # Verify we can set title on migrated session
         assert migrated_db.set_session_title("existing", "Migrated Title") is True
@@ -1398,6 +1513,48 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich()
         assert "\n" not in sessions[0]["preview"]
         assert "Line one Line two" in sessions[0]["preview"]
+
+    def test_branch_session_visible_in_list(self, db):
+        """Branch sessions (parent ended with 'branched') must appear in list_sessions_rich."""
+        db.create_session("parent", "cli")
+        db.end_session("parent", "branched")
+        db.create_session("branch", "cli", parent_session_id="parent")
+        db.append_message("branch", "user", "Exploring the alternative approach")
+
+        sessions = db.list_sessions_rich()
+        ids = [s["id"] for s in sessions]
+        assert "branch" in ids, "Branch session should be visible in default list"
+
+    def test_subagent_session_still_hidden(self, db):
+        """Sub-agent children (parent NOT ended with 'branched') remain hidden."""
+        db.create_session("root", "cli")
+        db.create_session("delegate", "cli", parent_session_id="root")
+
+        sessions = db.list_sessions_rich()
+        ids = [s["id"] for s in sessions]
+        assert "delegate" not in ids, "Delegate sub-agent should not appear in default list"
+        assert "root" in ids
+
+    def test_compression_child_still_hidden(self, db):
+        """Compression continuation sessions remain hidden (parent ended with 'compression')."""
+        import time as _time
+        t0 = _time.time()
+        db.create_session("root", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root"))
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?",
+            (t0 + 1800, "root"),
+        )
+        db._conn.commit()
+        db.create_session("continuation", "cli", parent_session_id="root")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1801, "continuation")
+        )
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(project_compression_tips=False)
+        ids = [s["id"] for s in sessions]
+        assert "continuation" not in ids, "Compression continuation should stay hidden"
 
 
 class TestCompressionChainProjection:
@@ -1732,3 +1889,179 @@ class TestConcurrentWriteSafety:
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
+
+
+# =========================================================================
+# Auto-maintenance: state_meta + vacuum + maybe_auto_prune_and_vacuum
+# =========================================================================
+
+class TestStateMeta:
+    def test_get_meta_missing_returns_none(self, db):
+        assert db.get_meta("nonexistent") is None
+
+    def test_set_then_get_meta(self, db):
+        db.set_meta("foo", "bar")
+        assert db.get_meta("foo") == "bar"
+
+    def test_set_meta_upsert(self, db):
+        """set_meta overwrites existing value (ON CONFLICT DO UPDATE)."""
+        db.set_meta("key", "v1")
+        db.set_meta("key", "v2")
+        assert db.get_meta("key") == "v2"
+
+
+class TestVacuum:
+    def test_vacuum_runs_without_error(self, db):
+        """VACUUM must succeed on a fresh DB (no rows to reclaim)."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="hi")
+        # Should not raise, even though there's nothing significant to reclaim.
+        db.vacuum()
+
+
+class TestAutoMaintenance:
+    def _make_old_ended(self, db, sid: str, days_old: int = 100):
+        """Create a session that is ended and was started `days_old` days ago."""
+        db.create_session(session_id=sid, source="cli")
+        db.end_session(sid, end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - days_old * 86400, sid),
+        )
+        db._conn.commit()
+
+    def test_first_run_prunes_and_vacuums(self, db):
+        self._make_old_ended(db, "old1", days_old=100)
+        self._make_old_ended(db, "old2", days_old=100)
+        db.create_session(session_id="new", source="cli")  # active, must survive
+
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result["skipped"] is False
+        assert result["pruned"] == 2
+        assert result["vacuumed"] is True
+        assert result.get("error") is None
+        assert db.get_session("old1") is None
+        assert db.get_session("old2") is None
+        assert db.get_session("new") is not None
+
+    def test_second_call_within_interval_skips(self, db):
+        self._make_old_ended(db, "old", days_old=100)
+        first = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, min_interval_hours=24
+        )
+        assert first["skipped"] is False
+        assert first["pruned"] == 1
+
+        # Create another prunable session; a second call within
+        # min_interval_hours should still skip without touching it.
+        self._make_old_ended(db, "old2", days_old=100)
+        second = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, min_interval_hours=24
+        )
+        assert second["skipped"] is True
+        assert second["pruned"] == 0
+        assert db.get_session("old2") is not None  # untouched
+
+    def test_second_call_after_interval_runs_again(self, db):
+        self._make_old_ended(db, "old", days_old=100)
+        db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
+
+        # Backdate the last-run marker to force another run.
+        db.set_meta("last_auto_prune", str(time.time() - 48 * 3600))
+
+        self._make_old_ended(db, "old2", days_old=100)
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, min_interval_hours=24
+        )
+        assert result["skipped"] is False
+        assert result["pruned"] == 1
+        assert db.get_session("old2") is None
+
+    def test_no_prunable_sessions_no_vacuum(self, db):
+        """When prune deletes 0 rows, VACUUM is skipped (wasted I/O)."""
+        db.create_session(session_id="fresh", source="cli")  # too recent
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result["skipped"] is False
+        assert result["pruned"] == 0
+        assert result["vacuumed"] is False
+        # But last-run is still recorded so we don't retry immediately.
+        assert db.get_meta("last_auto_prune") is not None
+
+    def test_vacuum_disabled_via_flag(self, db):
+        self._make_old_ended(db, "old", days_old=100)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90, vacuum=False)
+        assert result["pruned"] == 1
+        assert result["vacuumed"] is False
+
+    def test_corrupt_last_run_marker_treated_as_no_prior_run(self, db):
+        """A non-numeric marker must not break maintenance."""
+        db.set_meta("last_auto_prune", "not-a-timestamp")
+        self._make_old_ended(db, "old", days_old=100)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result["skipped"] is False
+        assert result["pruned"] == 1
+
+    def test_state_meta_survives_vacuum(self, db):
+        """Marker written just before VACUUM must still be readable after."""
+        self._make_old_ended(db, "old", days_old=100)
+        db.maybe_auto_prune_and_vacuum(retention_days=90)
+        marker = db.get_meta("last_auto_prune")
+        assert marker is not None
+        # Should parse as a float timestamp close to now.
+        assert abs(float(marker) - time.time()) < 60
+
+    def test_auto_prune_deletes_transcript_files(self, db, tmp_path):
+        """Issue #3015: auto-prune must also delete on-disk transcript files."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+
+        self._make_old_ended(db, "old1", days_old=100)
+        self._make_old_ended(db, "old2", days_old=100)
+        db.create_session(session_id="new", source="cli")  # active
+
+        # Transcript files mimicking real gateway/CLI layout
+        (sessions_dir / "old1.json").write_text("{}")
+        (sessions_dir / "old1.jsonl").write_text("{}\n")
+        (sessions_dir / "old2.jsonl").write_text("{}\n")
+        (sessions_dir / "request_dump_old1_001.json").write_text("{}")
+        (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, sessions_dir=sessions_dir
+        )
+        assert result["pruned"] == 2
+
+        # Pruned transcript files are gone
+        assert not (sessions_dir / "old1.json").exists()
+        assert not (sessions_dir / "old1.jsonl").exists()
+        assert not (sessions_dir / "old2.jsonl").exists()
+        assert not (sessions_dir / "request_dump_old1_001.json").exists()
+        # Active session's transcript is untouched
+        assert (sessions_dir / "new.jsonl").exists()
+
+    def test_auto_prune_without_sessions_dir_preserves_files(self, db, tmp_path):
+        """Backward-compat: no sessions_dir = DB-only cleanup (legacy behavior)."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        self._make_old_ended(db, "old", days_old=100)
+        (sessions_dir / "old.jsonl").write_text("{}\n")
+
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result["pruned"] == 1
+        # File stays — caller didn't opt in
+        assert (sessions_dir / "old.jsonl").exists()
+
+    def test_prune_sessions_deletes_files_for_pruned_only(self, db, tmp_path):
+        """Active-session transcripts must never be deleted by prune."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        self._make_old_ended(db, "old", days_old=100)
+        db.create_session(session_id="active", source="cli")  # not ended
+        (sessions_dir / "old.jsonl").write_text("{}\n")
+        (sessions_dir / "active.jsonl").write_text("{}\n")
+
+        count = db.prune_sessions(older_than_days=90, sessions_dir=sessions_dir)
+        assert count == 1
+        assert not (sessions_dir / "old.jsonl").exists()
+        assert (sessions_dir / "active.jsonl").exists()
+

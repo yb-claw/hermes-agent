@@ -3,9 +3,10 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { STARTUP_RESUME_ID } from '../config/env.js'
-import { MAX_HISTORY, WHEEL_SCROLL_STEP } from '../config/limits.js'
-import { imageTokenMeta } from '../domain/messages.js'
-import { fmtCwdBranch } from '../domain/paths.js'
+import { FULL_RENDER_TAIL_ITEMS, MAX_HISTORY, WHEEL_SCROLL_STEP } from '../config/limits.js'
+import { SECTION_NAMES, sectionMode } from '../domain/details.js'
+import { attachedImageNotice, imageTokenMeta } from '../domain/messages.js'
+import { fmtCwdBranch, shortCwd } from '../domain/paths.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
   ClarifyRespondResponse,
@@ -15,16 +16,20 @@ import type {
 } from '../gatewayTypes.js'
 import { useGitBranch } from '../hooks/useGitBranch.js'
 import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
+import { appendTranscriptMessage } from '../lib/messages.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
+import { terminalParityHints } from '../lib/terminalParity.js'
 import { buildToolTrailLine, sameToolTrailGroup, toolTrailLabel } from '../lib/text.js'
+import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { type GatewayRpc, type TranscriptRow } from './interfaces.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
+import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
-import { $turnState, patchTurnState } from './turnStore.js'
+import { patchTurnState, useTurnSelector } from './turnStore.js'
 import { $uiState, getUiState, patchUiState } from './uiStore.js'
 import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
@@ -36,6 +41,7 @@ import { useSubmission } from './useSubmission.js'
 const GOOD_VIBES_RE = /\b(good bot|thanks|thank you|thx|ty|ily|love you)\b/i
 const BRACKET_PASTE_ON = '\x1b[?2004h'
 const BRACKET_PASTE_OFF = '\x1b[?2004l'
+const MAX_HEIGHT_CACHE_BUCKETS = 12
 
 const capHistory = (items: Msg[]): Msg[] => {
   if (items.length <= MAX_HISTORY) {
@@ -59,12 +65,6 @@ const statusColorOf = (status: string, t: { dim: string; error: string; ok: stri
   }
 
   return t.dim
-}
-
-interface SelectionSnap {
-  anchor?: { row: number }
-  focus?: { row: number }
-  isDragging?: boolean
 }
 
 export function useMainApp(gw: GatewayClient) {
@@ -108,7 +108,19 @@ export function useMainApp(gw: GatewayClient) {
 
   const ui = useStore($uiState)
   const overlay = useStore($overlayState)
-  const turn = useStore($turnState)
+
+  const turnLiveTailActive = useTurnSelector(state =>
+    Boolean(
+      state.streaming ||
+      state.streamPendingTools.length ||
+      state.streamSegments.length ||
+      state.reasoning.trim() ||
+      state.reasoningActive ||
+      state.tools.length ||
+      state.subagents.length ||
+      state.todos.length
+    )
+  )
 
   const slashFlightRef = useRef(0)
   const slashRef = useRef<(cmd: string) => boolean>(() => false)
@@ -117,10 +129,12 @@ export function useMainApp(gw: GatewayClient) {
   const onEventRef = useRef<(ev: GatewayEvent) => void>(() => {})
   const clipboardPasteRef = useRef<(quiet?: boolean) => Promise<void> | void>(() => {})
   const submitRef = useRef<(value: string) => void>(() => {})
+  const terminalHintsShownRef = useRef(new Set<string>())
   const historyItemsRef = useRef(historyItems)
   const lastUserMsgRef = useRef(lastUserMsg)
   const msgIdsRef = useRef(new WeakMap<Msg, string>())
-  const nextMsgIdRef = useRef(0)
+  const msgIdSeqRef = useRef(0)
+  const heightCachesRef = useRef(new Map<string, Map<string, number>>())
 
   colsRef.current = cols
   historyItemsRef.current = historyItems
@@ -136,11 +150,29 @@ export function useMainApp(gw: GatewayClient) {
   const composer = useComposerState({
     gw,
     onClipboardPaste: quiet => clipboardPasteRef.current(quiet),
+    onImageAttached: info => {
+      sys(attachedImageNotice(info))
+    },
     submitRef
   })
 
   const { actions: composerActions, refs: composerRefs, state: composerState } = composer
   const empty = !historyItems.some(msg => msg.kind !== 'intro')
+
+  useEffect(() => {
+    void terminalParityHints()
+      .then(hints => {
+        for (const hint of hints) {
+          if (terminalHintsShownRef.current.has(hint.key)) {
+            continue
+          }
+
+          terminalHintsShownRef.current.add(hint.key)
+          turnController.pushActivity(hint.message, hint.tone)
+        }
+      })
+      .catch(() => {})
+  }, [])
 
   const messageId = useCallback((msg: Msg) => {
     const hit = msgIdsRef.current.get(msg)
@@ -149,7 +181,7 @@ export function useMainApp(gw: GatewayClient) {
       return hit
     }
 
-    const next = `m${++nextMsgIdRef.current}`
+    const next = `${messageHeightKey(msg)}:${++msgIdSeqRef.current}`
 
     msgIdsRef.current.set(msg, next)
 
@@ -161,53 +193,77 @@ export function useMainApp(gw: GatewayClient) {
     [historyItems, messageId]
   )
 
-  const virtualHistory = useVirtualHistory(scrollRef, virtualRows, cols)
+  const detailsLayoutKey = useMemo(() => {
+    const thinking = sectionMode('thinking', ui.detailsMode, ui.sections, ui.detailsModeCommandOverride)
+    const tools = sectionMode('tools', ui.detailsMode, ui.sections, ui.detailsModeCommandOverride)
+
+    return `${thinking}:${tools}`
+  }, [ui.detailsMode, ui.detailsModeCommandOverride, ui.sections])
+
+  const detailsVisible = detailsLayoutKey !== 'hidden:hidden'
+  const heightCacheKey = `${ui.sid ?? 'draft'}:${cols}:${ui.compact ? '1' : '0'}:${detailsLayoutKey}`
+
+  const heightCache = useMemo(() => {
+    let cache = heightCachesRef.current.get(heightCacheKey)
+
+    if (!cache) {
+      cache = new Map()
+      heightCachesRef.current.set(heightCacheKey, cache)
+
+      if (heightCachesRef.current.size > MAX_HEIGHT_CACHE_BUCKETS) {
+        heightCachesRef.current.delete(heightCachesRef.current.keys().next().value!)
+      }
+    }
+
+    return cache
+  }, [heightCacheKey])
+
+  const initialHeights = useMemo(() => {
+    const out = new Map<string, number>()
+
+    for (const row of virtualRows) {
+      out.set(
+        row.key,
+        heightCache.get(row.key) ??
+          estimatedMsgHeight(row.msg, cols, {
+            compact: ui.compact,
+            details: detailsVisible,
+            limitHistory: row.index < virtualRows.length - FULL_RENDER_TAIL_ITEMS
+          })
+      )
+    }
+
+    return out
+  }, [cols, detailsVisible, heightCache, ui.compact, virtualRows])
+
+  const syncHeightCache = useCallback(
+    (heights: ReadonlyMap<string, number>) => {
+      for (const row of virtualRows) {
+        const h = heights.get(row.key)
+
+        if (h) {
+          heightCache.set(row.key, h)
+        }
+      }
+    },
+    [heightCache, virtualRows]
+  )
+
+  const virtualHistory = useVirtualHistory(scrollRef, virtualRows, cols, {
+    initialHeights,
+    liveTailActive: turnLiveTailActive,
+    onHeightsChange: syncHeightCache
+  })
 
   const scrollWithSelection = useCallback(
-    (delta: number) => {
-      const s = scrollRef.current
-
-      if (!s) {
-        return
-      }
-
-      const sel = selection.getState() as null | SelectionSnap
-      const top = s.getViewportTop()
-      const bottom = top + s.getViewportHeight() - 1
-
-      if (
-        !sel?.anchor ||
-        !sel.focus ||
-        sel.anchor.row < top ||
-        sel.anchor.row > bottom ||
-        (!sel.isDragging && (sel.focus.row < top || sel.focus.row > bottom))
-      ) {
-        return s.scrollBy(delta)
-      }
-
-      const max = Math.max(0, s.getScrollHeight() - s.getViewportHeight())
-      const cur = s.getScrollTop() + s.getPendingDelta()
-      const actual = Math.max(0, Math.min(max, cur + delta)) - cur
-
-      if (actual === 0) {
-        return
-      }
-
-      const shift = sel!.isDragging ? selection.shiftAnchor : selection.shiftSelection
-
-      if (actual > 0) {
-        selection.captureScrolledRows(top, top + actual - 1, 'above')
-      } else {
-        selection.captureScrolledRows(bottom + actual + 1, bottom, 'below')
-      }
-
-      shift(-actual, top, bottom)
-      s.scrollBy(delta)
-    },
+    (delta: number) => scrollWithSelectionBy(delta, { scrollRef, selection }),
     [selection]
   )
 
-  const appendMessage = useCallback((msg: Msg) => setHistoryItems(prev => capHistory([...prev, msg])), [])
+  const appendMessage = useCallback(
+    (msg: Msg) => setHistoryItems(prev => capHistory(appendTranscriptMessage(prev, msg))),
+    []
+  )
 
   const sys = useCallback((text: string) => appendMessage({ role: 'system', text }), [appendMessage])
 
@@ -294,12 +350,14 @@ export function useMainApp(gw: GatewayClient) {
 
   useConfigSync({ gw, setBellOnComplete, setVoiceEnabled, sid: ui.sid })
 
-  // ── Terminal tab title ─────────────────────────────────────────────
-  // Show model name + status so users can identify the Hermes tab.
-  const shortModel = ui.info?.model?.replace(/^.*\//, '') ?? ''
-  const titleStatus = ui.busy ? '⏳' : '✓'
-  const terminalTitle = shortModel ? `${titleStatus} ${shortModel} — Hermes` : 'Hermes'
-  useTerminalTitle(terminalTitle)
+  // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
+  const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
+
+  const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
+
+  const tabCwd = ui.info?.cwd
+
+  useTerminalTitle(model ? `${marker} ${model}${tabCwd ? ` · ${shortCwd(tabCwd, 24)}` : ''}` : 'Hermes')
 
   useEffect(() => {
     if (!ui.sid || !stdout) {
@@ -384,7 +442,7 @@ export function useMainApp(gw: GatewayClient) {
 
   clipboardPasteRef.current = paste
 
-  const { dispatchSubmission, send, sendQueued, shellExec, submit } = useSubmission({
+  const { dispatchSubmission, send, sendQueued, submit } = useSubmission({
     appendMessage,
     composerActions,
     composerRefs,
@@ -415,6 +473,7 @@ export function useMainApp(gw: GatewayClient) {
     const next = composerActions.dequeue()
 
     if (next) {
+      patchUiState({ busy: true, status: 'running…' })
       sendQueued(next)
     }
   }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued])
@@ -432,13 +491,20 @@ export function useMainApp(gw: GatewayClient) {
     composer: { actions: composerActions, refs: composerRefs, state: composerState },
     gateway,
     terminal: { hasSelection, scrollRef, scrollWithSelection, selection, stdout },
-    voice: { recording: voiceRecording, setProcessing: setVoiceProcessing, setRecording: setVoiceRecording },
+    voice: {
+      enabled: voiceEnabled,
+      recording: voiceRecording,
+      setProcessing: setVoiceProcessing,
+      setRecording: setVoiceRecording,
+      setVoiceEnabled
+    },
     wheelStep: WHEEL_SCROLL_STEP
   })
 
   const onEvent = useMemo(
     () =>
       createGatewayEventHandler({
+        composer: { setInput: composerActions.setInput },
         gateway,
         session: {
           STARTUP_RESUME_ID,
@@ -448,18 +514,29 @@ export function useMainApp(gw: GatewayClient) {
           resumeById: session.resumeById,
           setCatalog
         },
+        submission: { submitRef },
         system: { bellOnComplete, stdout, sys },
-        transcript: { appendMessage, panel, setHistoryItems }
+        transcript: { appendMessage, panel, setHistoryItems },
+        voice: {
+          setProcessing: setVoiceProcessing,
+          setRecording: setVoiceRecording,
+          setVoiceEnabled
+        }
       }),
     [
       appendMessage,
       bellOnComplete,
+      composerActions.setInput,
       gateway,
       panel,
       session.newSession,
       session.resetSession,
       session.resumeById,
+      setVoiceEnabled,
+      setVoiceProcessing,
+      setVoiceRecording,
       stdout,
+      submitRef,
       sys
     ]
   )
@@ -487,7 +564,7 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [gw, sys])
 
-  useLongRunToolCharms(ui.busy, turn.tools)
+  useLongRunToolCharms()
 
   const slash = useMemo(
     () =>
@@ -585,25 +662,35 @@ export function useMainApp(gw: GatewayClient) {
 
   const onModelSelect = useCallback((value: string) => {
     patchOverlayState({ modelPicker: false })
-    slashRef.current(`/model ${value}`)
+    slashRef.current(`/model ${value} --global`)
   }, [])
 
-  const hasReasoning = Boolean(turn.reasoning.trim())
+  const hasReasoning = useTurnSelector(state => Boolean(state.reasoning.trim()))
 
-  const showProgressArea =
-    ui.detailsMode === 'hidden'
-      ? turn.activity.some(item => item.tone !== 'info')
-      : Boolean(
+  // Per-section overrides win over the global mode — when every section is
+  // resolved to hidden, the only thing ToolTrail will surface is the
+  // floating-alert backstop (errors/warnings).  Mirror that so we don't
+  // render an empty wrapper Box above the streaming area in quiet mode.
+  const anyPanelVisible = SECTION_NAMES.some(
+    s => sectionMode(s, ui.detailsMode, ui.sections, ui.detailsModeCommandOverride) !== 'hidden'
+  )
+
+  const showProgressArea = useTurnSelector(state =>
+    anyPanelVisible
+      ? Boolean(
           ui.busy ||
-          turn.outcome ||
-          turn.streamPendingTools.length ||
-          turn.streamSegments.length ||
-          turn.subagents.length ||
-          turn.tools.length ||
-          turn.turnTrail.length ||
+          state.outcome ||
+          state.streamPendingTools.length ||
+          state.streamSegments.length ||
+          state.subagents.length ||
+          state.tools.length ||
+          state.todos.length ||
+          state.turnTrail.length ||
           hasReasoning ||
-          turn.activity.length
+          state.activity.length
         )
+      : state.activity.some(item => item.tone !== 'info')
+  )
 
   const appActions = useMemo(
     () => ({
@@ -636,10 +723,10 @@ export function useMainApp(gw: GatewayClient) {
     [cols, composerActions, composerState, empty, pagerPageSize, submit]
   )
 
-  const appProgress = useMemo(
-    () => ({ ...turn, showProgressArea, showStreamingArea: Boolean(turn.streaming) }),
-    [turn, showProgressArea]
-  )
+  // Pass current progress through unfrozen — streaming update throttling
+  // handles interaction load; progress must stay truthful so panels don't
+  // randomly disappear when the live tail scrolls offscreen.
+  const appProgress = useMemo(() => ({ showProgressArea }), [showProgressArea])
 
   const cwd = ui.info?.cwd || process.env.HERMES_CWD || process.cwd()
   const gitBranch = useGitBranch(cwd)
@@ -653,7 +740,9 @@ export function useMainApp(gw: GatewayClient) {
       statusColor: statusColorOf(ui.status, ui.theme.color),
       stickyPrompt,
       turnStartedAt: ui.sid ? turnStartedAt : null,
-      voiceLabel: voiceRecording ? 'REC' : voiceProcessing ? 'STT' : `voice ${voiceEnabled ? 'on' : 'off'}`
+      // CLI parity: the classic prompt_toolkit status bar shows a red dot
+      // on REC (cli.py:_get_voice_status_fragments line 2344).
+      voiceLabel: voiceRecording ? '● REC' : voiceProcessing ? '◉ STT' : `voice ${voiceEnabled ? 'on' : 'off'}`
     }),
     [
       cwd,

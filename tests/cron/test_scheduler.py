@@ -673,6 +673,100 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
 
+    def _make_run_job_patches(self, tmp_path):
+        """Common patches for run_job tests."""
+        fake_db = MagicMock()
+        return fake_db, [
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("dotenv.load_dotenv"),
+            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+            ),
+        ]
+
+    def test_run_job_passes_enabled_toolsets_to_agent(self, tmp_path):
+        job = {
+            "id": "toolset-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": ["web", "terminal", "file"],
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
+
+    def test_run_job_enabled_toolsets_resolves_from_platform_config_when_not_set(self, tmp_path):
+        """When a job has no explicit enabled_toolsets, the scheduler now
+        resolves them from ``hermes tools`` platform config for ``cron``
+        (PR #14xxx — blanket fix for Norbert's surprise ``moa`` run).
+
+        The legacy "pass None → AIAgent loads full default" path is still
+        reachable, but only when ``_get_platform_tools`` raises (safety net
+        for any unexpected config shape).
+        """
+        job = {
+            "id": "no-toolset-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        # Resolution happened — not None, is a list.
+        assert isinstance(kwargs["enabled_toolsets"], list)
+        # The cron default is _HERMES_CORE_TOOLS with _DEFAULT_OFF_TOOLSETS
+        # (``moa``, ``homeassistant``, ``rl``) removed. The most important
+        # invariant: ``moa`` is NOT in the default cron toolset, so a cron
+        # run cannot accidentally spin up frontier models.
+        assert "moa" not in kwargs["enabled_toolsets"]
+
+    def test_run_job_per_job_toolsets_win_over_platform_config(self, tmp_path):
+        """Per-job enabled_toolsets (via cronjob tool) always take precedence
+        over the platform-level ``hermes tools`` config."""
+        job = {
+            "id": "override-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": ["terminal"],
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        # Even if the user has ``hermes tools`` configured to enable web+file
+        # for cron, the per-job override wins.
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch(
+                 "hermes_cli.tools_config._get_platform_tools",
+                 return_value={"web", "file"},
+             ):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["terminal"]
+
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
 
@@ -1580,3 +1674,128 @@ class TestParallelTick:
         end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+
+
+class TestDeliverResultTimeoutCancelsFuture:
+    """When future.result(timeout=60) raises TimeoutError in the live
+    adapter delivery path, _deliver_result must cancel the orphan
+    coroutine so it cannot duplicate-send after the standalone fallback.
+    """
+
+    def test_live_adapter_timeout_cancels_future_and_falls_back(self):
+        """End-to-end: live adapter hangs past the 60s budget, _deliver_result
+        patches the timeout down to a fast value, confirms future.cancel() fires,
+        and verifies the standalone fallback path still delivers."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        # Live adapter whose send() coroutine never resolves within the budget
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        # A real concurrent.futures.Future so .cancel() has real semantics,
+        # but we override .result() to raise TimeoutError exactly like the
+        # 60s wait firing in production.
+        captured_future = Future()
+        cancel_calls = []
+        original_cancel = captured_future.cancel
+
+        def tracking_cancel():
+            cancel_calls.append(True)
+            return original_cancel()
+
+        captured_future.cancel = tracking_cancel
+        captured_future.result = MagicMock(side_effect=TimeoutError("timed out"))
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return captured_future
+
+        job = {
+            "id": "timeout-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        # 1. The orphan future was cancelled on timeout (the bug fix)
+        assert cancel_calls == [True], "future.cancel() must fire on TimeoutError"
+        # 2. The standalone fallback delivered — no double send, no silent drop
+        assert result is None, f"expected successful delivery, got error: {result!r}"
+        standalone_send.assert_awaited_once()
+
+
+class TestSendMediaTimeoutCancelsFuture:
+    """Same orphan-coroutine guarantee for _send_media_via_adapter's
+    future.result(timeout=30) call. If this times out mid-batch, the
+    in-flight coroutine must be cancelled before the next file is tried.
+    """
+
+    def test_media_send_timeout_cancels_future_and_continues(self):
+        """End-to-end: _send_media_via_adapter with a future whose .result()
+        raises TimeoutError. Assert cancel() fires and the loop proceeds
+        to the next file rather than hanging or crashing."""
+        from concurrent.futures import Future
+
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        adapter.send_video = AsyncMock()
+
+        # First file: future that times out. Second file: future that resolves OK.
+        timeout_future = Future()
+        timeout_cancel_calls = []
+        original_cancel = timeout_future.cancel
+
+        def tracking_cancel():
+            timeout_cancel_calls.append(True)
+            return original_cancel()
+
+        timeout_future.cancel = tracking_cancel
+        timeout_future.result = MagicMock(side_effect=TimeoutError("timed out"))
+
+        ok_future = Future()
+        ok_future.set_result(MagicMock(success=True))
+
+        futures_iter = iter([timeout_future, ok_future])
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return next(futures_iter)
+
+        media_files = [
+            ("/tmp/slow.png", False),   # times out
+            ("/tmp/fast.mp4", False),   # succeeds
+        ]
+
+        loop = MagicMock()
+        job = {"id": "media-timeout"}
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            # Should not raise — the except Exception clause swallows the timeout
+            _send_media_via_adapter(adapter, "chat-1", media_files, None, loop, job)
+
+        # 1. The timed-out future was cancelled (the bug fix)
+        assert timeout_cancel_calls == [True], "future.cancel() must fire on TimeoutError"
+        # 2. Second file still got dispatched — one timeout doesn't abort the batch
+        adapter.send_video.assert_called_once()
+        assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
