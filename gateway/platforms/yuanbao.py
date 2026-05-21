@@ -157,6 +157,11 @@ _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
 OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
 # Max number of resource references to resolve per inbound turn
 OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
+# Max concurrent media-resolve operations per turn. Each operation chains
+# token-aware URL resolve + COS download; running them serially blocks the
+# inbound pipeline on the slowest leg. Cap kept conservative to avoid
+# tripping yuanbao OpenAPI QPS or saturating COS bandwidth.
+MEDIA_RESOLVE_CONCURRENCY = 4
 
 class MarkdownProcessor:
     """Encapsulates all Markdown-related utilities for the Yuanbao platform.
@@ -2383,32 +2388,57 @@ class MediaResolveMiddleware(InboundMiddleware):
 
         Yuanbao COS hostnames resolve to private IPs, tripping the SSRF guard
         in vision_tools. We download ourselves and return local cache paths.
-        """
-        media_urls: List[str] = []
-        media_types: List[str] = []
 
-        for ref in media_refs:
+        Per-ref resolution (URL refresh + COS download) runs concurrently up
+        to ``MEDIA_RESOLVE_CONCURRENCY`` at a time. Each ref still runs its
+        two legs (resolve → download) serially, but multiple refs interleave,
+        which dominates wall-clock for multi-image turns. Result order
+        matches input order. Per-ref failures are logged and skipped, never
+        aborting the whole batch.
+        """
+        # Filter and pre-index valid refs so output order is deterministic
+        # and matches the original ``media_refs`` ordering.
+        valid: List[Tuple[int, Dict[str, str], str, str]] = []
+        for idx, ref in enumerate(media_refs):
             kind = str(ref.get("kind") or "").strip().lower()
             url = str(ref.get("url") or "").strip()
             if kind not in _RESOLVABLE_MEDIA_KINDS or not url:
                 continue
+            valid.append((idx, ref, kind, url))
 
-            try:
-                fetch_url = await cls._resolve_download_url(adapter, url)
-            except Exception as exc:
-                logger.warning(
-                    "[%s] inbound media resolve failed: kind=%s url=%s err=%s",
-                    adapter.name, kind, url, exc,
+        if not valid:
+            return [], []
+
+        sem = asyncio.Semaphore(MEDIA_RESOLVE_CONCURRENCY)
+
+        async def _resolve_one(idx: int, ref: Dict[str, str], kind: str, url: str):
+            async with sem:
+                try:
+                    fetch_url = await cls._resolve_download_url(adapter, url)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] inbound media resolve failed: kind=%s url=%s err=%s",
+                        adapter.name, kind, url, exc,
+                    )
+                    return idx, None
+                cached = await cls._download_and_cache(
+                    adapter,
+                    fetch_url=fetch_url,
+                    kind=kind,
+                    file_name=str(ref.get("name") or "").strip() or None,
+                    log_tag=f"placeholder_url={url[:80]}",
                 )
-                continue
+                return idx, cached
 
-            cached = await cls._download_and_cache(
-                adapter,
-                fetch_url=fetch_url,
-                kind=kind,
-                file_name=str(ref.get("name") or "").strip() or None,
-                log_tag=f"placeholder_url={url[:80]}",
-            )
+        # gather preserves coroutine order in the result list, so we can
+        # rebuild output preserving valid-list order = original idx order.
+        results = await asyncio.gather(*(
+            _resolve_one(idx, ref, kind, url) for idx, ref, kind, url in valid
+        ))
+
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        for _idx, cached in results:
             if cached is None:
                 continue
             local_path, mime = cached
